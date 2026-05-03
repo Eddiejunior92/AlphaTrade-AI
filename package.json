@@ -1,0 +1,31 @@
+{
+  "name": "workspace",
+  "version": "1.0.0",
+  "description": "**Fully autonomous high-frequency trading system** using a multi-LLM ensemble (Gemini 2.5 Flash + Claude + GPT-4o + **Grok**) with consensus voting, stateful memory, Alpaca brokerage integration, Discord alerts, and iron-clad safety guardrails.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.2.4",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "axios": "^1.16.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "lucide-react": "^1.14.0",
+    "node-cron": "^4.2.1",
+    "postcss": "^8.5.13",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "recharts": "^3.8.1",
+    "tailwindcss": "^4.2.4",
+    "uuid": "^14.0.0",
+    "vite": "^8.0.10",
+    "ws": "^8.20.0"
+  }
+}

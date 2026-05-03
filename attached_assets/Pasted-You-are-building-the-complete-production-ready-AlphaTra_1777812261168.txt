@@ -1,0 +1,44 @@
+You are building the complete production-ready AlphaTrade AI — a fully autonomous multi-LLM high-frequency trading agent.
+
+Project context from README.md:
+- Fully autonomous Node.js agent with multi-LLM ensemble (Gemini 2.5 Flash + Claude 3.7 Sonnet + GPT-4o + Grok-4.20 as truth & sentiment specialist)
+- Consensus voting + confidence ≥ 85% safety valve
+- Alpaca brokerage integration (paper then live)
+- Stateful portfolio memory
+- Discord webhook alerts
+- React dashboard for real-time monitoring
+- Iron-clad risk guardrails
+
+Use the existing backend/services/llmService.js exactly as-is (it already has the full ensemble with OpenRouter + direct xAI support).
+
+Step-by-step build plan:
+1. Create backend/package.json with all required dependencies (openai, @neondatabase/serverless or Replit DB, express, dotenv, node-cron or setInterval, etc.).
+
+2. Create backend/agent.js — the headless autonomous loop:
+   - Loads watchlist from env
+   - Every 60-300 seconds: perception → multi-LLM ensemble decision via getEnsembleDecision() → safety valve check → execute trade via Alpaca if approved
+   - Uses persistent DB for portfolio state instead of portfolio.json
+
+3. Create backend/server.js — secure Express proxy with safety valve logic (rejects low-confidence trades)
+
+4. Set up Neon PostgreSQL (or Replit DB) for portfolio state (balance, holdings, trade history)
+
+5. Add full risk management:
+   - Max 3% portfolio per position
+   - Circuit breaker (pause on >5% daily drawdown)
+   - Hard stop-loss / take-profit on every trade
+   - Diversification rules
+
+6. Add comprehensive audit logging (every LLM vote, reasoning, final decision saved to DB)
+
+7. Keep/improve the React frontend dashboard (real-time portfolio, last trades, AI reasoning feed, emergency pause button)
+
+8. Deploy agent.js as a 24/7 always-on background service (Autoscale / Reserved VM)
+
+9. Move all secrets (GEMINI_API_KEY, ALPACA_KEY, etc., OPENROUTER_API_KEY, XAI_API_KEY, DISCORD_WEBHOOK_URL) to Replit Secrets
+
+10. Add health-check ping and auto-restart logic
+
+Start by showing me your high-level plan, then begin creating the files one by one. Use the existing llmService.js for all LLM calls. Ask me if you need any clarification.
+
+Build the full trusted autonomous investing program now.
