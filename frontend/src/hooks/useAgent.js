@@ -1,123 +1,83 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-const API_BASE = '/api';
+const API = '/api';
+
+async function apiPost(path) {
+  const res = await fetch(`${API}${path}`, { method: 'POST' });
+  return res.json();
+}
+
+async function apiGet(path) {
+  const res = await fetch(`${API}${path}`);
+  return res.json();
+}
 
 export function useAgent() {
   const [state, setState] = useState(null);
-  const [account, setAccount] = useState(null);
-  const [positions, setPositions] = useState([]);
-  const [orders, setOrders] = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [audit, setAudit] = useState([]);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState({});
   const wsRef = useRef(null);
 
   const setLoad = (key, val) => setLoading(l => ({ ...l, [key]: val }));
 
-  const fetchAccount = useCallback(async () => {
+  const refreshLogs = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/account`);
-      setAccount(await res.json());
-    } catch {}
-  }, []);
-
-  const fetchPositions = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/positions`);
-      setPositions(await res.json());
-    } catch { setPositions([]); }
-  }, []);
-
-  const fetchOrders = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/orders`);
-      setOrders(await res.json());
-    } catch { setOrders([]); }
-  }, []);
-
-  const fetchState = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/state`);
-      setState(await res.json());
+      const [t, a] = await Promise.all([apiGet('/trades?limit=100'), apiGet('/audit?limit=100')]);
+      setTrades(Array.isArray(t) ? t : []);
+      setAudit(Array.isArray(a) ? a : []);
     } catch {}
   }, []);
 
   useEffect(() => {
-    fetchState();
-    fetchAccount();
-    fetchPositions();
-    fetchOrders();
+    apiGet('/state').then(setState).catch(() => {});
+    refreshLogs();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host || 'localhost:5000';
-    const wsUrl = `${protocol}//${host}/ws`;
+    const host = window.location.host;
     let ws;
+    let reconnectTimer;
 
     const connect = () => {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(`${protocol}//${host}/ws`);
       wsRef.current = ws;
-
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
-        setTimeout(connect, 3000);
+        reconnectTimer = setTimeout(connect, 3000);
       };
-      ws.onerror = () => ws.close();
-      ws.onmessage = (event) => {
+      ws.onerror = () => { try { ws.close(); } catch {} };
+      ws.onmessage = (e) => {
         try {
-          const msg = JSON.parse(event.data);
+          const msg = JSON.parse(e.data);
           if (msg.type === 'state') setState(msg.data);
         } catch {}
       };
     };
-
     connect();
 
-    const interval = setInterval(() => {
-      fetchAccount();
-      fetchPositions();
-      fetchOrders();
-    }, 10000);
-
+    const logInterval = setInterval(refreshLogs, 8000);
     return () => {
-      clearInterval(interval);
+      clearInterval(logInterval);
+      clearTimeout(reconnectTimer);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [fetchState, fetchAccount, fetchPositions, fetchOrders]);
+  }, [refreshLogs]);
 
-  const startAgent = async () => {
-    setLoad('start', true);
-    try {
-      await fetch(`${API_BASE}/agent/start`, { method: 'POST' });
-      await fetchState();
-    } finally { setLoad('start', false); }
-  };
-
-  const stopAgent = async () => {
-    setLoad('stop', true);
-    try {
-      await fetch(`${API_BASE}/agent/stop`, { method: 'POST' });
-      await fetchState();
-    } finally { setLoad('stop', false); }
-  };
-
-  const runNow = async () => {
-    setLoad('runNow', true);
-    try {
-      await fetch(`${API_BASE}/agent/run-now`, { method: 'POST' });
-      await fetchState();
-      await fetchAccount();
-      await fetchPositions();
-      await fetchOrders();
-    } finally { setLoad('runNow', false); }
-  };
-
-  const resetCircuitBreaker = async () => {
-    await fetch(`${API_BASE}/agent/reset-circuit-breaker`, { method: 'POST' });
-    await fetchState();
+  const wrap = (key, fn) => async () => {
+    setLoad(key, true);
+    try { await fn(); await refreshLogs(); }
+    finally { setLoad(key, false); }
   };
 
   return {
-    state, account, positions, orders, connected,
-    loading, startAgent, stopAgent, runNow, resetCircuitBreaker,
+    state, trades, audit, connected, loading,
+    startAgent: wrap('start', () => apiPost('/agent/start')),
+    stopAgent: wrap('stop', () => apiPost('/agent/stop')),
+    runNow: wrap('runNow', () => apiPost('/agent/run-now')),
+    emergencyPause: wrap('pause', () => apiPost('/agent/emergency-pause')),
+    resume: wrap('resume', () => apiPost('/agent/resume')),
+    resetCircuitBreaker: wrap('cbReset', () => apiPost('/agent/reset-circuit-breaker')),
   };
 }
