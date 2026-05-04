@@ -1,77 +1,84 @@
-const EVENT_COLORS = {
-  SIGNAL: 'border-[#2196f3]/40 text-[#2196f3]',
-  TRADE_EXECUTED: 'border-[#00c851]/40 text-[#00c851]',
-  TRADE_REJECTED: 'border-[#8b949e]/40 text-[#8b949e]',
-  TRADE_ERROR: 'border-[#ff4444]/40 text-[#ff4444]',
-  CIRCUIT_BREAKER_TRIPPED: 'border-[#ff4444]/60 text-[#ff4444]',
-  CIRCUIT_BREAKER_RESET: 'border-[#00c851]/40 text-[#00c851]',
-  EMERGENCY_PAUSE: 'border-[#ff4444]/60 text-[#ff4444]',
-  EMERGENCY_RESUME: 'border-[#00c851]/40 text-[#00c851]',
-  STOP_LOSS: 'border-[#ff4444]/40 text-[#ff4444]',
-  TAKE_PROFIT: 'border-[#00c851]/40 text-[#00c851]',
-  AGENT_STARTED: 'border-[#00c851]/40 text-[#00c851]',
-  AGENT_STOPPED: 'border-[#8b949e]/40 text-[#8b949e]',
-  DAILY_RESET: 'border-[#ffbb33]/40 text-[#ffbb33]',
-  CYCLE_ERROR: 'border-[#ff4444]/40 text-[#ff4444]',
+const EVENT_META = {
+  SIGNAL: { color: 'var(--blue)', icon: '🧠', label: 'Signal' },
+  TRADE_EXECUTED: { color: 'var(--green)', icon: '✓', label: 'Trade Executed' },
+  TRADE_REJECTED: { color: 'var(--text-dim)', icon: '⊘', label: 'Trade Rejected' },
+  TRADE_ERROR: { color: 'var(--red)', icon: '⚠', label: 'Trade Error' },
+  CIRCUIT_BREAKER_TRIPPED: { color: 'var(--red)', icon: '🚨', label: 'Circuit Breaker' },
+  CIRCUIT_BREAKER_RESET: { color: 'var(--green)', icon: '↻', label: 'CB Reset' },
+  EMERGENCY_PAUSE: { color: 'var(--red)', icon: '⏸', label: 'Emergency Pause' },
+  EMERGENCY_RESUME: { color: 'var(--green)', icon: '▶', label: 'Resumed' },
+  STOP_LOSS: { color: 'var(--red)', icon: '⬇', label: 'Stop-Loss' },
+  TAKE_PROFIT: { color: 'var(--green)', icon: '🎯', label: 'Take-Profit' },
+  AGENT_STARTED: { color: 'var(--green)', icon: '▶', label: 'Agent Started' },
+  AGENT_STOPPED: { color: 'var(--text-dim)', icon: '⏹', label: 'Agent Stopped' },
+  DAILY_RESET: { color: 'var(--yellow)', icon: '☀', label: 'Daily Reset' },
+  CYCLE_ERROR: { color: 'var(--red)', icon: '⚠', label: 'Cycle Error' },
 };
 
-export default function ReasoningFeed({ entries = [] }) {
+export default function ReasoningFeed({ entries = [], compact = false }) {
   if (!entries.length) {
     return (
-      <div className="text-center text-[#8b949e] py-8 text-sm">
-        No AI reasoning recorded yet. Start the agent to see live decisions.
+      <div className="text-center py-12">
+        <div className="text-4xl mb-2 opacity-40">💭</div>
+        <div className="text-sm text-[var(--text-dim)]">No reasoning yet</div>
+        <div className="text-[11px] text-[var(--text-dim)] mt-1">Start the agent to see Alpha's live thinking</div>
       </div>
     );
   }
-
   return (
-    <div className="space-y-2 max-h-[600px] overflow-y-auto pr-2">
+    <div className={`space-y-3 ${compact ? 'max-h-[420px]' : 'max-h-[70vh]'} overflow-y-auto pr-1`}>
       {entries.map(e => {
-        const colorClass = EVENT_COLORS[e.event_type] || 'border-[#30363d] text-[#e6edf3]';
-        const time = new Date(e.created_at).toLocaleTimeString();
+        const meta = EVENT_META[e.event_type] || { color: 'var(--text-dim)', icon: '·', label: e.event_type };
+        const time = new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const models = e.models || null;
         const payload = e.payload || {};
         return (
-          <div key={e.id} className={`border-l-2 pl-3 py-1.5 ${colorClass.split(' ')[0]}`}>
-            <div className="flex items-center justify-between text-xs mb-1">
+          <div key={e.id} className="glass p-3.5 anim-fade">
+            <div className="flex items-center justify-between mb-1.5">
               <div className="flex items-center gap-2">
-                <span className={`font-mono font-semibold ${colorClass.split(' ')[1] || ''}`}>
-                  {e.event_type}
+                <span className="w-7 h-7 rounded-full flex items-center justify-center text-xs"
+                  style={{ background: `color-mix(in srgb, ${meta.color} 18%, transparent)`, color: meta.color }}>
+                  {meta.icon}
                 </span>
-                {e.symbol && <span className="font-mono text-white">{e.symbol}</span>}
-                {e.decision && (
-                  <span className={`font-bold ${
-                    e.decision === 'BUY' ? 'text-[#00c851]' :
-                    e.decision === 'SELL' ? 'text-[#ff4444]' : 'text-[#ffbb33]'
-                  }`}>{e.decision}</span>
-                )}
-                {e.confidence !== null && e.confidence !== undefined && (
-                  <span className="text-[#8b949e]">
-                    {(parseFloat(e.confidence) * 100).toFixed(0)}%
-                  </span>
-                )}
+                <div>
+                  <div className="text-[12px] font-semibold" style={{ color: meta.color }}>{meta.label}</div>
+                  <div className="text-[10px] text-[var(--text-dim)]">
+                    {e.symbol && <span className="font-mono mr-1.5">{e.symbol}</span>}
+                    {e.decision && (
+                      <span className={
+                        e.decision === 'BUY' ? 'text-[var(--green)] font-bold' :
+                        e.decision === 'SELL' ? 'text-[var(--red)] font-bold' :
+                        'text-[var(--yellow)] font-bold'
+                      }>{e.decision}</span>
+                    )}
+                    {e.confidence != null && (
+                      <span className="ml-1.5">· {(parseFloat(e.confidence) * 100).toFixed(0)}%</span>
+                    )}
+                  </div>
+                </div>
               </div>
-              <span className="text-[#8b949e] font-mono">{time}</span>
+              <span className="text-[10px] text-[var(--text-dim)]">{time}</span>
             </div>
             {payload.reason && (
-              <div className="text-xs text-[#8b949e]">{payload.reason}</div>
+              <div className="text-[12px] text-[var(--text)]/80 leading-snug">{payload.reason}</div>
             )}
             {payload.error && (
-              <div className="text-xs text-[#ff4444]">⚠ {payload.error}</div>
+              <div className="text-[12px] text-[var(--red)]">{payload.error}</div>
             )}
-            {models && Array.isArray(models) && models.length > 0 && (
-              <div className="mt-1.5 grid grid-cols-2 gap-1">
+            {!compact && models && Array.isArray(models) && models.length > 0 && (
+              <div className="mt-2.5 grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {models.map((m, i) => (
-                  <div key={i} className="text-[10px] bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-[#e6edf3]">{m.label || m.model}</span>
+                  <div key={i} className="bg-white/3 border border-white/5 rounded-xl p-2">
+                    <div className="flex items-center justify-between text-[11px] mb-0.5">
+                      <span className="font-semibold">{m.label || m.model}</span>
                       <span className={
-                        m.action === 'BUY' ? 'text-[#00c851]' :
-                        m.action === 'SELL' ? 'text-[#ff4444]' : 'text-[#ffbb33]'
+                        m.action === 'BUY' ? 'text-[var(--green)] font-semibold' :
+                        m.action === 'SELL' ? 'text-[var(--red)] font-semibold' :
+                        'text-[var(--yellow)] font-semibold'
                       }>{m.action} {(m.confidence * 100).toFixed(0)}%</span>
                     </div>
                     {m.rationale && (
-                      <div className="text-[#8b949e] mt-0.5 leading-snug">{m.rationale}</div>
+                      <div className="text-[10.5px] text-[var(--text-dim)] leading-snug">{m.rationale}</div>
                     )}
                   </div>
                 ))}

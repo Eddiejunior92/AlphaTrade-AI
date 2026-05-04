@@ -1,45 +1,48 @@
 export default function HoldingsTable({ holdings = [] }) {
   if (!holdings.length) {
-    return <div className="text-center text-[#8b949e] py-8 text-sm">No open positions</div>;
+    return (
+      <div className="text-center py-12">
+        <div className="text-4xl mb-2 opacity-40">📭</div>
+        <div className="text-sm text-[var(--text-dim)]">No open positions</div>
+        <div className="text-[11px] text-[var(--text-dim)] mt-1">Alpha is watching the market for high-conviction setups</div>
+      </div>
+    );
   }
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-[#8b949e] text-xs uppercase border-b border-[#30363d]">
-            <th className="text-left pb-2 pr-4">Symbol</th>
-            <th className="text-right pb-2 pr-4">Qty</th>
-            <th className="text-right pb-2 pr-4">Avg Cost</th>
-            <th className="text-right pb-2 pr-4">Current</th>
-            <th className="text-right pb-2 pr-4">Stop / Target</th>
-            <th className="text-right pb-2 pr-4">Market Val</th>
-            <th className="text-right pb-2">Unrealized P&amp;L</th>
-          </tr>
-        </thead>
-        <tbody>
-          {holdings.map(h => {
-            const pnl = h.unrealizedPnL || 0;
-            const isPos = pnl >= 0;
-            return (
-              <tr key={h.symbol} className="border-b border-[#30363d]/50 hover:bg-[#161b22]/50">
-                <td className="py-2 pr-4 font-bold font-mono">{h.symbol}</td>
-                <td className="py-2 pr-4 text-right font-mono">{h.qty}</td>
-                <td className="py-2 pr-4 text-right font-mono">${h.avgCost.toFixed(2)}</td>
-                <td className="py-2 pr-4 text-right font-mono">${h.currentPrice.toFixed(2)}</td>
-                <td className="py-2 pr-4 text-right font-mono text-xs">
-                  {h.stopLoss ? <span className="text-[#ff4444]">${h.stopLoss}</span> : '—'}
-                  {' / '}
-                  {h.takeProfit ? <span className="text-[#00c851]">${h.takeProfit}</span> : '—'}
-                </td>
-                <td className="py-2 pr-4 text-right font-mono">${h.marketValue.toFixed(2)}</td>
-                <td className={`py-2 text-right font-mono ${isPos ? 'text-[#00c851]' : 'text-[#ff4444]'}`}>
-                  {isPos ? '+' : ''}${pnl.toFixed(2)}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+    <div className="space-y-2">
+      {holdings.map(h => {
+        const pnl = h.unrealizedPnL || 0;
+        const pct = h.avgCost ? ((h.currentPrice - h.avgCost) / h.avgCost * 100) : 0;
+        const isPos = pnl >= 0;
+        return (
+          <div key={h.symbol} className="glass p-4 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center font-bold text-[12px]">
+                {h.symbol.slice(0, 3)}
+              </div>
+              <div>
+                <div className="font-semibold text-[15px]">{h.symbol}</div>
+                <div className="text-[11px] text-[var(--text-dim)]">
+                  {h.qty} sh · avg ${h.avgCost.toFixed(2)}
+                </div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="font-semibold text-[15px]">${h.marketValue.toFixed(2)}</div>
+              <div className={`text-[12px] font-medium ${isPos ? 'text-[var(--green)]' : 'text-[var(--red)]'}`}>
+                {isPos ? '+' : ''}${pnl.toFixed(2)} · {isPos ? '+' : ''}{pct.toFixed(2)}%
+              </div>
+              {(h.stopLoss || h.takeProfit) && (
+                <div className="text-[10px] text-[var(--text-dim)] mt-0.5">
+                  {h.stopLoss && <span className="text-[var(--red)]">SL ${h.stopLoss}</span>}
+                  {h.stopLoss && h.takeProfit && ' · '}
+                  {h.takeProfit && <span className="text-[var(--green)]">TP ${h.takeProfit}</span>}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

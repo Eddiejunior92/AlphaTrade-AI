@@ -1,12 +1,13 @@
-export default function StatCard({ label, value, sub, color = 'text-white', icon }) {
+export default function StatCard({ label, value, sub, icon, color, accent }) {
   return (
-    <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4 flex flex-col gap-1">
-      <div className="flex items-center gap-2 text-[#8b949e] text-xs uppercase tracking-wider">
-        {icon && <span>{icon}</span>}
-        {label}
+    <div className="glass p-4 sm:p-5 transition-transform hover:-translate-y-0.5">
+      <div className="flex items-start justify-between mb-2">
+        <span className="text-[11px] font-medium text-[var(--text-dim)] uppercase tracking-wider">{label}</span>
+        {icon && <span className="text-base opacity-60">{icon}</span>}
       </div>
-      <div className={`text-2xl font-bold font-mono ${color}`}>{value}</div>
-      {sub && <div className="text-xs text-[#8b949e]">{sub}</div>}
+      <div className={`text-2xl sm:text-3xl font-semibold tracking-tight ${color || 'text-[var(--text)]'}`}>{value}</div>
+      {sub && <div className="text-[12px] text-[var(--text-dim)] mt-1">{sub}</div>}
+      {accent && <div className={`mt-3 h-0.5 rounded-full ${accent}`} />}
     </div>
   );
 }

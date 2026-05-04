@@ -5,19 +5,30 @@ import SignalCard from './components/SignalCard';
 import TradeLog from './components/TradeLog';
 import HoldingsTable from './components/HoldingsTable';
 import ReasoningFeed from './components/ReasoningFeed';
+import VoiceChat from './components/VoiceChat';
+import Tooltip from './components/Tooltip';
 
-const TABS = ['Dashboard', 'AI Reasoning', 'Holdings', 'Trade History', 'Signals'];
+const TABS = [
+  { id: 'home',    label: 'Home',     icon: '◐' },
+  { id: 'reason',  label: 'Reasoning', icon: '🧠' },
+  { id: 'positions', label: 'Positions', icon: '📊' },
+  { id: 'trades',  label: 'Trades',   icon: '📜' },
+  { id: 'settings', label: 'Settings', icon: '⚙' },
+];
+
+function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }
 
 export default function App() {
-  const [tab, setTab] = useState('Dashboard');
+  const [tab, setTab] = useState('home');
+  const [chatOpen, setChatOpen] = useState(false);
   const {
-    state, trades, audit, connected, loading,
+    state, trades, audit, connected, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker,
   } = useAgent();
 
-  const equity = state ? state.equity.toFixed(2) : '—';
-  const cash = state ? state.cash.toFixed(2) : '—';
+  const equity = state?.equity || 0;
+  const cash = state?.cash || 0;
   const dailyPnL = state?.dailyPnL || 0;
   const totalPnL = state?.totalPnL || 0;
   const dailyPct = state?.dailyPnLPct || 0;
@@ -27,220 +38,366 @@ export default function App() {
   const paused = state?.emergencyPause;
   const cbTripped = state?.circuitBreakerTripped;
   const providers = state?.providers || { openrouter: false, xai: false };
+  const activeModels = (providers.openrouter ? 3 : 0) + (providers.xai ? 1 : 0);
   const risk = state?.risk;
+  const mode = state?.mode || 'paper';
 
   return (
-    <div className="min-h-screen bg-[#0d1117] text-[#e6edf3]">
-      <header className="border-b border-[#30363d] bg-[#161b22] px-6 py-3 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-3">
-          <span className="text-2xl">📈</span>
-          <div>
-            <h1 className="font-bold text-lg leading-tight">AlphaTrade AI</h1>
-            <div className="text-xs text-[#8b949e]">Multi-LLM Autonomous Trading Agent · v2</div>
+    <div className="min-h-screen pb-28 sm:pb-24">
+      {/* Top bar */}
+      <header className="sticky top-0 z-40 px-4 sm:px-6 py-3 backdrop-blur-xl bg-black/40 border-b border-white/5">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-2xl bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-base font-bold">α</div>
+            <div>
+              <div className="font-semibold text-[15px] tracking-tight">AlphaTrade</div>
+              <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5">
+                <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-[var(--green)] pulse-live' : 'bg-[var(--red)]'}`} />
+                {connected ? 'Live' : 'Reconnecting…'} · Cycle #{state?.cycleCount ?? 0}
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1.5 text-xs">
-            <div className={`w-2 h-2 rounded-full ${connected ? 'bg-[#00c851] pulse-green' : 'bg-[#ff4444]'}`} />
-            <span className="text-[#8b949e]">{connected ? 'Live' : 'Disconnected'}</span>
-          </div>
-          <div className={`text-xs px-2 py-1 rounded border font-mono ${
-            state?.mode === 'paper'
-              ? 'border-[#ffbb33]/40 text-[#ffbb33] bg-[#ffbb33]/5'
-              : 'border-[#ff4444]/40 text-[#ff4444] bg-[#ff4444]/5'
-          }`}>
-            {state?.mode?.toUpperCase() || 'PAPER'}
+          <div className="flex items-center gap-2">
+            <Tooltip text={`Currently ${mode === 'paper' ? 'paper trading (simulated, safe)' : 'LIVE trading with real money'}`}>
+              <span className={`text-[10px] font-bold px-2.5 py-1 rounded-full ${
+                mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
+              }`}>{mode.toUpperCase()}</span>
+            </Tooltip>
+            <Tooltip text="Talk to Alpha — your AI broker">
+              <button onClick={() => setChatOpen(true)}
+                className="w-9 h-9 rounded-full bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-sm">💬</button>
+            </Tooltip>
           </div>
         </div>
       </header>
 
       {/* Banners */}
       {paused && (
-        <div className="bg-[#ff4444]/10 border-b border-[#ff4444]/30 px-6 py-2 flex items-center justify-between">
-          <div className="text-[#ff4444] text-sm font-semibold">⏸ Emergency Pause Active — All trading halted</div>
-          <button onClick={resume} disabled={loading.resume}
-            className="text-xs px-3 py-1 rounded border border-[#00c851]/50 text-[#00c851] hover:bg-[#00c851]/10 disabled:opacity-50">
-            {loading.resume ? '...' : 'Resume Trading'}
-          </button>
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
+          <div className="glass p-3.5 flex items-center justify-between border border-[var(--red)]/30">
+            <div className="flex items-center gap-3">
+              <div className="text-xl">⏸</div>
+              <div>
+                <div className="text-sm font-semibold text-[var(--red)]">Emergency Pause Active</div>
+                <div className="text-[11px] text-[var(--text-dim)]">All trading halted by you. Resume when ready.</div>
+              </div>
+            </div>
+            <button onClick={resume} disabled={loading.resume} className="ios-btn ios-btn-success text-xs">
+              {loading.resume ? '…' : 'Resume'}
+            </button>
+          </div>
         </div>
       )}
       {cbTripped && (
-        <div className="bg-[#ff4444]/10 border-b border-[#ff4444]/30 px-6 py-2 flex items-center justify-between">
-          <div className="text-[#ff4444] text-sm font-semibold">🚨 Circuit Breaker Tripped — Daily drawdown exceeded</div>
-          <button onClick={resetCircuitBreaker} disabled={loading.cbReset}
-            className="text-xs px-3 py-1 rounded border border-[#ff4444]/50 text-[#ff4444] hover:bg-[#ff4444]/10 disabled:opacity-50">
-            {loading.cbReset ? '...' : 'Reset'}
-          </button>
-        </div>
-      )}
-      {!providers.openrouter && !providers.xai && (
-        <div className="bg-[#ffbb33]/10 border-b border-[#ffbb33]/30 px-6 py-2 text-[#ffbb33] text-sm">
-          ⚠ No LLM providers configured. Add <span className="font-mono">OPENROUTER_API_KEY</span> and <span className="font-mono">XAI_API_KEY</span> to Replit Secrets.
-        </div>
-      )}
-
-      {/* Controls */}
-      <div className="px-6 py-4 border-b border-[#30363d] flex items-center gap-3 flex-wrap">
-        {isRunning ? (
-          <button onClick={stopAgent} disabled={loading.stop}
-            className="px-4 py-2 rounded-lg bg-[#ff4444]/10 border border-[#ff4444]/40 text-[#ff4444] text-sm font-semibold hover:bg-[#ff4444]/20 disabled:opacity-50">
-            {loading.stop ? '…' : '⏹ Stop Agent'}
-          </button>
-        ) : (
-          <button onClick={startAgent} disabled={loading.start || paused}
-            className="px-4 py-2 rounded-lg bg-[#00c851]/10 border border-[#00c851]/40 text-[#00c851] text-sm font-semibold hover:bg-[#00c851]/20 disabled:opacity-50">
-            {loading.start ? '…' : '▶ Start Agent'}
-          </button>
-        )}
-        <button onClick={runNow} disabled={loading.runNow || paused}
-          className="px-4 py-2 rounded-lg bg-[#2196f3]/10 border border-[#2196f3]/40 text-[#2196f3] text-sm font-semibold hover:bg-[#2196f3]/20 disabled:opacity-50">
-          {loading.runNow ? 'Running…' : '⚡ Run Cycle Now'}
-        </button>
-        {!paused && (
-          <button onClick={emergencyPause} disabled={loading.pause}
-            className="px-4 py-2 rounded-lg bg-[#ff4444]/10 border border-[#ff4444]/40 text-[#ff4444] text-sm font-semibold hover:bg-[#ff4444]/20 disabled:opacity-50">
-            {loading.pause ? '…' : '🛑 Emergency Pause'}
-          </button>
-        )}
-        <div className="ml-auto flex items-center gap-4 text-sm text-[#8b949e]">
-          {state?.lastRun && <span>Last run: {new Date(state.lastRun).toLocaleTimeString()}</span>}
-          <span>Cycle #{state?.cycleCount ?? 0}</span>
-          <span>Interval: {state?.intervalSeconds}s</span>
-        </div>
-      </div>
-
-      {/* Tabs */}
-      <div className="px-6 border-b border-[#30363d] flex gap-0 overflow-x-auto">
-        {TABS.map(t => (
-          <button key={t} onClick={() => setTab(t)}
-            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
-              tab === t ? 'border-[#2196f3] text-white' : 'border-transparent text-[#8b949e] hover:text-white'
-            }`}>{t}</button>
-        ))}
-      </div>
-
-      <main className="p-6">
-        {tab === 'Dashboard' && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <StatCard label="Portfolio Value" value={`$${equity}`} icon="💼" />
-              <StatCard label="Cash" value={`$${cash}`} icon="💵" color="text-[#00c851]" />
-              <StatCard label="Daily P&L" icon="📊"
-                value={`${dailyPnL >= 0 ? '+' : ''}$${dailyPnL.toFixed(2)}`}
-                color={dailyPnL >= 0 ? 'text-[#00c851]' : 'text-[#ff4444]'}
-                sub={`${dailyPct >= 0 ? '+' : ''}${dailyPct.toFixed(2)}% · stop at -${risk ? (risk.maxDailyDrawdownPct * 100).toFixed(0) : 5}%`} />
-              <StatCard label="Total P&L" icon="📈"
-                value={`${totalPnL >= 0 ? '+' : ''}$${totalPnL.toFixed(2)}`}
-                color={totalPnL >= 0 ? 'text-[#00c851]' : 'text-[#ff4444]'}
-                sub={`Start: $${state?.startingBalance?.toFixed(2) || '—'}`} />
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <StatCard label="Agent Status" icon="🤖"
-                value={paused ? 'Paused' : isRunning ? 'Running' : 'Stopped'}
-                color={paused ? 'text-[#ff4444]' : isRunning ? 'text-[#00c851]' : 'text-[#8b949e]'} />
-              <StatCard label="Open Positions" value={holdings.length} icon="📌"
-                sub={`Max: ${risk?.maxHoldings || 8}`} />
-              <StatCard label="Confidence Gate" icon="🎯"
-                value={`${risk ? (risk.confidenceThreshold * 100).toFixed(0) : 85}%`}
-                sub={`Max ${risk ? (risk.maxPositionPct * 100).toFixed(0) : 3}% per position`} />
-              <StatCard label="LLM Ensemble" icon="🧠"
-                value={`${(providers.openrouter ? 3 : 0) + (providers.xai ? 1 : 0)}/4`}
-                sub="Gemini · Claude · GPT-4o · Grok"
-                color="text-[#ffbb33]" />
-            </div>
-
-            {state?.lastError && (
-              <div className="bg-[#ff4444]/10 border border-[#ff4444]/30 rounded-xl p-3 text-sm text-[#ff4444]">
-                ⚠ Last cycle error: {state.lastError}
-              </div>
-            )}
-
-            {signals.length > 0 && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
+          <div className="glass p-3.5 flex items-center justify-between border border-[var(--red)]/30">
+            <div className="flex items-center gap-3">
+              <div className="text-xl">🚨</div>
               <div>
-                <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-3">Latest Signals</h2>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="text-sm font-semibold text-[var(--red)]">Circuit Breaker Tripped</div>
+                <div className="text-[11px] text-[var(--text-dim)]">Daily drawdown exceeded {(risk?.maxDailyDrawdownPct * 100).toFixed(0)}%. Reset to resume.</div>
+              </div>
+            </div>
+            <button onClick={resetCircuitBreaker} disabled={loading.cbReset} className="ios-btn ios-btn-danger text-xs">
+              {loading.cbReset ? '…' : 'Reset'}
+            </button>
+          </div>
+        </div>
+      )}
+      {!providers.openrouter && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
+          <div className="glass p-3.5 border border-[var(--yellow)]/30 text-[var(--yellow)] text-[12px]">
+            ⚠ Add <span className="font-mono">OPENROUTER_API_KEY</span> to enable the AI ensemble and broker chat.
+          </div>
+        </div>
+      )}
+
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-5 anim-fade">
+        {tab === 'home' && (
+          <div className="space-y-6">
+            {/* Hero portfolio card */}
+            <div className="glass-strong p-6 sm:p-8">
+              <div className="text-[11px] text-[var(--text-dim)] uppercase tracking-wider mb-1">Portfolio Value</div>
+              <div className="text-4xl sm:text-5xl font-semibold tracking-tight">${fmt(equity)}</div>
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-3">
+                <div className={`text-sm font-medium ${dailyPnL >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]'}`}>
+                  {dailyPnL >= 0 ? '↑' : '↓'} ${fmt(Math.abs(dailyPnL))} ({dailyPct >= 0 ? '+' : ''}{dailyPct.toFixed(2)}%) today
+                </div>
+                <div className="text-[12px] text-[var(--text-dim)]">
+                  All-time: <span className={totalPnL >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]'}>
+                    {totalPnL >= 0 ? '+' : ''}${fmt(totalPnL)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3 mt-6">
+                <div>
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Cash</div>
+                  <div className="text-base font-semibold">${fmt(cash)}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Positions</div>
+                  <div className="text-base font-semibold">{holdings.length} <span className="text-[var(--text-dim)] text-[11px] font-normal">/ {risk?.maxHoldings || 8}</span></div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">AI Models</div>
+                  <div className="text-base font-semibold">{activeModels} <span className="text-[var(--text-dim)] text-[11px] font-normal">/ 4</span></div>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick actions */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <Tooltip text={isRunning ? 'Stop the autonomous trading loop' : 'Start the AI agent — it will analyze the market every 5 minutes'}>
+                {isRunning ? (
+                  <button onClick={stopAgent} disabled={loading.stop} className="ios-btn ios-btn-ghost w-full">
+                    <span>⏹</span> {loading.stop ? '…' : 'Stop Agent'}
+                  </button>
+                ) : (
+                  <button onClick={startAgent} disabled={loading.start || paused} className="ios-btn ios-btn-success w-full">
+                    <span>▶</span> {loading.start ? '…' : 'Start Agent'}
+                  </button>
+                )}
+              </Tooltip>
+              <Tooltip text="Run one analysis cycle right now without waiting">
+                <button onClick={runNow} disabled={loading.runNow || paused} className="ios-btn ios-btn-primary w-full">
+                  <span>⚡</span> {loading.runNow ? 'Running…' : 'Run Now'}
+                </button>
+              </Tooltip>
+              <Tooltip text="Instantly halt all trading. Use this if anything feels off.">
+                <button onClick={paused ? resume : emergencyPause} disabled={loading.pause || loading.resume}
+                  className={`ios-btn w-full ${paused ? 'ios-btn-success' : 'ios-btn-danger'}`}>
+                  <span>{paused ? '▶' : '🛑'}</span> {paused ? 'Resume' : 'Pause'}
+                </button>
+              </Tooltip>
+              <Tooltip text="Open chat with Alpha — your personal AI broker. Use voice or text.">
+                <button onClick={() => setChatOpen(true)} className="ios-btn ios-btn-ghost w-full">
+                  <span>🎙</span> Talk to Alpha
+                </button>
+              </Tooltip>
+            </div>
+
+            {/* Stats */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <StatCard label="Confidence Gate" icon="🎯" value={`${(risk?.confidenceThreshold * 100).toFixed(0) || 85}%`}
+                sub="Below this, no trade fires" color="text-[var(--blue)]" />
+              <StatCard label="Max Per Trade" icon="🛡" value={`${(risk?.maxPositionPct * 100).toFixed(0) || 3}%`}
+                sub="Of portfolio per position" />
+              <StatCard label="Daily Stop" icon="🚨" value={`${(risk?.maxDailyDrawdownPct * 100).toFixed(0) || 5}%`}
+                sub="Auto-halt on drawdown" color="text-[var(--red)]" />
+              <StatCard label="Status" icon="🤖"
+                value={paused ? 'Paused' : isRunning ? 'Active' : 'Idle'}
+                color={paused ? 'text-[var(--red)]' : isRunning ? 'text-[var(--green)]' : 'text-[var(--text-dim)]'}
+                sub={state?.lastRun ? `Last run ${new Date(state.lastRun).toLocaleTimeString()}` : 'Never run'} />
+            </div>
+
+            {/* Live signals */}
+            {signals.length > 0 && (
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-[15px] font-semibold tracking-tight">Live Signals</h2>
+                  <span className="text-[11px] text-[var(--text-dim)]">{signals.length} symbols</span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
                   {signals.slice(0, 8).map(s => <SignalCard key={s.symbol} signal={s} />)}
                 </div>
-              </div>
+              </section>
             )}
 
-            {holdings.length > 0 && (
-              <div>
-                <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-3">Open Positions</h2>
-                <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-                  <HoldingsTable holdings={holdings} />
+            {/* Reasoning preview */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-[15px] font-semibold tracking-tight flex items-center gap-2">
+                  <span>🧠</span> Alpha's Latest Thinking
+                </h2>
+                <button onClick={() => setTab('reason')} className="text-[11px] text-[var(--blue)] font-medium">See all →</button>
+              </div>
+              <ReasoningFeed entries={audit.slice(0, 5)} compact />
+            </section>
+          </div>
+        )}
+
+        {tab === 'reason' && (
+          <div className="space-y-4">
+            <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
+              <div className="flex items-center gap-3">
+                <div className="text-3xl">🧠</div>
+                <div>
+                  <h2 className="text-lg font-semibold tracking-tight">AI Reasoning</h2>
+                  <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes is logged here in real time. Each model votes independently — Alpha only acts when 3+ agree at high confidence.</div>
                 </div>
               </div>
-            )}
+            </div>
+            <ReasoningFeed entries={audit} />
+          </div>
+        )}
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div>
-                <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-3">Recent Trades</h2>
-                <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-                  <TradeLog trades={trades.slice(0, 8)} />
+        {tab === 'positions' && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold tracking-tight">Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {holdings.length}</span></h2>
+            <HoldingsTable holdings={holdings} />
+          </div>
+        )}
+
+        {tab === 'trades' && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold tracking-tight">Trade History <span className="text-[var(--text-dim)] text-sm font-normal">· {trades.length}</span></h2>
+            <TradeLog trades={trades} />
+          </div>
+        )}
+
+        {tab === 'settings' && (
+          <div className="space-y-5">
+            <h2 className="text-lg font-semibold tracking-tight">Settings & Account</h2>
+
+            {/* Mode toggle */}
+            <div className="glass p-5">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <div className="font-semibold text-[14px]">Trading Mode</div>
+                  <div className="text-[11px] text-[var(--text-dim)]">Paper = simulated · Live = real money</div>
+                </div>
+                <Tooltip text="Set TRADING_MODE=live in your environment to switch. Restart required.">
+                  <span className={`text-[10px] font-bold px-3 py-1.5 rounded-full ${
+                    mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
+                  }`}>{mode.toUpperCase()}</span>
+                </Tooltip>
+              </div>
+              <div className="text-[11px] text-[var(--text-dim)] bg-white/3 rounded-xl p-3">
+                Currently in <strong>{mode}</strong> mode. {mode === 'paper'
+                  ? 'All orders simulated through Alpaca paper account — your real money is safe.'
+                  : 'Orders will execute with real capital. Use extreme caution.'}
+              </div>
+            </div>
+
+            {/* Funds */}
+            <div className="glass p-5">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <div className="font-semibold text-[14px]">Connected Account</div>
+                  <div className="text-[11px] text-[var(--text-dim)]">Alpaca {mode === 'paper' ? 'Paper' : 'Live'} brokerage</div>
+                </div>
+                <Tooltip text="Manage funding directly in your Alpaca dashboard">
+                  <a href="https://app.alpaca.markets" target="_blank" rel="noreferrer" className="ios-btn ios-btn-primary text-xs">
+                    Add / Manage Funds
+                  </a>
+                </Tooltip>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Cash Balance</div>
+                  <div className="text-lg font-semibold">${fmt(cash)}</div>
+                </div>
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Total Equity</div>
+                  <div className="text-lg font-semibold">${fmt(equity)}</div>
                 </div>
               </div>
+            </div>
+
+            {/* Agent control */}
+            <div className="glass p-5 space-y-3">
               <div>
-                <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-3">AI Reasoning Feed</h2>
-                <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-                  <ReasoningFeed entries={audit.slice(0, 12)} />
-                </div>
+                <div className="font-semibold text-[14px] mb-1">Agent Control</div>
+                <div className="text-[11px] text-[var(--text-dim)]">Start, stop, or pause Alpha at any time</div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {isRunning ? (
+                  <button onClick={stopAgent} disabled={loading.stop} className="ios-btn ios-btn-ghost">⏹ Stop Agent</button>
+                ) : (
+                  <button onClick={startAgent} disabled={loading.start || paused} className="ios-btn ios-btn-success">▶ Start Agent</button>
+                )}
+                <button onClick={runNow} disabled={loading.runNow || paused} className="ios-btn ios-btn-primary">⚡ Run Now</button>
+                {paused ? (
+                  <button onClick={resume} disabled={loading.resume} className="ios-btn ios-btn-success col-span-2">▶ Resume from Pause</button>
+                ) : (
+                  <button onClick={emergencyPause} disabled={loading.pause} className="ios-btn ios-btn-danger col-span-2">🛑 Emergency Pause</button>
+                )}
+                {cbTripped && (
+                  <button onClick={resetCircuitBreaker} disabled={loading.cbReset} className="ios-btn ios-btn-danger col-span-2">↻ Reset Circuit Breaker</button>
+                )}
               </div>
             </div>
-          </div>
-        )}
 
-        {tab === 'AI Reasoning' && (
-          <div>
-            <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-4">
-              Live AI Decision Log — {audit.length} events
-            </h2>
-            <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-              <ReasoningFeed entries={audit} />
-            </div>
-          </div>
-        )}
-
-        {tab === 'Holdings' && (
-          <div>
-            <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-4">
-              Open Positions — {holdings.length} active
-            </h2>
-            <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-              <HoldingsTable holdings={holdings} />
-            </div>
-          </div>
-        )}
-
-        {tab === 'Trade History' && (
-          <div>
-            <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-4">
-              Trade History — {trades.length} entries
-            </h2>
-            <div className="bg-[#161b22] border border-[#30363d] rounded-xl p-4">
-              <TradeLog trades={trades} />
-            </div>
-          </div>
-        )}
-
-        {tab === 'Signals' && (
-          <div>
-            <h2 className="text-sm font-semibold text-[#8b949e] uppercase tracking-wider mb-4">
-              Latest AI Signals — {signals.length} symbols
-            </h2>
-            {signals.length === 0 ? (
-              <div className="text-center text-[#8b949e] py-16 text-sm">
-                No signals yet. Click <strong>Run Cycle Now</strong> to generate.
+            {/* Risk config */}
+            <div className="glass p-5">
+              <div className="font-semibold text-[14px] mb-3">Risk Guardrails</div>
+              <div className="space-y-2 text-[12px]">
+                <Row label="Confidence required" value={`${(risk?.confidenceThreshold * 100).toFixed(0)}%`} />
+                <Row label="Max position size" value={`${(risk?.maxPositionPct * 100).toFixed(0)}% of portfolio`} />
+                <Row label="Daily drawdown stop" value={`${(risk?.maxDailyDrawdownPct * 100).toFixed(0)}%`} />
+                <Row label="Stop-loss / take-profit" value={`-${(risk?.stopLossPct * 100).toFixed(0)}% / +${(risk?.takeProfitPct * 100).toFixed(0)}%`} />
+                <Row label="Max holdings" value={risk?.maxHoldings} />
+                <Row label="Cycle interval" value={`${state?.intervalSeconds}s`} />
+                <Row label="Watchlist" value={state?.watchlist?.join(', ')} />
               </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {signals.map(s => <SignalCard key={s.symbol} signal={s} />)}
+            </div>
+
+            {/* AI Models */}
+            <div className="glass p-5">
+              <div className="font-semibold text-[14px] mb-3">AI Ensemble</div>
+              <div className="space-y-2">
+                {(providers.models || []).map(m => {
+                  const active = (m.provider === 'openrouter' && providers.openrouter) || (m.provider === 'xai' && providers.xai);
+                  return (
+                    <div key={m.id} className="flex items-center justify-between bg-white/3 rounded-xl p-3">
+                      <div>
+                        <div className="text-[13px] font-semibold">{m.label}</div>
+                        <div className="text-[10px] text-[var(--text-dim)]">{m.role}</div>
+                      </div>
+                      <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${
+                        active ? 'bg-[var(--green)]/15 text-[var(--green)]' : 'bg-white/5 text-[var(--text-dim)]'
+                      }`}>{active ? 'ACTIVE' : 'OFFLINE'}</span>
+                    </div>
+                  );
+                })}
               </div>
-            )}
+            </div>
           </div>
         )}
       </main>
+
+      {/* Bottom nav (mobile-first) */}
+      <nav className="fixed bottom-0 inset-x-0 z-50 px-3 pb-3 safe-bottom">
+        <div className="max-w-md mx-auto glass-strong px-2 py-2 flex items-center justify-between">
+          {TABS.map(t => (
+            <Tooltip key={t.id} text={
+              t.id === 'home' ? 'Dashboard overview' :
+              t.id === 'reason' ? "See Alpha's reasoning live" :
+              t.id === 'positions' ? 'Your open positions' :
+              t.id === 'trades' ? 'Trade history' :
+              'Settings, funds, mode toggle'
+            }>
+              <button onClick={() => setTab(t.id)}
+                className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-2xl transition-all ${
+                  tab === t.id ? 'bg-white/10 text-white' : 'text-[var(--text-dim)] hover:text-white'
+                }`}>
+                <span className="text-base leading-none">{t.icon}</span>
+                <span className="text-[9px] font-medium">{t.label}</span>
+              </button>
+            </Tooltip>
+          ))}
+        </div>
+      </nav>
+
+      {/* Floating voice button */}
+      <Tooltip text="Tap to talk with Alpha — your AI broker">
+        <button onClick={() => setChatOpen(true)}
+          className="fixed bottom-24 right-4 sm:bottom-6 sm:right-6 z-40 w-14 h-14 rounded-full bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-2xl shadow-2xl pulse-live">
+          🎙
+        </button>
+      </Tooltip>
+
+      <VoiceChat open={chatOpen} onClose={() => setChatOpen(false)} brokerChat={brokerChat} />
+    </div>
+  );
+}
+
+function Row({ label, value }) {
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b border-white/5 last:border-0">
+      <span className="text-[var(--text-dim)]">{label}</span>
+      <span className="font-medium text-right">{value}</span>
     </div>
   );
 }

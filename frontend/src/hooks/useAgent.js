@@ -71,8 +71,17 @@ export function useAgent() {
     finally { setLoad(key, false); }
   };
 
+  const brokerChat = useCallback(async (messages) => {
+    const res = await fetch(`${API}/broker/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    });
+    return res.json();
+  }, []);
+
   return {
-    state, trades, audit, connected, loading,
+    state, trades, audit, connected, loading, brokerChat,
     startAgent: wrap('start', () => apiPost('/agent/start')),
     stopAgent: wrap('stop', () => apiPost('/agent/stop')),
     runNow: wrap('runNow', () => apiPost('/agent/run-now')),

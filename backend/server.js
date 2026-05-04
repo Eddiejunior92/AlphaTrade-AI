@@ -9,6 +9,7 @@ const {
 } = require('./agent');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
+const brokerService = require('./services/brokerService');
 const db = require('./services/db');
 
 const app = express();
@@ -131,6 +132,35 @@ app.get('/api/audit', async (req, res) => {
 
 app.get('/api/account', async (req, res) => {
   res.json(await alpacaService.getAccount());
+});
+
+app.post('/api/broker/chat', async (req, res) => {
+  try {
+    const { messages } = req.body || {};
+    if (!Array.isArray(messages) || !messages.length) {
+      return res.status(400).json({ error: 'messages array required' });
+    }
+    const [snapshot, recentTrades, recentAudit] = await Promise.all([
+      getAgentSnapshot(),
+      db.getRecentTrades(10),
+      db.getRecentAudit(20),
+    ]);
+    const recentSignals = recentAudit
+      .filter(a => a.event_type === 'SIGNAL')
+      .map(a => ({
+        symbol: a.symbol,
+        signal: a.decision,
+        confidence: parseFloat(a.confidence) || 0,
+      }))
+      .slice(0, 8);
+    const result = await brokerService.chat({
+      messages: messages.slice(-12),
+      snapshot, recentSignals, recentTrades,
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ reply: `Server error: ${e.message}`, error: true });
+  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
