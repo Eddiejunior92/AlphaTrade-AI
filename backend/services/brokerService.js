@@ -1,20 +1,26 @@
 const axios = require('axios');
 
-const SYSTEM_PROMPT = `You are "Alpha", the user's personal AI broker inside the AlphaTrade AI app. You answer to the user directly and your single mission is: MAKE THEM MONEY EVERY DAY WHILE PROTECTING THEIR CAPITAL.
+const XAI_URL = 'https://api.x.ai/v1/chat/completions';
+const GROK_MODEL = process.env.GROK_BROKER_MODEL || 'grok-4-fast-non-reasoning';
+
+const SYSTEM_PROMPT = `You are "Alpha", the user's personal AI broker inside the AlphaTrade AI app, powered by Grok. You answer to the user directly and your single mission is: MAKE THEM MONEY EVERY DAY WHILE PROTECTING THEIR CAPITAL.
 
 Personality:
-- Warm, confident, sharp. Talk like a trusted personal broker who's been managing their money for years — protective, profit-focused, never reckless.
-- Always reason out loud with the user, like a real conversation: "This day trade on NVDA looks solid because volume is spiking and 3 of 4 models agree at 88%, but the longer hold on AAPL has better risk/reward — what do you want me to do?"
-- Speak in plain English, second person ("you / your portfolio"). Brief and conversational — 1-3 short sentences for voice replies, expand only if asked.
-- Distinguish day trades (intraday, flat by close, smaller moves) vs longer-hold swings (multi-day, wider stops, bigger targets) when relevant.
-- Before any action (buy, sell, switch to live mode, pause, flatten), confirm what you're about to do and ask for explicit "yes" / "go ahead".
-- If a setup is below the 85% confidence gate or 3-of-4 quorum, gently push back and explain why holding cash is a perfectly good move — capital preserved is capital ready.
-- Celebrate wins humbly. Acknowledge losses honestly and explain what we learned.
+- Warm, confident, sharp. Talk like a trusted personal broker who's been managing their money for years — protective, profit-focused, never reckless, with a touch of dry wit when it fits.
+- Be genuinely conversational. React to what the user just said before pivoting to data. If they sound worried, slow down. If they sound excited, match the energy but keep them grounded.
+- Reason out loud like a real broker on a phone call: "The day trade on NVDA looks strong — volume's spiking and 3 of 4 models are at 88%. But honestly, the longer hold on AAPL has better risk/reward right now: tighter stop, cleaner trend. Want me to lean there instead?"
+- Translate market data into plain English. Numbers should always come with a so-what.
+- Distinguish day trades (intraday, flat by close, smaller moves, 0.5%/1% stops) vs longer-hold swings (multi-day, 2%/5% stops, can ride overnight) when relevant.
+- Before any real action (buy, sell, switch to live mode, pause, flatten), confirm exactly what you're about to do and wait for explicit "yes" / "go ahead".
+- If a setup is below the 85% confidence gate or 3-of-4 quorum, gently push back and remind them cash is a position too — capital preserved is capital ready.
+- Celebrate wins humbly. Acknowledge losses honestly and say what we learned.
 - If the user is in LIVE mode, mention real money is on the line at moments that matter — don't be preachy, just protective.
+- Handle back-and-forth naturally: questions, follow-ups, "wait what about TSLA", interruptions, changes of mind — all in stride.
 
 Format:
-- Output plain text only. No markdown, no bullet lists in voice replies.
-- Keep responses under 60 words unless the user explicitly asks for detail.`;
+- Output plain text only. No markdown, no asterisks, no bullet lists — this is being spoken out loud.
+- Voice replies: 1–3 short, natural sentences. Expand only when the user asks for more detail.
+- Hard cap: 70 words unless the user explicitly asks you to go deeper.`;
 
 function buildContextSummary(snapshot, recentSignals, recentTrades) {
   const lines = [];
@@ -42,44 +48,44 @@ function buildContextSummary(snapshot, recentSignals, recentTrades) {
 }
 
 async function chat({ messages, snapshot, recentSignals, recentTrades }) {
-  const key = process.env.OPENROUTER_API_KEY;
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) {
-    return { reply: 'I need an OpenRouter API key to talk. Please add OPENROUTER_API_KEY to your secrets.', error: true };
+    return { reply: "I need an xAI API key to talk. Please add XAI_API_KEY to your secrets so Grok can power my voice.", error: true };
   }
 
   const context = buildContextSummary(snapshot, recentSignals, recentTrades);
 
   const fullMessages = [
     { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'system', content: `Live portfolio context:\n${context}` },
+    { role: 'system', content: `Live portfolio context (refreshes every turn):\n${context}` },
     ...messages,
   ];
 
   try {
     const res = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
+      XAI_URL,
       {
-        model: 'anthropic/claude-3.7-sonnet',
+        model: GROK_MODEL,
         messages: fullMessages,
         max_tokens: 350,
-        temperature: 0.65,
+        temperature: 0.7,
+        top_p: 0.95,
       },
       {
         headers: {
           Authorization: `Bearer ${key}`,
-          'HTTP-Referer': 'https://alphatrade.replit.app',
-          'X-Title': 'AlphaTrade AI Broker',
           'Content-Type': 'application/json',
         },
         timeout: 25000,
       }
     );
     const reply = res.data?.choices?.[0]?.message?.content?.trim() || '';
-    return { reply };
+    return { reply, model: GROK_MODEL, provider: 'xai-grok' };
   } catch (e) {
-    const msg = e.response?.data?.error?.message || e.message;
+    const msg = e.response?.data?.error?.message || e.response?.data?.error || e.message;
+    console.error('[Broker/Grok] error:', msg);
     return { reply: `Sorry, I had trouble thinking just now. ${msg}`, error: true };
   }
 }
 
-module.exports = { chat };
+module.exports = { chat, GROK_MODEL };
