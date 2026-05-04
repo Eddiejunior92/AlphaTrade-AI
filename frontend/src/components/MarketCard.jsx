@@ -1,7 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, memo } from 'react';
 import {
   XAxis, YAxis, Tooltip as RTip, ResponsiveContainer, Area, AreaChart,
 } from 'recharts';
+
+// Concrete hex colors — SVG `stopColor` and `stroke` need real color strings.
+// CSS custom-property strings (var(--green)) sometimes break React 19 dev
+// profiling with structuredClone OOM via performance.measure.
+const COLOR_GREEN = '#34D399';
+const COLOR_RED   = '#F87171';
+const COLOR_GREEN_SOFT = '#7CD992';
+const COLOR_RED_SOFT   = '#FF8C8C';
 
 function fmtPrice(n) {
   return typeof n === 'number'
@@ -10,20 +18,20 @@ function fmtPrice(n) {
 }
 
 function sentimentColor(score) {
-  if (score >= 0.4) return 'var(--green)';
-  if (score >= 0.15) return '#7CD992';
-  if (score <= -0.4) return 'var(--red)';
-  if (score <= -0.15) return '#FF8C8C';
-  return 'var(--text-dim)';
+  if (score >= 0.4) return COLOR_GREEN;
+  if (score >= 0.15) return COLOR_GREEN_SOFT;
+  if (score <= -0.4) return COLOR_RED;
+  if (score <= -0.15) return COLOR_RED_SOFT;
+  return '#9CA3AF';
 }
 
 function signalColor(action) {
-  if (action === 'BUY') return 'var(--green)';
-  if (action === 'SELL') return 'var(--red)';
-  return 'var(--text-dim)';
+  if (action === 'BUY') return COLOR_GREEN;
+  if (action === 'SELL') return COLOR_RED;
+  return '#9CA3AF';
 }
 
-export default function MarketCard({ card }) {
+function MarketCard({ card }) {
   const [range, setRange] = useState('1d');
   const [bars, setBars] = useState([]);
   const [status, setStatus] = useState('loading'); // loading | ready | empty | error
@@ -58,7 +66,7 @@ export default function MarketCard({ card }) {
   const last = series[series.length - 1]?.c;
   const periodPct = first && last ? +(((last - first) / first) * 100).toFixed(2) : null;
   const up = periodPct == null ? (card.changePct ?? 0) >= 0 : periodPct >= 0;
-  const lineColor = up ? 'var(--green)' : 'var(--red)';
+  const lineColor = up ? COLOR_GREEN : COLOR_RED;
   const gradId = `grad-${card.symbol}-${range}`;
 
   // Latest price preference: live card.price > last bar close > —.
@@ -223,3 +231,23 @@ export default function MarketCard({ card }) {
     </div>
   );
 }
+
+// Memoize on symbol + price + signal/sentiment timestamps so identical-shape
+// re-renders from the 30s parent poll don't churn 15 charts.
+function areEqual(prev, next) {
+  const a = prev.card, b = next.card;
+  return (
+    a.symbol === b.symbol &&
+    a.price === b.price &&
+    a.changePct === b.changePct &&
+    a.signal?.timestamp === b.signal?.timestamp &&
+    a.signal?.consensus === b.signal?.consensus &&
+    a.signal?.confidence === b.signal?.confidence &&
+    a.signal?.reason === b.signal?.reason &&
+    a.sentiment?.fetchedAt === b.sentiment?.fetchedAt &&
+    a.sentiment?.score === b.sentiment?.score &&
+    a.sentiment?.summary === b.sentiment?.summary
+  );
+}
+
+export default memo(MarketCard, areEqual);

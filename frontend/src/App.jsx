@@ -8,6 +8,7 @@ import ReasoningFeed from './components/ReasoningFeed';
 import VoiceChat from './components/VoiceChat';
 import Tooltip from './components/Tooltip';
 import MarketsTab from './components/MarketsTab';
+import ErrorBoundary from './components/ErrorBoundary';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
@@ -274,7 +275,11 @@ export default function App() {
           </div>
         )}
 
-        {tab === 'markets' && <MarketsTab />}
+        {tab === 'markets' && (
+          <ErrorBoundary>
+            <MarketsTab />
+          </ErrorBoundary>
+        )}
 
         {tab === 'strategies' && (
           <div className="space-y-5">

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import MarketCard from './MarketCard';
+import ErrorBoundary from './ErrorBoundary';
 
 export default function MarketsTab() {
   const [data, setData] = useState(null);
@@ -57,7 +58,11 @@ export default function MarketsTab() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {cards.map(c => <MarketCard key={c.symbol} card={c} />)}
+          {cards.map(c => (
+            <ErrorBoundary key={c.symbol}>
+              <MarketCard card={c} />
+            </ErrorBoundary>
+          ))}
         </div>
       )}
     </div>
