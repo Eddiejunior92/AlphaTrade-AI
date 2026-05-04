@@ -54,6 +54,7 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(false);
   const [modeModal, setModeModal] = useState(null); // 'paper' | 'live' | null
   const [modeError, setModeError] = useState('');
+  const [modeConfirmText, setModeConfirmText] = useState('');
   const {
     state, trades, audit, connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
@@ -87,9 +88,11 @@ export default function App() {
     setModeError('');
     const target = modeModal;
     const r = await setTradingMode(target, target === 'live' ? 'I_UNDERSTAND_LIVE' : undefined);
-    if (r?.success) setModeModal(null);
+    if (r?.success) { setModeModal(null); setModeConfirmText(''); }
     else setModeError(r?.error || 'Switch failed');
   };
+  const closeModeModal = () => { setModeModal(null); setModeConfirmText(''); setModeError(''); };
+  const liveConfirmOk = modeConfirmText.trim().toUpperCase() === 'LIVE';
 
   return (
     <div className="min-h-screen pb-28 sm:pb-24">
@@ -539,7 +542,7 @@ export default function App() {
       {/* Mode-switch confirmation modal */}
       {modeModal && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 anim-fade">
-          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={() => setModeModal(null)} />
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={closeModeModal} />
           <div className="relative glass-strong w-full max-w-md p-6 anim-slide-up">
             <div className="text-3xl mb-2">{modeModal === 'live' ? '🔴' : '🟡'}</div>
             <h3 className="text-xl font-semibold tracking-tight mb-2">
@@ -547,13 +550,26 @@ export default function App() {
             </h3>
             {modeModal === 'live' ? (
               <div className="text-[13px] text-[var(--text-dim)] space-y-2">
-                <p><strong className="text-[var(--red)]">This uses real money.</strong> All trades will execute on your live Alpaca brokerage account immediately.</p>
-                <p>All risk gates remain active — 85% confidence, 3-of-4 quorum, $100/day loss budget — but actual losses will be real.</p>
-                <p className="text-[var(--yellow)]">Make sure you understand your strategy and risk before continuing.</p>
+                <p><strong className="text-[var(--red)]">This uses REAL money.</strong> Every trade executes on your live Alpaca brokerage account immediately and losses are permanent.</p>
+                <p>All safety gates stay active — 85% confidence, 3-of-4 model quorum, $100/day loss budget, circuit breaker, dynamic sizing, force-flatten before close — but actual losses will be real.</p>
+                <div className={`mt-2 rounded-xl p-2.5 text-[12px] ${liveAvailable ? 'bg-[var(--green)]/10 text-[var(--green)]' : 'bg-[var(--red)]/10 text-[var(--red)]'}`}>
+                  {liveAvailable
+                    ? '✓ Live API keys detected on the server.'
+                    : '✗ Live API keys NOT detected. Add ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY in Secrets first.'}
+                </div>
+                <p className="text-[var(--yellow)] pt-1">To confirm, type <span className="font-mono font-bold text-white">LIVE</span> below.</p>
+                <input
+                  type="text"
+                  autoFocus
+                  value={modeConfirmText}
+                  onChange={e => setModeConfirmText(e.target.value)}
+                  placeholder="Type LIVE to confirm"
+                  className="w-full mt-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder:text-[var(--text-dim)] focus:outline-none focus:border-[var(--red)]/50"
+                />
               </div>
             ) : (
               <div className="text-[13px] text-[var(--text-dim)]">
-                Switching back to paper mode. All future trades will be simulated through your Alpaca paper account. Your live positions will remain untouched on the broker side.
+                Switching back to paper mode. All future trades will be simulated through your Alpaca paper account. Any open live positions stay on the broker — they will not be touched by this switch.
               </div>
             )}
             {modeError && (
@@ -562,10 +578,12 @@ export default function App() {
               </div>
             )}
             <div className="grid grid-cols-2 gap-2 mt-5">
-              <button onClick={() => setModeModal(null)} disabled={loading.mode} className="ios-btn ios-btn-ghost">
+              <button onClick={closeModeModal} disabled={loading.mode} className="ios-btn ios-btn-ghost">
                 Cancel
               </button>
-              <button onClick={handleModeSwitch} disabled={loading.mode}
+              <button
+                onClick={handleModeSwitch}
+                disabled={loading.mode || (modeModal === 'live' && (!liveConfirmOk || !liveAvailable))}
                 className={`ios-btn ${modeModal === 'live' ? 'ios-btn-danger' : 'ios-btn-success'}`}>
                 {loading.mode ? '…' : modeModal === 'live' ? 'Yes, Go Live' : 'Switch to Paper'}
               </button>
