@@ -89,6 +89,34 @@ class AlpacaService {
     }
   }
 
+  async getClock() {
+    if (!this.isConfigured()) {
+      return { is_open: false, timestamp: new Date().toISOString(), next_open: null, next_close: null };
+    }
+    try {
+      const res = await axios.get(`${this.baseUrl}/v2/clock`, { headers: this.headers, timeout: 8000 });
+      return res.data;
+    } catch (e) {
+      console.error('[Alpaca] getClock error:', e.message);
+      return { is_open: false, timestamp: new Date().toISOString(), error: e.message };
+    }
+  }
+
+  async closeAllPositions() {
+    if (!this.isConfigured()) return [];
+    try {
+      const res = await axios.delete(`${this.baseUrl}/v2/positions`, {
+        headers: this.headers,
+        params: { cancel_orders: true },
+        timeout: 15000,
+      });
+      return res.data || [];
+    } catch (e) {
+      console.error('[Alpaca] closeAllPositions error:', e.message);
+      return [];
+    }
+  }
+
   async getLatestQuote(symbol) {
     try {
       const res = await axios.get(`${this.dataUrl}/v2/stocks/${symbol}/quotes/latest`, {

@@ -50,10 +50,15 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-2xl bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-base font-bold">α</div>
             <div>
-              <div className="font-semibold text-[15px] tracking-tight">AlphaTrade</div>
+              <div className="font-semibold text-[15px] tracking-tight">AlphaTrade <span className="text-[10px] font-medium text-[var(--blue)] ml-1">· Day Trading</span></div>
               <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5">
                 <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-[var(--green)] pulse-live' : 'bg-[var(--red)]'}`} />
                 {connected ? 'Live' : 'Reconnecting…'} · Cycle #{state?.cycleCount ?? 0}
+                {state?.market && (
+                  <span className={`ml-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold ${state.market.open ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/10 text-[var(--text-dim)]'}`}>
+                    {state.market.open ? 'MKT OPEN' : 'MKT CLOSED'}
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -148,7 +153,7 @@ export default function App() {
 
             {/* Quick actions */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <Tooltip text={isRunning ? 'Stop the autonomous trading loop' : 'Start the AI agent — it will analyze the market every 5 minutes'}>
+              <Tooltip text={isRunning ? 'Stop the autonomous trading loop' : `Start the AI day-trader — analyzes the market every ${state?.intervalSeconds ?? 60}s during market hours only`}>
                 {isRunning ? (
                   <button onClick={stopAgent} disabled={loading.stop} className="ios-btn ios-btn-ghost w-full">
                     <span>⏹</span> {loading.stop ? '…' : 'Stop Agent'}
@@ -181,14 +186,16 @@ export default function App() {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <StatCard label="Confidence Gate" icon="🎯" value={`${(risk?.confidenceThreshold * 100).toFixed(0) || 85}%`}
                 sub="Below this, no trade fires" color="text-[var(--blue)]" />
-              <StatCard label="Max Per Trade" icon="🛡" value={`${(risk?.maxPositionPct * 100).toFixed(0) || 3}%`}
-                sub="Of portfolio per position" />
-              <StatCard label="Daily Stop" icon="🚨" value={`${(risk?.maxDailyDrawdownPct * 100).toFixed(0) || 5}%`}
-                sub="Auto-halt on drawdown" color="text-[var(--red)]" />
+              <StatCard label="Daily Risk Cap" icon="💵" value={`$${risk?.maxDailyLossUSD ?? 100}`}
+                sub={`$${(state?.dailyLossUSD || 0).toFixed(2)} used today`} color="text-[var(--red)]" />
+              <StatCard label="Max Per Trade" icon="🛡" value={`$${risk?.maxRiskPerTradeUSD ?? 100}`}
+                sub={`Stop -${((risk?.stopLossPct || 0) * 100).toFixed(2)}% · Target +${((risk?.takeProfitPct || 0) * 100).toFixed(2)}%`} />
               <StatCard label="Status" icon="🤖"
-                value={paused ? 'Paused' : isRunning ? 'Active' : 'Idle'}
-                color={paused ? 'text-[var(--red)]' : isRunning ? 'text-[var(--green)]' : 'text-[var(--text-dim)]'}
-                sub={state?.lastRun ? `Last run ${new Date(state.lastRun).toLocaleTimeString()}` : 'Never run'} />
+                value={paused ? 'Paused' : isRunning ? (state?.market?.open ? 'Trading' : 'Waiting') : 'Idle'}
+                color={paused ? 'text-[var(--red)]' : isRunning ? (state?.market?.open ? 'text-[var(--green)]' : 'text-[var(--yellow)]') : 'text-[var(--text-dim)]'}
+                sub={state?.market?.open
+                  ? `Auto-flatten ${state?.forceFlattenMinutesBeforeClose || 5}m before close`
+                  : state?.market?.nextOpen ? `Opens ${new Date(state.market.nextOpen).toLocaleString([], { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric' })}` : 'Market closed'} />
             </div>
 
             {/* Live signals */}

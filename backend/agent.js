@@ -8,7 +8,11 @@ const db = require('./services/db');
 const WATCHLIST = (process.env.WATCHLIST || 'AAPL,NVDA,TSLA,MSFT,AMZN,META,GOOGL,SPY')
   .split(',').map(s => s.trim()).filter(Boolean);
 const TRADING_MODE = process.env.TRADING_MODE || 'paper';
-const INTERVAL_SECONDS = Math.max(60, parseInt(process.env.AGENT_INTERVAL_SECONDS || '300'));
+const STRATEGY = 'day-trading';
+const INTERVAL_SECONDS = Math.max(30, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
+const BAR_TIMEFRAME = process.env.BAR_TIMEFRAME || '1Min';
+const BAR_LOOKBACK = parseInt(process.env.BAR_LOOKBACK || '30');
+const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
 let memoryState = {
   lastRun: null,
@@ -16,11 +20,16 @@ let memoryState = {
   lastError: null,
   startTime: Date.now(),
   cycleCount: 0,
+  marketOpen: false,
+  nextOpen: null,
+  nextClose: null,
+  lastFlatten: null,
 };
 
 let intervalHandle = null;
 let dailyResetHandle = null;
 let cycleInProgress = false;
+let flattenInProgress = false;
 
 async function buildPriceLookup(holdings) {
   const lookup = {};
@@ -114,19 +123,87 @@ async function evaluateExistingPositions({ lookup, stale }, holdings, equity) {
   }
 }
 
+async function flattenAllPositions(reason = 'End-of-day flatten') {
+  if (flattenInProgress) return;
+  flattenInProgress = true;
+  try {
+    const holdings = await db.getHoldings();
+    if (!holdings.length) {
+      flattenInProgress = false;
+      return;
+    }
+    console.log(`[Agent] Flattening ${holdings.length} positions — ${reason}`);
+    await db.recordAudit({ event_type: 'FORCE_FLATTEN_START', payload: { reason, count: holdings.length } });
+
+    const brokerConfigured = alpacaService.isConfigured();
+    let brokerOk = !brokerConfigured;
+    if (brokerConfigured) {
+      try {
+        await alpacaService.closeAllPositions();
+        await new Promise(r => setTimeout(r, 1500));
+        const remaining = await alpacaService.getPositions();
+        brokerOk = remaining.length === 0;
+        if (!brokerOk) {
+          await db.recordAudit({
+            event_type: 'FORCE_FLATTEN_BROKER_FAIL',
+            payload: { reason, remaining: remaining.map(p => p.symbol) },
+          });
+          await discordService.sendCircuitBreakerAlert(
+            `⚠ FLATTEN INCOMPLETE — broker still holds: ${remaining.map(p => p.symbol).join(', ')}. Local state NOT cleared. Investigate immediately.`
+          );
+          console.error('[Agent] Broker flatten incomplete — local state preserved for reconciliation');
+          return;
+        }
+      } catch (e) {
+        await db.recordAudit({ event_type: 'FORCE_FLATTEN_BROKER_FAIL', payload: { reason, error: e.message } });
+        await discordService.sendCircuitBreakerAlert(`⚠ FLATTEN ERROR — ${e.message}. Local state NOT cleared.`);
+        console.error('[Agent] Broker flatten threw — local state preserved:', e.message);
+        return;
+      }
+    }
+
+    const priceMap = await buildPriceLookup(holdings);
+    for (const h of holdings) {
+      const price = priceMap.lookup[h.symbol] || parseFloat(h.avg_cost);
+      const qty = parseFloat(h.qty);
+      const pnl = (price - parseFloat(h.avg_cost)) * qty;
+      await db.adjustCash(qty * price);
+      await db.deleteHolding(h.symbol);
+      await db.recordTrade({
+        symbol: h.symbol, side: 'SELL', qty, price,
+        confidence: 1.0, consensus: 'SELL',
+        order_id: `flatten-${Date.now()}`, status: 'flattened',
+        pnl, reason,
+      });
+      await db.recordAudit({
+        event_type: 'FORCE_FLATTEN', symbol: h.symbol, decision: 'SELL',
+        payload: { qty, price, pnl, reason },
+      });
+    }
+    memoryState.lastFlatten = new Date().toISOString();
+    await discordService.sendCircuitBreakerAlert(`End-of-day flatten complete — ${holdings.length} positions closed`);
+  } catch (e) {
+    console.error('[Agent] flatten error:', e.message);
+  } finally {
+    flattenInProgress = false;
+  }
+}
+
 async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash) {
-  const bars = await alpacaService.getBars(symbol, '5Min', 20);
+  const bars = await alpacaService.getBars(symbol, BAR_TIMEFRAME, BAR_LOOKBACK);
   if (!bars.length) return null;
   const prices = bars.map(b => b.c);
   const latest = prices[prices.length - 1];
   const change = ((latest - prices[0]) / prices[0] * 100).toFixed(2);
-  const sentiment = parseFloat(change) > 1 ? 'bullish' : parseFloat(change) < -1 ? 'bearish' : 'neutral';
+  const sentiment = parseFloat(change) > 0.5 ? 'bullish' : parseFloat(change) < -0.5 ? 'bearish' : 'neutral';
 
   const priceData = {
     symbol, latest, change: `${change}%`,
     high: Math.max(...prices).toFixed(2),
     low: Math.min(...prices).toFixed(2),
     bars: bars.slice(-5).map(b => ({ t: b.t, c: b.c, v: b.v })),
+    timeframe: BAR_TIMEFRAME,
+    strategy: 'intraday day-trading',
   };
 
   const holding = holdings.find(h => h.symbol === symbol) || null;
@@ -152,7 +229,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash) 
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal, stop_loss: eval_.stop_loss, take_profit: eval_.take_profit,
-        reason: signal.reason,
+        reason: `${signal.reason} | risk $${eval_.riskUSD}`,
       });
     } else {
       await db.recordAudit({
@@ -180,6 +257,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash) 
   return signal;
 }
 
+function minutesUntilClose(clock) {
+  if (!clock?.is_open || !clock.next_close) return Infinity;
+  const now = new Date(clock.timestamp || Date.now());
+  const close = new Date(clock.next_close);
+  return Math.max(0, (close - now) / 60000);
+}
+
 async function runCycle() {
   if (cycleInProgress) {
     console.log('[Agent] Cycle already in progress, skipping');
@@ -192,42 +276,59 @@ async function runCycle() {
   try {
     const portfolio = await db.getPortfolio();
     if (portfolio.emergency_pause) {
-      console.log('[Agent] Emergency pause active — cycle skipped');
-      cycleInProgress = false;
+      console.log('[Agent] Emergency pause — cycle skipped');
       return;
     }
-    if (!portfolio.agent_running) {
-      cycleInProgress = false;
+    if (!portfolio.agent_running) return;
+
+    const clock = await alpacaService.getClock();
+    memoryState.marketOpen = clock.is_open;
+    memoryState.nextOpen = clock.next_open;
+    memoryState.nextClose = clock.next_close;
+
+    if (!clock.is_open) {
+      console.log(`[Agent] Market closed — cycle skipped (next open: ${clock.next_open})`);
+      return;
+    }
+
+    const minsLeft = minutesUntilClose(clock);
+    if (minsLeft <= FORCE_FLATTEN_MINUTES_BEFORE_CLOSE) {
+      console.log(`[Agent] ${minsLeft.toFixed(1)}m to close — flattening, no new entries`);
+      await flattenAllPositions(`Auto-flatten ${FORCE_FLATTEN_MINUTES_BEFORE_CLOSE}m before close`);
       return;
     }
 
     const holdings = await db.getHoldings();
     const priceMap = await buildPriceLookup(holdings);
-    const { equity, cash } = await riskManager.computeEquity(holdings, priceMap.lookup);
+    const { equity } = await riskManager.computeEquity(holdings, priceMap.lookup);
 
     const cb = await riskManager.checkCircuitBreaker(equity);
     if (cb.tripped) {
-      console.log(`[Agent] Circuit breaker active (drawdown: ${(cb.drawdown * 100).toFixed(2)}%)`);
-      await discordService.sendCircuitBreakerAlert(`Drawdown ${(cb.drawdown * 100).toFixed(2)}% exceeded threshold`);
-      cycleInProgress = false;
+      console.log(`[Agent] Circuit breaker active — ${cb.reason || 'tripped'}`);
+      await discordService.sendCircuitBreakerAlert(cb.reason || `Drawdown ${(cb.drawdown * 100).toFixed(2)}%`);
+      await flattenAllPositions(cb.reason || 'Circuit breaker tripped');
       return;
     }
 
     await evaluateExistingPositions(priceMap, holdings, equity);
 
-    const refreshedHoldings = await db.getHoldings();
-    const refreshed = await riskManager.computeEquity(refreshedHoldings, priceMap.lookup);
-
     for (const symbol of WATCHLIST) {
       try {
-        await analyzeAndTradeSymbol(symbol, portfolio, refreshedHoldings, refreshed.equity, refreshed.cash);
+        const liveHoldings = await db.getHoldings();
+        const live = await riskManager.computeEquity(liveHoldings, priceMap.lookup);
+        const cb2 = await riskManager.checkCircuitBreaker(live.equity);
+        if (cb2.tripped) {
+          console.log(`[Agent] CB tripped mid-cycle — halting further entries`);
+          break;
+        }
+        await analyzeAndTradeSymbol(symbol, portfolio, liveHoldings, live.equity, live.cash);
       } catch (e) {
         console.error(`[Agent] ${symbol} error:`, e.message);
       }
     }
 
     memoryState.lastError = null;
-    console.log(`[Agent] Cycle ${memoryState.cycleCount} complete`);
+    console.log(`[Agent] Cycle ${memoryState.cycleCount} complete (${minsLeft.toFixed(0)}m to close)`);
   } catch (e) {
     memoryState.lastError = e.message;
     console.error('[Agent] Cycle error:', e);
@@ -239,11 +340,11 @@ async function runCycle() {
 
 async function startAgent() {
   await db.updatePortfolio({ agent_running: true });
-  await db.recordAudit({ event_type: 'AGENT_STARTED', payload: { mode: TRADING_MODE, intervalSeconds: INTERVAL_SECONDS } });
+  await db.recordAudit({ event_type: 'AGENT_STARTED', payload: { mode: TRADING_MODE, strategy: STRATEGY, intervalSeconds: INTERVAL_SECONDS } });
   if (!intervalHandle) {
     intervalHandle = setInterval(runCycle, INTERVAL_SECONDS * 1000);
   }
-  console.log(`[Agent] Started — interval ${INTERVAL_SECONDS}s, mode ${TRADING_MODE}`);
+  console.log(`[Agent] Started — ${STRATEGY}, ${INTERVAL_SECONDS}s interval, mode ${TRADING_MODE}`);
   runCycle();
 }
 
@@ -260,7 +361,6 @@ async function emergencyPause(pause = true) {
 }
 
 async function resetCircuitBreaker() {
-  const portfolio = await db.getPortfolio();
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
   const { equity } = await riskManager.computeEquity(holdings, priceMap.lookup);
@@ -302,9 +402,11 @@ async function getAgentSnapshot() {
   const dayStart = parseFloat(portfolio.day_start_equity);
   const dailyPnL = equity - dayStart;
   const totalPnL = equity - parseFloat(portfolio.starting_balance);
+  const dailyLossUSD = Math.max(0, -dailyPnL);
 
   return {
     mode: TRADING_MODE,
+    strategy: STRATEGY,
     running: portfolio.agent_running,
     emergencyPause: portfolio.emergency_pause,
     circuitBreakerTripped: portfolio.circuit_breaker,
@@ -315,6 +417,12 @@ async function getAgentSnapshot() {
     dailyPnL,
     totalPnL,
     dailyPnLPct: dayStart ? (dailyPnL / dayStart * 100) : 0,
+    dailyLossUSD,
+    market: {
+      open: memoryState.marketOpen,
+      nextOpen: memoryState.nextOpen,
+      nextClose: memoryState.nextClose,
+    },
     holdings: holdings.map(h => ({
       symbol: h.symbol,
       qty: parseFloat(h.qty),
@@ -327,12 +435,15 @@ async function getAgentSnapshot() {
     })),
     signals: memoryState.lastSignals,
     lastRun: memoryState.lastRun,
+    lastFlatten: memoryState.lastFlatten,
     cycleCount: memoryState.cycleCount,
     lastError: memoryState.lastError,
     risk: riskManager.getConfig(),
     providers: llmService.getProviderStatus(),
     watchlist: WATCHLIST,
     intervalSeconds: INTERVAL_SECONDS,
+    barTimeframe: BAR_TIMEFRAME,
+    forceFlattenMinutesBeforeClose: FORCE_FLATTEN_MINUTES_BEFORE_CLOSE,
   };
 }
 
@@ -353,5 +464,5 @@ scheduleDailyReset();
 
 module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
-  emergencyPause, resetCircuitBreaker, WATCHLIST,
+  emergencyPause, resetCircuitBreaker, flattenAllPositions, WATCHLIST,
 };

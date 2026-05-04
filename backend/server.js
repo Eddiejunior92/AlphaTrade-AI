@@ -5,7 +5,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
-  emergencyPause, resetCircuitBreaker,
+  emergencyPause, resetCircuitBreaker, flattenAllPositions,
 } = require('./agent');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
@@ -17,6 +17,22 @@ const PORT = parseInt(process.env.PORT) || 3001;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+
+const OPERATOR_TOKEN = process.env.OPERATOR_TOKEN || '';
+function requireOperator(req, res, next) {
+  if (!OPERATOR_TOKEN) return next();
+  const provided = req.get('x-operator-token') || req.query.token;
+  if (provided !== OPERATOR_TOKEN) {
+    return res.status(401).json({ success: false, error: 'Unauthorized — operator token required' });
+  }
+  next();
+}
+app.use((req, res, next) => {
+  if (req.method === 'POST' && (req.path.startsWith('/api/agent/') || req.path === '/api/broker/chat')) {
+    return requireOperator(req, res, next);
+  }
+  next();
+});
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
@@ -118,6 +134,14 @@ app.post('/api/agent/reset-circuit-breaker', async (req, res) => {
   await resetCircuitBreaker();
   broadcastState();
   res.json({ success: true });
+});
+
+app.post('/api/agent/flatten', async (req, res) => {
+  try {
+    await flattenAllPositions(req.body?.reason || 'Manual flatten via dashboard');
+    broadcastState();
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.get('/api/trades', async (req, res) => {

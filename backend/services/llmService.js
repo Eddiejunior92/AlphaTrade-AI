@@ -167,17 +167,19 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, holding, port
 
   const consensus = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
   const avgConfidence = votes[consensus] > 0 ? confSum[consensus] / votes[consensus] : 0;
-  const agreementRatio = votes[consensus] / valid.length;
-  const finalConfidence = avgConfidence * agreementRatio;
+  const agreementCount = votes[consensus];
+  const agreementRatio = agreementCount / valid.length;
 
   return {
     consensus,
-    confidence: finalConfidence,
-    rawConfidence: avgConfidence,
+    confidence: avgConfidence,
     agreement: agreementRatio,
+    agreementCount,
+    validCount: valid.length,
+    totalModels: MODELS.length,
     votes,
     models: results,
-    reason: `${votes[consensus]}/${valid.length} models agree on ${consensus} (avg conf ${(avgConfidence * 100).toFixed(0)}%, agreement ${(agreementRatio * 100).toFixed(0)}%)`,
+    reason: `${agreementCount}/${valid.length} models agree on ${consensus} (avg conf ${(avgConfidence * 100).toFixed(0)}%)`,
   };
 }
 
