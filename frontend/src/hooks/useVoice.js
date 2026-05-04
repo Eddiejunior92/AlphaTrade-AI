@@ -101,8 +101,9 @@ export function useVoice({ onTranscript, defaultVoiceId = 'eve' } = {}) {
     beats.forEach((beat, i) => {
       const u = new SpeechSynthesisUtterance(beat);
       if (v) u.voice = v;
-      u.rate = 0.97 + (Math.cos(i * 1.3) * 0.03);
-      u.pitch = 1.02 + (Math.sin(i * 1.7) * 0.06);
+      // Punchier fallback delivery to match Grok-TTS energy
+      u.rate = 1.12 + (Math.cos(i * 1.3) * 0.03);
+      u.pitch = 1.04 + (Math.sin(i * 1.7) * 0.05);
       if (i === beats.length - 1) {
         u.onend = () => { if (seq === speakSeqRef.current) setSpeaking(false); };
         u.onerror = () => { if (seq === speakSeqRef.current) setSpeaking(false); };
@@ -132,6 +133,12 @@ export function useVoice({ onTranscript, defaultVoiceId = 'eve' } = {}) {
       objectUrlRef.current = url;
       const audio = new Audio(url);
       audio.preload = 'auto';
+      // Punchier broker delivery — speed up ~12% while preserving pitch so
+      // Eve still sounds natural, not chipmunked.
+      audio.playbackRate = opts.rate ?? 1.12;
+      audio.preservesPitch = true;
+      audio.mozPreservesPitch = true;
+      audio.webkitPreservesPitch = true;
       audioRef.current = audio;
       audio.onended = () => { if (seq === speakSeqRef.current) { setSpeaking(false); stopAudio(); } };
       audio.onerror = () => { if (seq === speakSeqRef.current) { setSpeaking(false); stopAudio(); } };
