@@ -90,4 +90,51 @@ async function chat({ messages, snapshot, recentSignals, recentTrades }) {
   }
 }
 
-module.exports = { chat, GROK_MODEL };
+// ---- xAI Grok TTS ----
+const TTS_URL = 'https://api.x.ai/v1/tts';
+const VOICES_URL = 'https://api.x.ai/v1/tts/voices';
+const DEFAULT_VOICE = process.env.GROK_TTS_VOICE || 'eve'; // warm multilingual female
+
+let voicesCache = null;
+let voicesCacheAt = 0;
+
+async function listVoices() {
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
+  if (!key) return [];
+  if (voicesCache && Date.now() - voicesCacheAt < 10 * 60 * 1000) return voicesCache;
+  try {
+    const res = await axios.get(VOICES_URL, {
+      headers: { Authorization: `Bearer ${key}` },
+      timeout: 15000,
+    });
+    voicesCache = (res.data?.voices || []).filter(v => /^(multilingual|en)/i.test(v.language));
+    voicesCacheAt = Date.now();
+    return voicesCache;
+  } catch (e) {
+    console.error('[Broker/TTS] voices error:', e.response?.data?.error || e.message);
+    return [];
+  }
+}
+
+async function synthesize({ text, voice, language = 'en' }) {
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
+  if (!key) throw new Error('XAI_API_KEY required for TTS');
+  if (!text || !text.trim()) throw new Error('text required');
+  const chosen = voice || DEFAULT_VOICE;
+  const res = await axios.post(
+    TTS_URL,
+    { text: text.trim().slice(0, 4000), voice: chosen, language },
+    {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      responseType: 'arraybuffer',
+      timeout: 30000,
+    }
+  );
+  return {
+    audio: Buffer.from(res.data),
+    contentType: res.headers['content-type'] || 'audio/mpeg',
+    voice: chosen,
+  };
+}
+
+module.exports = { chat, listVoices, synthesize, GROK_MODEL, DEFAULT_VOICE };

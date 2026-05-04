@@ -31,8 +31,9 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
     }
   }, [messages, thinking, brokerChat, autoSpeak]);
 
-  const { listening, speaking, interim, supported, voiceName, startListening, stopListening, speak, stopSpeaking } =
+  const { listening, speaking, interim, supported, voices, voiceId, setVoiceId, engine, startListening, stopListening, speak, stopSpeaking } =
     useVoice({ onTranscript: (t) => send(t) });
+  const currentVoice = voices.find(v => v.voice_id === voiceId);
 
   useEffect(() => {
     if (open && !greetedRef.current && autoSpeak) {
@@ -66,11 +67,24 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
                 <div className="text-[11px] text-[var(--text-dim)] flex items-center gap-1.5">
                   <span className={`w-1.5 h-1.5 rounded-full ${listening ? 'bg-[var(--red)]' : speaking ? 'bg-[var(--blue)]' : 'bg-[var(--green)]'}`} />
                   {listening ? 'Listening…' : speaking ? 'Speaking…' : thinking ? 'Thinking…' : 'Ready'}
-                  {voiceName && <span className="opacity-60 ml-1">· {voiceName.split(' ')[0]}</span>}
+                  <span className="opacity-60 ml-1">· {engine === 'grok' ? 'Grok TTS' : 'Browser'}{currentVoice ? ` · ${currentVoice.name}` : ''}</span>
                 </div>
               </div>
             </div>
             <div className="flex items-center gap-1">
+              {voices.length > 0 && (
+                <select
+                  value={voiceId}
+                  onChange={(e) => setVoiceId(e.target.value)}
+                  title="Pick Alpha's voice"
+                  className="bg-white/5 border border-white/10 rounded-full px-2.5 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--blue)] max-w-[100px]">
+                  {voices.map(v => (
+                    <option key={v.voice_id} value={v.voice_id} className="bg-[#0a0a0a]">
+                      {v.name}{v.gender ? ` · ${v.gender[0].toUpperCase()}` : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
               <button onClick={() => setAutoSpeak(s => !s)}
                 className="p-2 rounded-full hover:bg-white/10 text-sm"
                 title={autoSpeak ? 'Mute voice replies' : 'Enable voice replies'}>

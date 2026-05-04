@@ -171,6 +171,29 @@ app.get('/api/audit', async (req, res) => {
 
 app.get('/api/account', async (req, res) => { res.json(await alpacaService.getAccount()); });
 
+app.get('/api/broker/voices', async (_req, res) => {
+  try {
+    const voices = await brokerService.listVoices();
+    res.json({ voices, default: brokerService.DEFAULT_VOICE });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/broker/tts', async (req, res) => {
+  try {
+    const { text, voice, language } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const out = await brokerService.synthesize({ text, voice, language });
+    res.set('Content-Type', out.contentType);
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Voice', out.voice);
+    res.send(out.audio);
+  } catch (e) {
+    const msg = e.response?.data ? Buffer.from(e.response.data).toString('utf8') : e.message;
+    console.error('[Server] TTS error:', msg);
+    res.status(502).json({ error: msg });
+  }
+});
+
 app.post('/api/broker/chat', async (req, res) => {
   try {
     const { messages } = req.body || {};
