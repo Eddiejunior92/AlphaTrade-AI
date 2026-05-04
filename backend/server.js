@@ -61,7 +61,11 @@ function requireOperatorStrict(req, res, next) {
   next();
 }
 app.use((req, res, next) => {
-  if (req.method === 'POST' && (req.path.startsWith('/api/agent/') || req.path === '/api/broker/chat' || req.path === '/api/broker/chat-stream')) {
+  // Operator-token gate — protects anything that can change agent state
+  // (start/stop, mode switch, flatten, refresh, risk scale, strategy toggle).
+  // Broker chat (/api/broker/chat[-stream]) is intentionally NOT gated:
+  // it is read-only conversation about the portfolio and never places trades.
+  if (req.method === 'POST' && req.path.startsWith('/api/agent/')) {
     return requireOperator(req, res, next);
   }
   next();
