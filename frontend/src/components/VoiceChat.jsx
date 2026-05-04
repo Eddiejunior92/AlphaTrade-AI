@@ -31,7 +31,7 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
     }
   }, [messages, thinking, brokerChat, autoSpeak]);
 
-  const { listening, speaking, interim, supported, startListening, stopListening, speak, stopSpeaking } =
+  const { listening, speaking, interim, supported, voiceName, startListening, stopListening, speak, stopSpeaking } =
     useVoice({ onTranscript: (t) => send(t) });
 
   useEffect(() => {
@@ -66,6 +66,7 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
                 <div className="text-[11px] text-[var(--text-dim)] flex items-center gap-1.5">
                   <span className={`w-1.5 h-1.5 rounded-full ${listening ? 'bg-[var(--red)]' : speaking ? 'bg-[var(--blue)]' : 'bg-[var(--green)]'}`} />
                   {listening ? 'Listening…' : speaking ? 'Speaking…' : thinking ? 'Thinking…' : 'Ready'}
+                  {voiceName && <span className="opacity-60 ml-1">· {voiceName.split(' ')[0]}</span>}
                 </div>
               </div>
             </div>
