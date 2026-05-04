@@ -183,8 +183,11 @@ app.get('/api/audit', async (req, res) => {
 app.get('/api/account', async (req, res) => { res.json(await alpacaService.getAccount()); });
 
 // --- Charts: price bars per symbol -----------------------------------------
-// GET /api/bars/:symbol?range=1d|5d  → { symbol, range, bars: [{t, o, h, l, c, v}] }
-// 1d → 5-minute bars (78 bars), 5d → 30-minute bars (~65 bars). Cached briefly.
+// GET /api/bars/:symbol?range=1d|5d → { symbol, range, timeframe, bars[], stale }
+// 1d  → 5-min bars over the last ~3 trading days, trimmed to the most recent
+//        ~78 bars (one full session). When market is closed this still returns
+//        the prior session's data so the chart never goes blank.
+// 5d  → 30-min bars over the last ~10 calendar days, trimmed to the latest ~70.
 const BARS_CACHE = new Map(); // key=`${sym}:${range}` → {ts, data}
 const BARS_TTL_MS = 30000;
 app.get('/api/bars/:symbol', async (req, res) => {
@@ -192,16 +195,38 @@ app.get('/api/bars/:symbol', async (req, res) => {
     const symbol = String(req.params.symbol || '').toUpperCase();
     const range = (req.query.range || '1d').toLowerCase();
     if (!['1d', '5d'].includes(range)) return res.status(400).json({ error: 'range must be 1d or 5d' });
+    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    if (!allowed.has(symbol)) return res.status(404).json({ error: 'Symbol not in watchlist' });
+
     const cacheKey = `${symbol}:${range}`;
     const cached = BARS_CACHE.get(cacheKey);
     if (cached && Date.now() - cached.ts < BARS_TTL_MS) return res.json(cached.data);
 
-    const cfg = range === '1d' ? { timeframe: '5Min', limit: 80 } : { timeframe: '30Min', limit: 70 };
-    const bars = await alpacaService.getBars(symbol, cfg.timeframe, cfg.limit);
-    const data = { symbol, range, timeframe: cfg.timeframe, bars };
+    // IEX free feed has a ~15-min delay, so cap end at 'now - 16min' to avoid
+    // SIP-only subscription errors.
+    const endDate = new Date(Date.now() - 16 * 60 * 1000);
+    const lookbackDays = range === '1d' ? 4 : 10;
+    const startDate = new Date(endDate.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
+    const cfg = range === '1d'
+      ? { timeframe: '5Min', limit: 1000, take: 78 }
+      : { timeframe: '30Min', limit: 1000, take: 70 };
+
+    const allBars = await alpacaService.getBars(symbol, cfg.timeframe, cfg.limit, {
+      start: startDate.toISOString(),
+      end: endDate.toISOString(),
+    });
+    const bars = allBars.slice(-cfg.take);
+    const stale = bars.length === 0;
+    const data = {
+      symbol, range, timeframe: cfg.timeframe, bars, stale,
+      lastBarAt: bars.length ? bars[bars.length - 1].t : null,
+    };
     BARS_CACHE.set(cacheKey, { ts: Date.now(), data });
     res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('[Bars] error:', e.message);
+    res.status(500).json({ error: e.message, bars: [] });
+  }
 });
 
 // --- News sentiment per symbol --------------------------------------------

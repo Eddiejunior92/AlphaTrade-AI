@@ -90,10 +90,16 @@ class AlpacaService {
     } catch (e) { console.error('[Alpaca] closePosition error:', e.message); throw e; }
   }
 
-  async getBars(symbol, timeframe = '1Min', limit = 20) {
+  async getBars(symbol, timeframe = '1Min', limit = 20, opts = {}) {
+    // Without `start`, Alpaca IEX returns the most-recent bars only — which is
+    // usually empty after-hours / over weekends. Pass a start window so we
+    // always get historical data even when the market is closed.
+    const params = { timeframe, limit, feed: 'iex', adjustment: 'raw' };
+    if (opts.start) params.start = opts.start;
+    if (opts.end) params.end = opts.end;
     try {
       const res = await axios.get(`${this.dataUrl}/v2/stocks/${symbol}/bars`, {
-        headers: this.headers, params: { timeframe, limit, feed: 'iex' }, timeout: 10000,
+        headers: this.headers, params, timeout: 10000,
       });
       return res.data?.bars || [];
     } catch (e) { console.error('[Alpaca] getBars error:', e.message); return this.mockBars(symbol, limit); }
