@@ -20,7 +20,7 @@ const STRATEGIES = {
     label: 'Day Trading',
     description: 'Fast intraday trades on 1-minute bars. Auto-flattens 5 min before close. No overnight risk.',
     timeframe: '1Min',
-    lookback: 30,
+    lookback: 60, // need ≥35 bars for MACD(12,26,9); 60 gives a stable EMA warmup
     intervalSeconds: 60,
     // base stop/target — scaled by risk scale's stop/target multipliers
     stopLossPct: 0.005,

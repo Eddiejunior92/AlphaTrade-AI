@@ -4,7 +4,7 @@ const axios = require('axios');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_SENTIMENT_MODEL || 'grok-4-fast-non-reasoning';
-const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '1800') * 1000; // 30 min default
+const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '600') * 1000; // 10 min default — keep tighter so each vote sees recent news + social
 const TIMEOUT_MS = 12000;
 const MAX_CACHE = parseInt(process.env.SENTIMENT_CACHE_MAX || '64'); // hard cap entries
 
@@ -47,18 +47,33 @@ function classify(score) {
   return 'neutral';
 }
 
+function clamp(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return null;
+  return +Math.max(-1, Math.min(1, n)).toFixed(2);
+}
+
 function sanitize(obj, symbol) {
   if (!obj || typeof obj !== 'object') return defaultPayload(symbol, 'Malformed response');
-  let score = parseFloat(obj.score);
-  if (!Number.isFinite(score)) score = 0;
-  score = Math.max(-1, Math.min(1, score));
+  // Combined score (back-compat). New: separate news_score + social_score.
+  const newsScore   = clamp(obj.news_score);
+  const socialScore = clamp(obj.social_score);
+  let score = clamp(obj.score);
+  if (score == null) {
+    if (newsScore != null && socialScore != null) score = +((newsScore * 0.6 + socialScore * 0.4)).toFixed(2);
+    else score = newsScore != null ? newsScore : (socialScore != null ? socialScore : 0);
+  }
   const insights = Array.isArray(obj.insights) ? obj.insights.slice(0, 3).map(s => String(s).slice(0, 160)) : [];
   const sources = Array.isArray(obj.sources) ? obj.sources.slice(0, 3).map(s => String(s).slice(0, 80)) : [];
+  const social_summary = String(obj.social_summary || '').slice(0, 200);
   return {
     symbol,
-    score: +score.toFixed(2),
+    score,
     label: classify(score),
+    news_score: newsScore,
+    social_score: socialScore,
     summary: String(obj.summary || '').slice(0, 280),
+    social_summary,
     insights,
     sources,
     cached: false,
@@ -68,17 +83,24 @@ function sanitize(obj, symbol) {
 }
 
 function buildPrompt(symbol) {
-  return `You are a sentiment analyst for an automated trading system. Analyze the most recent (last 24-48h) news, earnings, analyst actions, and social chatter for ticker ${symbol}.
+  return `You are a real-time sentiment analyst for an automated trading system. Analyze the LATEST (last 6-24h) signals for ticker ${symbol} across TWO independent channels:
+  1) NEWS — wires, earnings, guidance, analyst actions, regulatory, macro headlines that mention ${symbol}.
+  2) SOCIAL — X/Twitter cashtag $${symbol}, retail-investor forums, prominent finance accounts. Look for unusual chatter volume, options unusual-activity rumors, hype, or piling-on negativity.
+
+Score each channel independently. Be calibrated: routine days are 0 to ±0.2; reserve ±0.5+ for clearly material catalysts.
 
 Respond with ONLY valid JSON (no markdown, no prose):
 {
-  "score": <number from -1 (very bearish) to +1 (very bullish), 0 = neutral/mixed>,
-  "summary": "<one short sentence describing the dominant narrative>",
+  "news_score": <-1 to +1>,
+  "social_score": <-1 to +1>,
+  "score": <-1 to +1, your blended view weighting news a bit heavier>,
+  "summary": "<one short sentence — the dominant news narrative>",
+  "social_summary": "<one short sentence — the dominant social narrative, or 'no notable chatter'>",
   "insights": ["<key insight 1 — short>", "<key insight 2>", "<key insight 3>"],
-  "sources": ["<source name 1>", "<source name 2>"]
+  "sources": ["<source 1>", "<source 2>"]
 }
 
-Be calibrated: routine days are 0 to ±0.2. Reserve ±0.5+ for clearly material catalysts. If you have no real recent information, return score 0 with summary "no notable recent news".`;
+If you genuinely have no real recent information, return all scores at 0 with summary "no notable recent news".`;
 }
 
 async function fetchFresh(symbol) {

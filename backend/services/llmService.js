@@ -36,14 +36,34 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, strategyName }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, strategyName }) {
   const positionLine = holding
     ? `Current position: ${holding.qty} shares @ avg $${holding.avg_cost} (stop: $${holding.stop_loss}, target: $${holding.take_profit})`
     : 'Current position: NONE';
 
-  const newsLine = newsSentiment
-    ? `News sentiment (Grok, last 24-48h): ${newsSentiment.label} (score ${newsSentiment.score >= 0 ? '+' : ''}${newsSentiment.score}) — ${newsSentiment.summary}${newsSentiment.insights?.length ? '\nKey insights: ' + newsSentiment.insights.map(i => '• ' + i).join('  ') : ''}`
-    : 'News sentiment: unavailable';
+  // News + social sentiment block (Grok, refreshed ≤10m). Shows both channels
+  // separately so the model can spot news/social divergences.
+  let newsLine = 'News + social sentiment: unavailable';
+  if (newsSentiment) {
+    const sgn = (n) => n == null ? 'n/a' : (n >= 0 ? `+${n}` : `${n}`);
+    const newsBit = `news ${sgn(newsSentiment.news_score)} (${newsSentiment.summary || '—'})`;
+    const socBit  = `social ${sgn(newsSentiment.social_score)} (${newsSentiment.social_summary || '—'})`;
+    const insights = newsSentiment.insights?.length ? '\n  Key insights: ' + newsSentiment.insights.map(i => '• ' + i).join('  ') : '';
+    newsLine = `Real-time sentiment (Grok, last 6-24h): blended ${newsSentiment.label} (${sgn(newsSentiment.score)})\n  ${newsBit}\n  ${socBit}${insights}`;
+  }
+
+  // Technical indicators block — used by BOTH strategies.
+  let indicatorsLine = 'Technical indicators: unavailable';
+  if (indicators && indicators.ok) {
+    const m = indicators.macd;
+    const v = indicators.volume;
+    const vol = indicators.volatility;
+    indicatorsLine = `Technical indicators:
+  RSI(14): ${indicators.rsi} (${indicators.rsiLabel})
+  MACD(12,26,9): macd=${m ? m.macd : 'n/a'} signal=${m ? m.signal : 'n/a'} hist=${m ? m.histogram : 'n/a'} (${m ? m.cross : 'n/a'})
+  Volume trend (last 5 vs prior 20): ${v ? v.ratio + 'x' : 'n/a'} (${v ? v.label : 'n/a'})
+  Volatility: ATR ${vol ? vol.atrPct + '%' : 'n/a'} · stdev ${vol ? vol.stddevPctPerBar + '%/bar' : 'n/a'} (${vol ? vol.label : 'n/a'})`;
+  }
 
   // --- Day strategy (unchanged) ----------------------------------------
   if (strategyName !== 'swing') {
@@ -59,7 +79,9 @@ Period high/low: $${priceData.high} / $${priceData.low}
 Price action: ${sentiment}
 ${newsLine}
 
-Weigh both technicals and news sentiment. A bullish price trend with bearish news is a yellow flag; the reverse is a yellow flag too. Strong agreement between both raises confidence.
+${indicatorsLine}
+
+Weigh price action, technical indicators (RSI/MACD/volume/volatility), and real-time news+social sentiment together. Conflict between channels (e.g. bullish price but bearish social, overbought RSI on weak volume) is a yellow flag — lower confidence. Strong multi-channel agreement raises confidence. For an intraday scalp, a fresh MACD bullish cross with expanding volume and RSI < 70 is a strong setup.
 
 You must respond in EXACTLY this format (no markdown, no extra text):
 DECISION: BUY|SELL|HOLD
@@ -113,15 +135,18 @@ Recent bars (last 5 of 15-min): ${JSON.stringify(priceData.bars)}
 Short-term price action: ${sentiment}
 ${newsLine}
 
+${indicatorsLine}
+
 ${patternsBlock}
 
 ${fundamentalsBlock}
 
 Decision guidance for SWING trades:
-  • Favor BUY when trend is up, structure shows higher highs/lows OR a fresh breakout, sector is strong/flat, valuation is fair-to-cheap or growth strongly justifies a richer multiple, and news sentiment isn't actively bearish.
-  • Favor SELL when trend is down, structure shows lower highs/lows OR a breakdown, sector is weak, or fundamentals deteriorate (negative EPS/revenue growth, recent miss).
+  • Favor BUY when trend is up, indicators confirm (RSI 45-70, MACD positive or fresh bullish cross, expanding volume), structure shows higher highs/lows OR a fresh breakout, sector is strong/flat, valuation is fair-to-cheap or growth strongly justifies a richer multiple, and news+social sentiment isn't actively bearish.
+  • Favor SELL when trend is down, indicators deteriorate (RSI rolling over from overbought, MACD bearish cross, volume drying up), structure shows lower highs/lows OR a breakdown, sector is weak, or fundamentals weaken (negative EPS/revenue growth, recent miss).
   • AVOID new BUYs within 2 trading days of earnings (use earnings_next_date) — flag in rationale and prefer HOLD.
-  • Conflict between technicals and fundamentals → lower confidence.
+  • Elevated/high volatility → trim confidence and prefer waiting for a cleaner setup.
+  • Conflict between technicals, sentiment, and fundamentals → lower confidence.
   • If a position is open, weigh whether to hold for the swing target vs. exit; respect the existing trailing stop logic in the agent.
 
 You must respond in EXACTLY this format (no markdown, no extra text):
@@ -209,9 +234,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, strategyName }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, strategyName }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, strategyName }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, strategyName }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

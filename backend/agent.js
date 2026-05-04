@@ -6,6 +6,7 @@ const riskManager = require('./services/riskManager');
 const sentimentService = require('./services/sentimentService');
 const fundamentalsService = require('./services/fundamentalsService');
 const patternService = require('./services/patternService');
+const indicatorsService = require('./services/indicatorsService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -258,8 +259,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   // Pull cached news sentiment (refreshed once per cycle in runCycle).
   const newsSentiment = sentimentService.getCached(symbol);
 
-  // SWING ONLY: fold in technical patterns + cached Grok fundamentals.
-  // The day strategy stays lean (latency-sensitive intraday loop).
+  // Technical indicators (RSI / MACD / volume / volatility) — pure JS,
+  // computed from the same bars. Used by BOTH day and swing strategies.
+  let indicators = null;
+  try { indicators = indicatorsService.computeIndicators(bars); }
+  catch (e) { indicators = { ok: false, reason: e.message }; }
+
+  // SWING ONLY: fold in pattern recognition + cached Grok fundamentals.
   let patterns = null;
   let fundamentals = null;
   if (sc.name === 'swing') {
@@ -270,13 +276,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
 
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-    patterns, fundamentals, strategyName: sc.name,
+    patterns, fundamentals, indicators, strategyName: sc.name,
   });
 
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
-    payload: { priceData, sentiment, newsSentiment, patterns, fundamentals,
+    payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals,
       votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
