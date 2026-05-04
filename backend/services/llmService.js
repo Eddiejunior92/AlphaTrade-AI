@@ -36,7 +36,10 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, strategyName, premarket }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket }) {
+  // 20-year historical intelligence (cached, refreshed once/day before open).
+  // Already a pre-rendered text block — null when cache isn't warm yet.
+  const historicalBlock = historical ? `\n${historical}\n` : '';
   // Pre-market briefing injection (only present during the first ~60 min after open).
   const premarketBlock = premarket ? `\nPRE-MARKET BRIEFING (use as PRIOR — overrides nothing, but explains gaps & catalysts):\n${premarket}\n` : '';
   const positionLine = holding
@@ -121,7 +124,7 @@ ${indicatorsLine}
 ${dayPatternsBlock}
 
 ${intradayBlock}
-${premarketBlock}
+${historicalBlock}${premarketBlock}
 Decision guidance for INTRADAY trades:
   • DIP-BUY (favor BUY) — pullback to support after a leg up, with reversal candle + rising volume + RSI 30-60 + news/social not bearish. The strongest dip-buys have a confirmed higher-low forming AND price within 0.6% of a clustered support level. A flagged DIP_BUY_SETUP above is a strong prior — weight it heavily, especially if score ≥ 4.
   • BREAKOUT (favor BUY) — fresh close above a 60-min resistance with expanding volume, MACD bullish cross, RSI < 70. Avoid chasing if RSI > 75 or volume is flat.
@@ -187,7 +190,7 @@ ${indicatorsLine}
 ${patternsBlock}
 
 ${fundamentalsBlock}
-${premarketBlock}
+${historicalBlock}${premarketBlock}
 Decision guidance for SWING trades:
   • Favor BUY when trend is up, indicators confirm (RSI 45-70, MACD positive or fresh bullish cross, expanding volume), structure shows higher highs/lows OR a fresh breakout, sector is strong/flat, valuation is fair-to-cheap or growth strongly justifies a richer multiple, and news+social sentiment isn't actively bearish.
   • Favor SELL when trend is down, indicators deteriorate (RSI rolling over from overbought, MACD bearish cross, volume drying up), structure shows lower highs/lows OR a breakdown, sector is weak, or fundamentals weaken (negative EPS/revenue growth, recent miss).
@@ -281,9 +284,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, strategyName, premarket }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, strategyName, premarket }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

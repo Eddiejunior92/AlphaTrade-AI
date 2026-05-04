@@ -94,15 +94,44 @@ class AlpacaService {
     // Without `start`, Alpaca IEX returns the most-recent bars only — which is
     // usually empty after-hours / over weekends. Pass a start window so we
     // always get historical data even when the market is closed.
-    const params = { timeframe, limit, feed: 'iex', adjustment: 'raw' };
-    if (opts.start) params.start = opts.start;
-    if (opts.end) params.end = opts.end;
+    //
+    // When `opts.paginate === true` (used by the historical intelligence layer
+    // for 20Y of daily bars), we follow `next_page_token` until exhausted —
+    // staying under a hard cap so a runaway response can't melt memory.
+    // `raw` is correct for intraday (last-60-min) bars where splits don't
+    // matter. For multi-year historical analysis the caller MUST pass
+    // adjustment: 'all' so split/dividend events don't masquerade as crashes
+    // (e.g. NVDA's 10:1 split would otherwise show as a -90% drawdown).
+    const baseParams = { timeframe, limit, feed: 'iex', adjustment: opts.adjustment || 'raw' };
+    if (opts.start) baseParams.start = opts.start;
+    if (opts.end)   baseParams.end   = opts.end;
+    const HARD_CAP = 50000;
+
     try {
-      const res = await axios.get(`${this.dataUrl}/v2/stocks/${symbol}/bars`, {
-        headers: this.headers, params, timeout: 10000,
-      });
-      return res.data?.bars || [];
-    } catch (e) { console.error('[Alpaca] getBars error:', e.message); return this.mockBars(symbol, limit); }
+      let all = [];
+      let pageToken = null;
+      let pages = 0;
+      do {
+        const params = { ...baseParams };
+        if (pageToken) params.page_token = pageToken;
+        const res = await axios.get(`${this.dataUrl}/v2/stocks/${symbol}/bars`, {
+          headers: this.headers, params, timeout: 15000,
+        });
+        const bars = res.data?.bars || [];
+        all = all.concat(bars);
+        pageToken = opts.paginate ? (res.data?.next_page_token || null) : null;
+        pages++;
+        if (all.length >= HARD_CAP) break;
+      } while (pageToken && pages < 25);
+      return all;
+    } catch (e) {
+      console.error('[Alpaca] getBars error:', e.message);
+      // Fail-closed for callers that can't tolerate synthetic data (e.g. the
+      // historical-intelligence layer, where caching mock 20Y bars would
+      // produce convincing-looking but fabricated CAGR/regime numbers).
+      if (opts.noMock) throw e;
+      return this.mockBars(symbol, limit);
+    }
   }
 
   async getClock() {

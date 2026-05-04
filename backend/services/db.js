@@ -29,7 +29,21 @@ async function ensureSchema() {
     await query(`ALTER TABLE holdings DROP CONSTRAINT IF EXISTS holdings_pkey`);
     await query(`ALTER TABLE holdings ADD PRIMARY KEY (symbol, strategy)`);
   } catch (e) { /* already converted */ }
-  console.log('[DB] Schema ensured (strategy columns + composite PK)');
+
+  // 20-year historical intelligence cache. One row per symbol, refreshed once
+  // per day. payload is the full HistoricalIntelligenceService output (regime,
+  // seasonality, drawdowns, hourly/weekday/monthly tendencies, etc).
+  await query(`
+    CREATE TABLE IF NOT EXISTS historical_intelligence (
+      symbol      TEXT PRIMARY KEY,
+      as_of_date  DATE NOT NULL,
+      payload     JSONB NOT NULL,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS historical_intelligence_date_idx ON historical_intelligence (as_of_date)`);
+
+  console.log('[DB] Schema ensured (strategy columns + composite PK + historical_intelligence)');
 }
 
 async function getPortfolio() {

@@ -9,6 +9,7 @@ const fundamentalsService = require('./services/fundamentalsService');
 const patternService = require('./services/patternService');
 const indicatorsService = require('./services/indicatorsService');
 const intradayService = require('./services/intradayService');
+const historicalIntel = require('./services/historicalIntelligenceService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -290,6 +291,18 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     catch (e) { intraday = { ok: false, reason: e.message }; }
   }
 
+  // 20-year historical intelligence (cached daily). Both strategies receive it.
+  // Day strategy gets an "early-session" emphasis flag during the first 90
+  // minutes after open, when intraday data is still thin.
+  let historical = null;
+  try {
+    const minSinceOpen = minutesSinceOpenET();
+    const earlySession = sc.name === 'day' && minSinceOpen != null && minSinceOpen >= 0 && minSinceOpen <= 90;
+    historical = await historicalIntel.getInsightsForPrompt(symbol, { withinFirst90Min: earlySession });
+  } catch (e) {
+    console.error(`[Agent] historicalIntel render error for ${symbol}:`, e.message);
+  }
+
   // Pre-market briefing context — only present during first 60 min after open.
   // Returns null otherwise; LLM prompt is unchanged. Never throws.
   const premarket = await premarketService.getActiveBriefingContext(symbol, {
@@ -299,13 +312,15 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
 
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-    patterns, fundamentals, indicators, intraday, strategyName: sc.name, premarket,
+    patterns, fundamentals, indicators, intraday, historical,
+    strategyName: sc.name, premarket,
   });
 
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
     payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals, intraday,
+      historicalAvailable: !!historical,
       votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
@@ -574,6 +589,41 @@ function scheduleDailyReset() {
   dailyResetHandle = setTimeout(async () => { await dailyReset(); scheduleDailyReset(); }, next - now);
 }
 
+// --- 20-year historical intelligence — daily refresh -------------------------
+// Runs once per day at ~09:00 UTC (~04:00-05:00 ET, well before US open). On
+// startup we kick off a non-blocking refresh that skips symbols already cached
+// for today, so a restart never hammers the data API.
+let intelDailyHandle = null;
+function scheduleDailyIntelligence() {
+  if (intelDailyHandle) clearTimeout(intelDailyHandle);
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(9, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  intelDailyHandle = setTimeout(async () => {
+    try { await historicalIntel.runDailyIntelligence({}); }
+    catch (e) { console.error('[Intel] Daily run failed:', e.message); }
+    scheduleDailyIntelligence();
+  }, next - now);
+  console.log(`[Intel] Next daily run scheduled in ${Math.round((next - now) / 60000)} min`);
+}
+
+// Minutes since today's 9:30 AM ET. Returns a negative number before 9:30 ET,
+// positive after; null only on parse failure. Caller (early-session flag) must
+// also gate on market-open since this does not check trading day.
+function minutesSinceOpenET() {
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', hour: 'numeric', minute: 'numeric', hour12: false,
+    }).formatToParts(now);
+    const h = parseInt(parts.find(p => p.type === 'hour')?.value, 10);
+    const m = parseInt(parts.find(p => p.type === 'minute')?.value, 10);
+    if (Number.isNaN(h) || Number.isNaN(m)) return null;
+    return (h * 60 + m) - (9 * 60 + 30);
+  } catch (_) { return null; }
+}
+
 async function getAgentSnapshot() {
   const portfolio = await db.getPortfolio();
   const holdings = await db.getHoldings();
@@ -667,6 +717,7 @@ async function getAgentSnapshot() {
 }
 
 scheduleDailyReset();
+scheduleDailyIntelligence();
 
 (async () => {
   try {
@@ -678,6 +729,10 @@ scheduleDailyReset();
       intervalHandle = setInterval(runCycle, BASE_INTERVAL_SECONDS * 1000);
       runCycle();
     }
+    // Fire-and-forget: ensure today's intelligence cache is warm. Skips any
+    // symbol already cached for today, so restarts don't re-hit the data API.
+    historicalIntel.runDailyIntelligence({})
+      .catch(e => console.error('[Intel] Startup warm-up failed:', e.message));
   } catch (e) {
     console.error('[Agent] Startup check failed:', e.message);
   }
