@@ -27,9 +27,9 @@ const MODELS = [
   },
   {
     id: 'grok',
-    label: 'Grok 2',
+    label: 'Grok 4 Fast',
     provider: 'xai',
-    model: 'grok-2-latest',
+    model: 'grok-4-fast-non-reasoning',
     role: 'Truth & sentiment specialist — read social/news sentiment, flag red flags.',
   },
 ];
