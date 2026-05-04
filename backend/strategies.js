@@ -1,3 +1,6 @@
+// Base strategy templates. Per-trade risk numbers, confidence gates, and
+// stop/target multipliers are scaled at runtime by the user's chosen Risk Scale
+// (see RISK_SCALES below + applyRiskScale).
 const STRATEGIES = {
   day: {
     name: 'day',
@@ -6,15 +9,13 @@ const STRATEGIES = {
     timeframe: '1Min',
     lookback: 30,
     intervalSeconds: 60,
+    // base stop/target — scaled by risk scale's stop/target multipliers
     stopLossPct: 0.005,
     takeProfitPct: 0.01,
-    minRiskUSD: 50,
-    maxRiskUSD: 100,
     maxHoldings: 4,
     forceFlattenBeforeClose: true,
     holdOvernight: false,
-    confidenceThreshold: 0.85,
-    minDirectionalAgreement: 3,
+    minDirectionalAgreement: 3, // quorum NEVER relaxed by risk scale
     maxPositionPct: 0.03,
   },
   swing: {
@@ -26,18 +27,99 @@ const STRATEGIES = {
     intervalSeconds: 300,
     stopLossPct: 0.02,
     takeProfitPct: 0.05,
-    minRiskUSD: 75,
-    maxRiskUSD: 200,
     maxHoldings: 3,
     forceFlattenBeforeClose: false,
     holdOvernight: true,
-    confidenceThreshold: 0.85,
     minDirectionalAgreement: 3,
     maxPositionPct: 0.05,
   },
 };
 
-function getStrategy(name) { return STRATEGIES[name] || null; }
-function listStrategies() { return Object.values(STRATEGIES); }
+// User-controlled risk scales. The Risk Scale governs:
+//   - confidenceThreshold (consensus gate)
+//   - min/maxRiskUSD per trade
+//   - stop & target multipliers (relative to base strategy)
+//   - maxDailyLossUSD (daily loss circuit-breaker budget)
+// Quorum (3-of-4 directional agreement) and the % drawdown circuit breaker are
+// NOT relaxed by risk scale — those remain hard safety floors.
+const RISK_SCALES = {
+  conservative: {
+    name: 'conservative',
+    label: 'Conservative',
+    emoji: '🛡',
+    short: 'Capital preservation first.',
+    description: '85% confidence gate, $50–$100 per trade, tight stops, $100/day loss cap.',
+    confidenceThreshold: 0.85,
+    minRiskUSD: 50,
+    maxRiskUSD: 100,
+    stopMultiplier: 0.8,
+    targetMultiplier: 0.9,
+    maxDailyLossUSD: 100,
+  },
+  balanced: {
+    name: 'balanced',
+    label: 'Balanced',
+    emoji: '⚖',
+    short: 'Default — steady growth, sensible risk.',
+    description: '80% confidence gate, $100–$200 per trade, balanced stops, $200/day loss cap.',
+    confidenceThreshold: 0.80,
+    minRiskUSD: 100,
+    maxRiskUSD: 200,
+    stopMultiplier: 1.0,
+    targetMultiplier: 1.0,
+    maxDailyLossUSD: 200,
+  },
+  aggressive: {
+    name: 'aggressive',
+    label: 'Aggressive',
+    emoji: '🔥',
+    short: 'Bigger swings, bigger payoffs.',
+    description: '75% confidence gate, $200–$400 per trade, wider stops/targets, $400/day loss cap.',
+    confidenceThreshold: 0.75,
+    minRiskUSD: 200,
+    maxRiskUSD: 400,
+    stopMultiplier: 1.4,
+    targetMultiplier: 1.6,
+    maxDailyLossUSD: 400,
+  },
+};
 
-module.exports = { STRATEGIES, getStrategy, listStrategies };
+const DEFAULT_RISK_SCALE = 'balanced';
+
+function getRiskScale(name) {
+  return RISK_SCALES[name] || RISK_SCALES[DEFAULT_RISK_SCALE];
+}
+
+// Returns a NEW strategy object with risk-scale overrides applied.
+// Never mutates the base strategy.
+function applyRiskScale(strategy, scaleName) {
+  const scale = getRiskScale(scaleName);
+  return {
+    ...strategy,
+    confidenceThreshold: scale.confidenceThreshold,
+    minRiskUSD: scale.minRiskUSD,
+    maxRiskUSD: scale.maxRiskUSD,
+    stopLossPct: +(strategy.stopLossPct * scale.stopMultiplier).toFixed(5),
+    takeProfitPct: +(strategy.takeProfitPct * scale.targetMultiplier).toFixed(5),
+    riskScale: scale.name,
+  };
+}
+
+function getStrategy(name, scaleName) {
+  const base = STRATEGIES[name];
+  if (!base) return null;
+  return scaleName ? applyRiskScale(base, scaleName) : base;
+}
+
+function listStrategies(scaleName) {
+  return Object.values(STRATEGIES).map(s => scaleName ? applyRiskScale(s, scaleName) : s);
+}
+
+function listRiskScales() {
+  return Object.values(RISK_SCALES);
+}
+
+module.exports = {
+  STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE,
+  getStrategy, listStrategies, getRiskScale, applyRiskScale, listRiskScales,
+};

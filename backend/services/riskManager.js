@@ -1,7 +1,17 @@
 const db = require('./db');
+const { getRiskScale, DEFAULT_RISK_SCALE } = require('../strategies');
 
 const MAX_DAILY_DRAWDOWN_PCT = parseFloat(process.env.MAX_DAILY_DRAWDOWN_PCT || '0.05');
-const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || '100');
+// Hard env-level ceiling on daily $ loss. The active risk scale provides its own
+// (typically smaller) budget; we always use the MIN of the two so env can cap
+// even an Aggressive scale during early testing.
+const MAX_DAILY_LOSS_USD_ENV = parseFloat(process.env.MAX_DAILY_LOSS_USD || '0') || null;
+
+function effectiveDailyLossBudget(portfolio) {
+  const scale = getRiskScale(portfolio?.risk_scale || DEFAULT_RISK_SCALE);
+  const scaleBudget = scale.maxDailyLossUSD;
+  return MAX_DAILY_LOSS_USD_ENV ? Math.min(scaleBudget, MAX_DAILY_LOSS_USD_ENV) : scaleBudget;
+}
 
 async function computeEquity(holdings, priceLookup) {
   const portfolio = await db.getPortfolio();
@@ -18,14 +28,15 @@ async function checkCircuitBreaker(equity) {
   const dayStart = parseFloat(portfolio.day_start_equity);
   const drawdown = (dayStart - equity) / dayStart;
   const lossUSD = dayStart - equity;
+  const dailyLossBudget = effectiveDailyLossBudget(portfolio);
 
-  if (lossUSD >= MAX_DAILY_LOSS_USD && !portfolio.circuit_breaker) {
+  if (lossUSD >= dailyLossBudget && !portfolio.circuit_breaker) {
     await db.updatePortfolio({ circuit_breaker: true });
     await db.recordAudit({
       event_type: 'CIRCUIT_BREAKER_TRIPPED',
-      payload: { reason: 'daily_loss_budget', lossUSD, threshold: MAX_DAILY_LOSS_USD, dayStart, equity },
+      payload: { reason: 'daily_loss_budget', lossUSD, threshold: dailyLossBudget, riskScale: portfolio.risk_scale, dayStart, equity },
     });
-    return { tripped: true, drawdown, lossUSD, reason: `Daily loss $${lossUSD.toFixed(2)} ≥ $${MAX_DAILY_LOSS_USD} budget` };
+    return { tripped: true, drawdown, lossUSD, reason: `Daily loss $${lossUSD.toFixed(2)} ≥ $${dailyLossBudget} budget (${portfolio.risk_scale})` };
   }
   if (drawdown >= MAX_DAILY_DRAWDOWN_PCT && !portfolio.circuit_breaker) {
     await db.updatePortfolio({ circuit_breaker: true });
@@ -118,14 +129,16 @@ async function evaluateStops({ symbol, currentPrice, holding }) {
   return null;
 }
 
-function getConfig() {
+function getConfig(portfolio) {
   return {
     maxDailyDrawdownPct: MAX_DAILY_DRAWDOWN_PCT,
-    maxDailyLossUSD: MAX_DAILY_LOSS_USD,
+    maxDailyLossUSD: effectiveDailyLossBudget(portfolio),
+    envCapUSD: MAX_DAILY_LOSS_USD_ENV,
   };
 }
 
 module.exports = {
   computeEquity, checkCircuitBreaker,
   evaluateBuy, evaluateSell, evaluateStops, getConfig,
+  effectiveDailyLossBudget,
 };

@@ -19,6 +19,7 @@ async function ensureSchema() {
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS risk_scale TEXT NOT NULL DEFAULT 'balanced'`);
   // Holdings PK was symbol-only; allow same symbol in multiple strategies.
   try {
     await query(`ALTER TABLE holdings DROP CONSTRAINT IF EXISTS holdings_pkey`);
@@ -35,7 +36,7 @@ async function getPortfolio() {
 const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'cash_balance', 'starting_balance', 'day_start_equity',
   'circuit_breaker', 'emergency_pause', 'agent_running',
-  'day_enabled', 'swing_enabled', 'trading_mode',
+  'day_enabled', 'swing_enabled', 'trading_mode', 'risk_scale',
 ]);
 
 async function updatePortfolio(updates) {

@@ -4,7 +4,7 @@ const alpacaService = require('./services/alpacaService');
 const discordService = require('./services/discordService');
 const riskManager = require('./services/riskManager');
 const db = require('./services/db');
-const { STRATEGIES, listStrategies, getStrategy } = require('./strategies');
+const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE } = require('./strategies');
 
 const WATCHLIST = (process.env.WATCHLIST || 'AAPL,NVDA,TSLA,MSFT,AMZN,META,GOOGL,SPY')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -362,10 +362,12 @@ async function runCycle() {
       if (bars.length) fullLookup[sym] = bars[bars.length - 1].c;
     }));
 
-    // Run each enabled strategy according to its own cadence
+    // Apply the user's chosen risk scale to each strategy before running.
+    // This dynamically adjusts confidence gate, $ risk per trade, and stop/target ratios.
+    const scaleName = portfolio.risk_scale || DEFAULT_RISK_SCALE;
     const strategies = [
-      { sc: STRATEGIES.day, enabled: portfolio.day_enabled },
-      { sc: STRATEGIES.swing, enabled: portfolio.swing_enabled },
+      { sc: applyRiskScale(STRATEGIES.day, scaleName), enabled: portfolio.day_enabled },
+      { sc: applyRiskScale(STRATEGIES.swing, scaleName), enabled: portfolio.swing_enabled },
     ];
     for (const { sc, enabled } of strategies) {
       if (!enabled) continue;
@@ -413,6 +415,27 @@ async function resetCircuitBreaker() {
   const { equity } = await riskManager.computeEquity(holdings, priceMap.lookup);
   await db.updatePortfolio({ circuit_breaker: false, day_start_equity: equity.toFixed(2) });
   await db.recordAudit({ event_type: 'CIRCUIT_BREAKER_RESET', payload: { newDayStart: equity } });
+}
+
+async function setRiskScale(scaleName) {
+  if (!getRiskScale(scaleName) || !['conservative', 'balanced', 'aggressive'].includes(scaleName)) {
+    throw new Error('risk_scale must be conservative, balanced, or aggressive');
+  }
+  const prev = (await db.getPortfolio()).risk_scale || DEFAULT_RISK_SCALE;
+  await db.updatePortfolio({ risk_scale: scaleName });
+  const scale = getRiskScale(scaleName);
+  await db.recordAudit({
+    event_type: 'RISK_SCALE_CHANGED',
+    payload: {
+      from: prev, to: scaleName,
+      confidenceThreshold: scale.confidenceThreshold,
+      riskUSD: [scale.minRiskUSD, scale.maxRiskUSD],
+      maxDailyLossUSD: scale.maxDailyLossUSD,
+      stopMultiplier: scale.stopMultiplier,
+      targetMultiplier: scale.targetMultiplier,
+    },
+  });
+  console.log(`[Agent] Risk scale: ${prev} → ${scaleName}`);
 }
 
 async function setStrategyEnabled(strategyName, enabled) {
@@ -469,7 +492,9 @@ async function getAgentSnapshot() {
   const tradingMode = portfolio.trading_mode || 'paper';
   if (alpacaService.mode !== tradingMode) alpacaService.setMode(tradingMode);
 
-  const strategies = listStrategies().map(s => ({
+  const scaleName = portfolio.risk_scale || DEFAULT_RISK_SCALE;
+  const activeScale = getRiskScale(scaleName);
+  const strategies = listStrategies(scaleName).map(s => ({
     ...s,
     enabled: s.name === 'day' ? !!portfolio.day_enabled : !!portfolio.swing_enabled,
     holdings: holdings.filter(h => h.strategy === s.name).length,
@@ -505,7 +530,12 @@ async function getAgentSnapshot() {
     lastFlatten: memoryState.lastFlatten,
     cycleCount: memoryState.cycleCount,
     lastError: memoryState.lastError,
-    risk: riskManager.getConfig(),
+    risk: riskManager.getConfig(portfolio),
+    riskScale: {
+      current: scaleName,
+      ...activeScale,
+    },
+    riskScales: listRiskScales(),
     strategies,
     providers: llmService.getProviderStatus(),
     watchlist: WATCHLIST,
@@ -534,5 +564,5 @@ scheduleDailyReset();
 module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, flattenAllPositions,
-  setStrategyEnabled, setTradingMode, WATCHLIST,
+  setStrategyEnabled, setTradingMode, setRiskScale, WATCHLIST,
 };

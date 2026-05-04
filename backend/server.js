@@ -6,7 +6,7 @@ const WebSocket = require('ws');
 const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, flattenAllPositions,
-  setStrategyEnabled, setTradingMode,
+  setStrategyEnabled, setTradingMode, setRiskScale,
 } = require('./agent');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
@@ -145,6 +145,15 @@ app.post('/api/agent/strategy/:name/toggle', async (req, res) => {
     broadcastState();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/agent/risk-scale', async (req, res) => {
+  try {
+    const { scale } = req.body || {};
+    await setRiskScale(scale);
+    broadcastState();
+    res.json({ success: true, scale });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/agent/trading-mode', async (req, res) => {

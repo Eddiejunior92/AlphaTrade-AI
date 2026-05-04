@@ -28,7 +28,7 @@ export default function App() {
     state, trades, audit, connected, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
-    toggleStrategy, setTradingMode,
+    toggleStrategy, setTradingMode, setRiskScale,
   } = useAgent();
 
   const equity = state?.equity || 0;
@@ -44,6 +44,8 @@ export default function App() {
   const providers = state?.providers || { openrouter: false, xai: false };
   const activeModels = (providers.openrouter ? 3 : 0) + (providers.xai ? 1 : 0);
   const risk = state?.risk;
+  const riskScale = state?.riskScale;
+  const riskScales = state?.riskScales || [];
   const mode = state?.mode || 'paper';
   const liveAvailable = state?.liveAvailable;
   const strategies = state?.strategies || [];
@@ -177,6 +179,14 @@ export default function App() {
               </div>
             </div>
 
+            {/* Risk Scale — prominent user control */}
+            <RiskScaleSelector
+              scales={riskScales}
+              current={riskScale?.current}
+              loading={loading}
+              onChange={setRiskScale}
+            />
+
             {/* Strategy mini-toggles */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {[dayStrat, swingStrat].filter(Boolean).map(s => (
@@ -218,9 +228,10 @@ export default function App() {
 
             {/* Stats */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <StatCard label="Confidence Gate" icon="🎯" value="85%"
-                sub="Below this, no trade fires" color="text-[var(--blue)]" />
-              <StatCard label="Daily Risk Cap" icon="💵" value={`$${risk?.maxDailyLossUSD ?? 100}`}
+              <StatCard label="Confidence Gate" icon="🎯"
+                value={`${Math.round((riskScale?.confidenceThreshold ?? 0.85) * 100)}%`}
+                sub={`${riskScale?.label || 'Balanced'} · below this, no trade`} color="text-[var(--blue)]" />
+              <StatCard label="Daily Risk Cap" icon="💵" value={`$${risk?.maxDailyLossUSD ?? 200}`}
                 sub={`$${(state?.dailyLossUSD || 0).toFixed(2)} used today`} color="text-[var(--red)]" />
               <StatCard label="Mode" icon={mode === 'live' ? '🔴' : '🟡'}
                 value={mode.toUpperCase()}
@@ -517,6 +528,48 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+function RiskScaleSelector({ scales, current, loading, onChange }) {
+  if (!scales?.length) return null;
+  const ACCENT = {
+    conservative: { ring: 'border-[var(--green)]/60', glow: 'from-[var(--green)]/20', text: 'text-[var(--green)]' },
+    balanced:     { ring: 'border-[var(--blue)]/60',  glow: 'from-[var(--blue)]/20',  text: 'text-[var(--blue)]' },
+    aggressive:   { ring: 'border-[var(--red)]/60',   glow: 'from-[var(--red)]/20',   text: 'text-[var(--red)]' },
+  };
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">Risk Scale</div>
+        <div className="text-[10px] text-[var(--text-dim)]">Quorum 3-of-4 stays locked · CB always armed</div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 sm:gap-3">
+        {scales.map(s => {
+          const active = current === s.name;
+          const a = ACCENT[s.name] || ACCENT.balanced;
+          const isLoading = loading[`risk:${s.name}`];
+          return (
+            <Tooltip key={s.name} text={s.description}>
+              <button onClick={() => !active && onChange(s.name)} disabled={isLoading}
+                className={`w-full glass p-3 sm:p-4 text-left transition-all relative overflow-hidden ${
+                  active ? `border ${a.ring} bg-gradient-to-br ${a.glow} to-transparent` : 'border border-white/5 hover:border-white/15 opacity-80 hover:opacity-100'
+                }`}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-base sm:text-lg">{s.emoji}</span>
+                  {active && <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-white/10 ${a.text}`}>ACTIVE</span>}
+                  {isLoading && <span className="text-[9px] text-[var(--text-dim)]">…</span>}
+                </div>
+                <div className={`text-[12px] sm:text-[13px] font-semibold ${active ? a.text : ''}`}>{s.label}</div>
+                <div className="text-[9px] sm:text-[10px] text-[var(--text-dim)] mt-1 leading-tight">
+                  {Math.round(s.confidenceThreshold * 100)}% gate · ${s.minRiskUSD}–${s.maxRiskUSD} · ${s.maxDailyLossUSD}/day cap
+                </div>
+              </button>
+            </Tooltip>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

@@ -109,5 +109,13 @@ export function useAgent() {
         return r;
       } finally { setLoad('mode', false); }
     },
+    setRiskScale: async (scale) => {
+      setLoad(`risk:${scale}`, true);
+      try {
+        const r = await apiPost('/agent/risk-scale', { scale });
+        await refreshLogs();
+        return r;
+      } finally { setLoad(`risk:${scale}`, false); }
+    },
   };
 }
