@@ -13,9 +13,9 @@ const MODELS = [
   },
   {
     id: 'claude',
-    label: 'Claude 3.5 Sonnet',
+    label: 'Claude 3.7 Sonnet',
     provider: 'openrouter',
-    model: 'anthropic/claude-3.5-sonnet',
+    model: 'anthropic/claude-3.7-sonnet',
     role: 'Risk manager — focus on downside risk and capital preservation.',
   },
   {
