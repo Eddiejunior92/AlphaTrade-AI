@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const bus = require('./eventBus');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -118,12 +119,17 @@ async function getRecentTrades(limit = 50) {
 }
 
 async function recordAudit({ event_type, symbol, decision, confidence, models, payload }) {
-  await query(
+  const { rows } = await query(
     `INSERT INTO audit_log (event_type, symbol, decision, confidence, models, payload)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING *`,
     [event_type, symbol || null, decision || null, confidence || null,
      models ? JSON.stringify(models) : null, payload ? JSON.stringify(payload) : null]
   );
+  const row = rows[0];
+  // Fire-and-forget: any subscriber (e.g. WS broadcaster) gets the row live.
+  if (row) { try { bus.emit('audit', row); } catch (_) { /* never block writes */ } }
+  return row;
 }
 
 async function getRecentAudit(limit = 50) {

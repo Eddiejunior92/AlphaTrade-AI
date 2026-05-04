@@ -13,6 +13,7 @@ const llmService = require('./services/llmService');
 const brokerService = require('./services/brokerService');
 const sentimentService = require('./services/sentimentService');
 const db = require('./services/db');
+const bus = require('./services/eventBus');
 const { getWatchlist } = require('./strategies');
 
 const app = express();
@@ -90,6 +91,18 @@ async function broadcastState() {
   } catch (e) { console.error('[WS] broadcast error:', e.message); }
 }
 setInterval(broadcastState, 4000);
+
+// Live audit-log push: every recordAudit() emits on the bus; we forward to
+// all connected dashboards so the Reasoning tab updates without polling.
+function broadcastAudit(row) {
+  if (!row || wsClients.size === 0) return;
+  const msg = JSON.stringify({ type: 'audit', data: row });
+  for (const ws of [...wsClients]) {
+    if (ws.readyState !== WebSocket.OPEN) { wsClients.delete(ws); continue; }
+    try { ws.send(msg); } catch { wsClients.delete(ws); try { ws.terminate(); } catch {} }
+  }
+}
+bus.on('audit', broadcastAudit);
 
 app.get('/api/health', (req, res) => {
   res.json({

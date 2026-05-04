@@ -21,16 +21,34 @@ export function useAgent() {
   const [trades, setTrades] = useState([]);
   const [audit, setAudit] = useState([]);
   const [connected, setConnected] = useState(false);
+  const [liveAuditAt, setLiveAuditAt] = useState(0);
   const [loading, setLoading] = useState({});
   const wsRef = useRef(null);
 
   const setLoad = (key, val) => setLoading(l => ({ ...l, [key]: val }));
 
+  // Merge fetched audit rows with the in-memory list (which may already contain
+  // newer rows pushed live over WS). Dedupe by id, keep newest-first, cap 200.
+  const mergeAudit = (incoming) => {
+    if (!Array.isArray(incoming)) return;
+    setAudit(prev => {
+      const seen = new Set();
+      const merged = [];
+      for (const row of [...prev, ...incoming]) {
+        if (!row || row.id == null || seen.has(row.id)) continue;
+        seen.add(row.id);
+        merged.push(row);
+      }
+      merged.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      return merged.slice(0, 200);
+    });
+  };
+
   const refreshLogs = useCallback(async () => {
     try {
       const [t, a] = await Promise.all([apiGet('/trades?limit=100'), apiGet('/audit?limit=100')]);
       setTrades(Array.isArray(t) ? t : []);
-      setAudit(Array.isArray(a) ? a : []);
+      mergeAudit(a);
     } catch {}
   }, []);
 
@@ -56,6 +74,14 @@ export function useAgent() {
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'state') setState(msg.data);
+          else if (msg.type === 'audit' && msg.data) {
+            setAudit(prev => {
+              // Dedupe by id, prepend newest, cap at 200 entries.
+              if (prev.some(r => r.id === msg.data.id)) return prev;
+              return [msg.data, ...prev].slice(0, 200);
+            });
+            setLiveAuditAt(Date.now());
+          }
         } catch {}
       };
     };
@@ -85,7 +111,7 @@ export function useAgent() {
   }, []);
 
   return {
-    state, trades, audit, connected, loading, brokerChat,
+    state, trades, audit, connected, liveAuditAt, loading, brokerChat,
     startAgent: wrap('start', () => apiPost('/agent/start')),
     stopAgent: wrap('stop', () => apiPost('/agent/stop')),
     runNow: wrap('runNow', () => apiPost('/agent/run-now')),

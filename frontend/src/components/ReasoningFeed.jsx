@@ -15,7 +15,18 @@ const EVENT_META = {
   CYCLE_ERROR: { color: 'var(--red)', icon: '⚠', label: 'Cycle Error' },
 };
 
-export default function ReasoningFeed({ entries = [], compact = false }) {
+import { useEffect, useRef } from 'react';
+
+export default function ReasoningFeed({ entries = [], compact = false, autoScroll = false }) {
+  const scrollRef = useRef(null);
+  const topId = entries[0]?.id;
+  // Auto-scroll the container to the top whenever a new newest entry arrives.
+  // Newest-first ordering means "latest" lives at scrollTop=0.
+  useEffect(() => {
+    if (!autoScroll || !scrollRef.current || topId == null) return;
+    scrollRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [topId, autoScroll]);
+
   if (!entries.length) {
     return (
       <div className="text-center py-12">
@@ -26,7 +37,7 @@ export default function ReasoningFeed({ entries = [], compact = false }) {
     );
   }
   return (
-    <div className={`space-y-3 ${compact ? 'max-h-[420px]' : 'max-h-[70vh]'} overflow-y-auto pr-1`}>
+    <div ref={scrollRef} className={`space-y-3 ${compact ? 'max-h-[420px]' : 'max-h-[70vh]'} overflow-y-auto pr-1`}>
       {entries.map(e => {
         const meta = EVENT_META[e.event_type] || { color: 'var(--text-dim)', icon: '·', label: e.event_type };
         const time = new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });

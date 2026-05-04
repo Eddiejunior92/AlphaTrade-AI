@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useAgent } from './hooks/useAgent';
 import StatCard from './components/StatCard';
 import SignalCard from './components/SignalCard';
@@ -23,13 +23,39 @@ const TABS = [
 
 function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }
 
+function LiveBadge({ connected, pulseAt }) {
+  // Briefly flash brighter for 1.2s after each new live entry arrives.
+  const [flash, setFlash] = useState(false);
+  useEffect(() => {
+    if (!pulseAt) return;
+    setFlash(true);
+    const t = setTimeout(() => setFlash(false), 1200);
+    return () => clearTimeout(t);
+  }, [pulseAt]);
+
+  if (!connected) {
+    return (
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] font-semibold text-[var(--text-dim)]">
+        <span className="w-1.5 h-1.5 rounded-full bg-[var(--text-dim)]" />
+        OFFLINE
+      </div>
+    );
+  }
+  return (
+    <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-semibold transition-colors ${flash ? 'bg-[var(--green)]/25 border-[var(--green)]/50 text-[var(--green)]' : 'bg-[var(--green)]/10 border-[var(--green)]/30 text-[var(--green)]'}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-[var(--green)] pulse-live" />
+      LIVE
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState('home');
   const [chatOpen, setChatOpen] = useState(false);
   const [modeModal, setModeModal] = useState(null); // 'paper' | 'live' | null
   const [modeError, setModeError] = useState('');
   const {
-    state, trades, audit, connected, loading, brokerChat,
+    state, trades, audit, connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
     toggleStrategy, setTradingMode, setRiskScale,
@@ -307,15 +333,18 @@ export default function App() {
         {tab === 'reason' && (
           <div className="space-y-4">
             <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
-              <div className="flex items-center gap-3">
-                <div className="text-3xl">🧠</div>
-                <div>
-                  <h2 className="text-lg font-semibold tracking-tight">AI Reasoning</h2>
-                  <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes is logged here in real time. Each model votes independently — Alpha only acts when 3+ agree at 85%+ confidence.</div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="text-3xl">🧠</div>
+                  <div>
+                    <h2 className="text-lg font-semibold tracking-tight">AI Reasoning</h2>
+                    <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes streams here in real time. Each model votes independently — Alpha only acts when 3+ agree at the confidence threshold.</div>
+                  </div>
                 </div>
+                <LiveBadge connected={connected} pulseAt={liveAuditAt} />
               </div>
             </div>
-            <ReasoningFeed entries={audit} />
+            <ReasoningFeed entries={audit} autoScroll />
           </div>
         )}
 
