@@ -4,6 +4,8 @@
   "description": "**Fully autonomous high-frequency trading system** using a multi-LLM ensemble (Gemini 2.5 Flash + Claude + GPT-4o + **Grok**) with consensus voting, stateful memory, Alpaca brokerage integration, Discord alerts, and iron-clad safety guardrails.",
   "main": "index.js",
   "scripts": {
+    "build": "node_modules/.bin/vite build --config frontend/vite.config.js frontend",
+    "start": "node backend/server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:conservative": "node scripts/risk.js test conservative",
     "test:balanced":     "node scripts/risk.js test balanced",

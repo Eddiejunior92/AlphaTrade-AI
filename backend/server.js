@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
 const WebSocket = require('ws');
 const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
@@ -514,6 +516,22 @@ app.post('/api/broker/chat', async (req, res) => {
     res.json(result);
   } catch (e) { res.status(500).json({ reply: `Server error: ${e.message}`, error: true }); }
 });
+
+// --- Serve the built React frontend in production ------------------------
+// In dev, Vite (port 5000) serves the UI and proxies /api + /ws to us.
+// In prod, there is no Vite — we serve frontend/dist directly and add a
+// SPA fallback so client-side routes (anything that isn't /api or /ws)
+// return index.html.
+const FRONTEND_DIST = path.resolve(__dirname, '..', 'frontend', 'dist');
+if (fs.existsSync(path.join(FRONTEND_DIST, 'index.html'))) {
+  app.use(express.static(FRONTEND_DIST, { index: false, maxAge: '1h' }));
+  app.get(/^\/(?!api\/|ws($|\/)).*/, (_req, res) => {
+    res.sendFile(path.join(FRONTEND_DIST, 'index.html'));
+  });
+  console.log(`[Server] Serving static frontend from ${FRONTEND_DIST}`);
+} else {
+  console.log(`[Server] No built frontend at ${FRONTEND_DIST} — dev mode (Vite handles UI)`);
+}
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] AlphaTrade AI v2 listening on :${PORT}`);
