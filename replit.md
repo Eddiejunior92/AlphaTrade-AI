@@ -14,8 +14,14 @@ Production-ready autonomous multi-LLM high-frequency trading agent.
   - `services/db.js` — PostgreSQL with `ensureSchema()` migration. `holdings` has composite PK `(symbol, strategy)` so the same symbol can be held in both strategies independently.
   - `services/discordService.js` — webhook alerts.
   - `services/sentimentService.js` — Grok-powered news sentiment per symbol. Returns `{score: -1..+1, label, summary, insights, sources}`. Cached 30 min per symbol; refreshed in background each cycle. Injected into the LLM ensemble prompt and exposed to the dashboard.
-- **Frontend** (`frontend/`, port 5000): React + Vite + Tailwind v4. iPhone-16 glassmorphism dashboard. Tabs: Home, Markets, Strategies, Reasoning, Positions, Trades, Settings. Tooltips on every button. Strategy ON/OFF toggles, paper↔live mode switcher with confirmation modal. Voice broker (`VoiceChat` + `useVoice` hook) via Web Speech API. Markets tab shows a clean recharts price chart per watchlist symbol (1d / 5d toggle) with live AI confidence, news sentiment score, and key insights.
-- **Database**: PostgreSQL — `portfolio` (with `day_enabled`, `swing_enabled`, `trading_mode`), `holdings` (composite PK), `trades` (strategy-tagged), `audit_log`.
+  - `services/adaptiveLearningService.js` — nightly recompute (22:00 UTC) of per-(symbol,strategy) and per-(model,strategy) win-rate from closed trades. Exposes `getCalibrationHints()` (prompt block, advisory only) and `getSizingMultiplier()` ∈ [0.7, 1.2]. Never relaxes quorum/gate.
+  - `services/portfolioOptimizationService.js` — correlation-aware portfolio risk. `evaluateAddition()` returns `sizeMult` ∈ [0.5, 1.0] based on existing-holding correlation + concentration. Pure SIZING modifier, applied AFTER quorum/gate.
+  - `services/hedgingService.js` — portfolio-level risk monitor. Posts Discord alert on risk spike; if `AUTO_HEDGE=true`, places SH (inverse SPY) buy at 15% of long exposure. Cooldown-protected, never bypasses circuit breaker. Default OFF (advisory).
+  - `services/orderFlowService.js` — bar-derived buy/sell pressure proxy (volume-weighted up vs down candles). Lightweight prompt block.
+  - `services/optionsActivityService.js` — Grok-fetched unusual options activity flag per symbol. Cached, refreshed every 30 min during market hours. Prompt block only — never sizes trades.
+  - `services/backtestService.js` — daily-bars rules-based backtest engine (RSI + trend + MACD entry, configurable stop/target/trailing). Models slippage (bps) and per-trade commission. Returns equity curve, trade log, Sharpe, max drawdown, win rate. Persists to `backtest_runs` table. Watchlist-only, in-flight lock, operator-gated.
+- **Frontend** (`frontend/`, port 5000): React + Vite + Tailwind v4. iPhone-16 glassmorphism dashboard. Tabs: Home, Markets, Strategies, Reasoning, Positions, Trades, **Backtest**, Settings. Tooltips on every button. Strategy ON/OFF toggles, paper↔live mode switcher with confirmation modal. Voice broker (`VoiceChat` + `useVoice` hook) via Web Speech API. Markets tab shows a clean recharts price chart per watchlist symbol (1d / 5d toggle) with live AI confidence, news sentiment score, and key insights.
+- **Database**: PostgreSQL — `portfolio`, `holdings` (composite PK), `trades`, `audit_log`, `historical_intelligence`, `symbol_strategy_performance`, `model_performance`, `backtest_runs`.
 
 ## Strategy Configs (in `backend/strategies.js`)
 - **Day**: 1Min bars, 60s cadence, 0.5%/1% stop/target, $50–$100 risk/trade, max 4 holdings, 3% position cap, auto-flatten 5m before close. No trailing stop (intraday only).
@@ -31,6 +37,7 @@ Production-ready autonomous multi-LLM high-frequency trading agent.
 - `AGENT_INTERVAL_SECONDS=60` (base loop tick)
 - `FORCE_FLATTEN_MINUTES_BEFORE_CLOSE=5` (day strategy only)
 - `OPERATOR_TOKEN` — REQUIRED to enable LIVE mode switch and to deploy in production.
+- `AUTO_HEDGE=true` (default false) — arms automatic SH inverse-ETF hedge on portfolio risk spikes (otherwise advisory Discord alert only).
 
 ## Required Secrets
 - `OPENROUTER_API_KEY` — Gemini, Claude, GPT-4o

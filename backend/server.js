@@ -210,6 +210,99 @@ app.get('/api/audit', async (req, res) => {
   res.json(await db.getRecentAudit(limit));
 });
 
+// --- Backtest engine ---------------------------------------------------------
+// POST /api/backtest         — run a backtest with the given params (gated)
+// GET  /api/backtest/recent  — list recent runs (no body)
+// GET  /api/backtest/:id     — full run incl. equity curve + trades
+const backtestService = require('./services/backtestService');
+const adaptiveLearning = require('./services/adaptiveLearningService');
+const portfolioOpt = require('./services/portfolioOptimizationService');
+const hedgingService = require('./services/hedgingService');
+
+// Strict gate for expensive endpoints — refuses entirely when OPERATOR_TOKEN
+// is unset, so a misconfigured deploy can never expose cost-amplifying jobs.
+function requireOperatorStrictGate(req, res, next) {
+  if (!OPERATOR_TOKEN) return res.status(403).json({ error: 'This endpoint requires OPERATOR_TOKEN to be configured on the server.' });
+  const provided = req.get('x-operator-token') || req.query.token;
+  if (provided !== OPERATOR_TOKEN) return res.status(401).json({ error: 'Operator token required' });
+  next();
+}
+
+let backtestInFlight = false;
+app.post('/api/backtest', requireOperatorStrictGate, async (req, res) => {
+  if (backtestInFlight) return res.status(429).json({ error: 'A backtest is already running. Try again in a moment.' });
+  backtestInFlight = true;
+  try {
+    // Constrain symbols to the watchlist (prevents arbitrary-symbol cost-DoS).
+    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    const requested = Array.isArray(req.body?.symbols) ? req.body.symbols.map(s => String(s).toUpperCase()) : null;
+    const symbols = requested ? requested.filter(s => allowed.has(s)) : [...allowed].slice(0, 5);
+    if (!symbols.length) return res.status(400).json({ error: 'No valid symbols (must be in watchlist)' });
+
+    const params = {
+      symbols,
+      lookbackDays: Math.max(30, Math.min(1000, parseInt(req.body?.lookbackDays) || 365)),
+      startCash:    Math.max(1000, Math.min(10_000_000, parseFloat(req.body?.startCash) || 100000)),
+      slippageBps:  Math.max(0, Math.min(200, parseFloat(req.body?.slippageBps ?? 5))),
+      commissionUSD:Math.max(0, Math.min(20, parseFloat(req.body?.commissionUSD ?? 1))),
+      rsiBuyMax:    Math.max(20, Math.min(80, parseFloat(req.body?.rsiBuyMax ?? 55))),
+      rsiSellMin:   Math.max(40, Math.min(95, parseFloat(req.body?.rsiSellMin ?? 70))),
+      stopLossPct:  Math.max(0.005, Math.min(0.25, parseFloat(req.body?.stopLossPct ?? 0.04))),
+      takeProfitPct:Math.max(0.01, Math.min(1.0, parseFloat(req.body?.takeProfitPct ?? 0.10))),
+      trailingStopPct: Math.max(0.005, Math.min(0.5, parseFloat(req.body?.trailingStopPct ?? 0.06))),
+      maxPositionPct:  Math.max(0.01, Math.min(1.0, parseFloat(req.body?.maxPositionPct ?? 0.20))),
+      requireUptrend: req.body?.requireUptrend !== false,
+    };
+    const result = await backtestService.runBacktest(params);
+    res.json(result);
+  } catch (e) {
+    console.error('[Backtest] error:', e);
+    res.status(500).json({ error: e.message });
+  } finally { backtestInFlight = false; }
+});
+app.get('/api/backtest/recent', async (_req, res) => res.json(await backtestService.getRecentRuns(20)));
+app.get('/api/backtest/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+  const run = await backtestService.getRun(id);
+  if (!run) return res.status(404).json({ error: 'not found' });
+  res.json(run);
+});
+
+// --- Adaptive learning + portfolio risk read endpoints ----------------------
+app.get('/api/adaptive/performance', async (_req, res) => {
+  try { res.json(await adaptiveLearning.getDashboardSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// In-flight mutex + 60s cooldown — adaptive recompute scans up to ~2000 closed
+// trades and joins each to a SIGNAL audit row, so it must not be flooded.
+let adaptiveRecomputeInFlight = false;
+let lastAdaptiveRecomputeAt = 0;
+const ADAPTIVE_RECOMPUTE_COOLDOWN_MS = 60_000;
+app.post('/api/adaptive/recompute', requireOperatorStrictGate, async (req, res) => {
+  if (adaptiveRecomputeInFlight) return res.status(429).json({ error: 'Adaptive recompute already running.' });
+  const since = Date.now() - lastAdaptiveRecomputeAt;
+  if (since < ADAPTIVE_RECOMPUTE_COOLDOWN_MS) {
+    return res.status(429).json({ error: `Cooldown active. Try again in ${Math.ceil((ADAPTIVE_RECOMPUTE_COOLDOWN_MS - since) / 1000)}s.` });
+  }
+  adaptiveRecomputeInFlight = true;
+  try {
+    const out = await adaptiveLearning.recomputeFromHistory();
+    lastAdaptiveRecomputeAt = Date.now();
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+  finally { adaptiveRecomputeInFlight = false; }
+});
+app.get('/api/portfolio/risk', async (_req, res) => {
+  try {
+    const holdings = await db.getHoldings();
+    const symbols = [...new Set(holdings.map(h => h.symbol))];
+    const snap = await portfolioOpt.getPortfolioSnapshot(symbols);
+    const hedge = holdings.length >= 2 ? await hedgingService.getPortfolioRisk(holdings) : null;
+    res.json({ snap, hedge, holdings: holdings.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/account', async (req, res) => { res.json(await alpacaService.getAccount()); });
 
 // --- Charts: price bars per symbol -----------------------------------------

@@ -153,16 +153,23 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
 
   // Dynamic target: confidence-weighted and compounding-scaled.
   const dyn = dynamic || { growthMult: 1, perfMult: 1, compoundMult: 1 };
+  // Adaptive (own track-record) and portfolio (correlation/concentration)
+  // multipliers. Both are clamped at the source: adaptive ∈ [0.7, 1.2],
+  // portfolio ∈ [0.5, 1.0]. Pure SIZING modifiers — never relax the quorum,
+  // confidence gate, daily caps, or circuit breaker.
+  const adaptiveMult  = Number.isFinite(dyn.adaptiveMult)  ? dyn.adaptiveMult  : 1.0;
+  const portfolioMult = Number.isFinite(dyn.portfolioMult) ? dyn.portfolioMult : 1.0;
   const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
+  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult).toFixed(2);
 
-  const qtyByRisk = Math.floor(target.targetRiskUSD / riskPerShare);
+  const qtyByRisk = Math.floor(adjustedRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
   const remainingBudgetUSD = Math.min(maxPositionUSD, cash);
   const qtyByPosition = Math.floor(remainingBudgetUSD / price);
 
   const qty = Math.max(0, Math.min(qtyByRisk, qtyByPosition));
   if (qty < 1) {
-    return { allow: false, reason: `Computed qty<1 (target=$${target.targetRiskUSD}, risk-cap=${qtyByRisk}, position-cap=${qtyByPosition})` };
+    return { allow: false, reason: `Computed qty<1 (target=$${target.targetRiskUSD}, adj=$${adjustedRiskUSD}, risk-cap=${qtyByRisk}, position-cap=${qtyByPosition})` };
   }
 
   const tradeRisk = qty * riskPerShare;
@@ -180,11 +187,14 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
     riskUSD: parseFloat(tradeRisk.toFixed(2)),
     sizing: {
       targetRiskUSD: target.targetRiskUSD,
+      adjustedRiskUSD,
       baseRiskUSD: target.baseRiskUSD,
       confFraction: target.confFraction,
       growthMult: dyn.growthMult,
       perfMult: dyn.perfMult,
       compoundMult: dyn.compoundMult,
+      adaptiveMult,
+      portfolioMult,
     },
   };
 }

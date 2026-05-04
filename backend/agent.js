@@ -10,6 +10,11 @@ const patternService = require('./services/patternService');
 const indicatorsService = require('./services/indicatorsService');
 const intradayService = require('./services/intradayService');
 const historicalIntel = require('./services/historicalIntelligenceService');
+const adaptiveLearning = require('./services/adaptiveLearningService');
+const portfolioOpt = require('./services/portfolioOptimizationService');
+const hedgingService = require('./services/hedgingService');
+const orderFlowService = require('./services/orderFlowService');
+const optionsActivityService = require('./services/optionsActivityService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -310,10 +315,39 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     nextClose: memoryState.nextClose,
   });
 
+  // ---- Upgrade context (informational + sizing inputs) -------------------
+  // All four are best-effort; failure → null/no-op, never blocks a decision.
+  let adaptiveHints = null;
+  try { adaptiveHints = await adaptiveLearning.getCalibrationHints(symbol, sc.name); } catch (_) {}
+
+  let portfolioRiskBlock = null;
+  let portfolioMult = 1.0;
+  try {
+    const allH = await db.getHoldings();
+    if (allH.length) {
+      const r = await portfolioOpt.evaluateAddition({ candidate: symbol, holdings: allH });
+      portfolioMult = r.sizeMult;
+      portfolioRiskBlock = await portfolioOpt.getPromptBlock({ candidate: symbol, holdings: allH });
+    }
+  } catch (_) {}
+
+  let adaptiveMult = 1.0;
+  try { adaptiveMult = await adaptiveLearning.getSizingMultiplier(symbol, sc.name); } catch (_) {}
+
+  let orderFlow = null;
+  try { orderFlow = orderFlowService.analyzeOrderFlow(bars); } catch (_) {}
+
+  let optionsActivity = null;
+  try {
+    const opt = await optionsActivityService.getCached(symbol);
+    if (opt) optionsActivity = optionsActivityService.renderForPrompt(opt);
+  } catch (_) {}
+
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
+    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity,
   });
 
   await db.recordAudit({
@@ -333,7 +367,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
-    const eval_ = await riskManager.evaluateBuy({ symbol, signal, price: latest, equity, cash, holdings, strategyConfig: sc, dynamic });
+    // Pass adaptive + portfolio multipliers through `dynamic` so riskManager
+    // can apply them as pure SIZING modifiers (after quorum/gate). Existing
+    // safety gates remain unchanged.
+    const dynamicWithUpgrades = { ...(dynamic || {}), adaptiveMult, portfolioMult };
+    const eval_ = await riskManager.evaluateBuy({ symbol, signal, price: latest, equity, cash, holdings, strategyConfig: sc, dynamic: dynamicWithUpgrades });
     if (eval_.allow) {
       const sz = eval_.sizing || {};
       await executeOrder({
@@ -487,6 +525,22 @@ async function runCycle() {
       await runStrategy(sc, portfolio, clock, fullLookup, dynamic);
     }
 
+    // Portfolio-level hedge check — informational by default. AUTO_HEDGE=true
+    // arms an inverse-ETF hedge (SH) sized to 15% of long exposure on a risk
+    // spike. Cooldown-protected; **NEVER auto-executes when circuit breaker
+    // is tripped, emergency pause is on, or agent is stopped** — alert still
+    // fires (advisory) but no order is placed.
+    try {
+      const allHForHedge = await db.getHoldings();
+      if (allHForHedge.length >= 2) {
+        const safeForAutoHedge = !portfolio.circuit_breaker
+          && !portfolio.emergency_pause
+          && portfolio.agent_running;
+        const autoHedge = process.env.AUTO_HEDGE === 'true' && safeForAutoHedge;
+        await hedgingService.evaluateAndAlert(allHForHedge, { autoHedge });
+      }
+    } catch (e) { console.error('[Hedge] Tick error:', e.message); }
+
     memoryState.lastError = null;
     console.log(`[Agent] Cycle ${memoryState.cycleCount} complete`);
   } catch (e) {
@@ -593,6 +647,36 @@ function scheduleDailyReset() {
 // Runs once per day at ~09:00 UTC (~04:00-05:00 ET, well before US open). On
 // startup we kick off a non-blocking refresh that skips symbols already cached
 // for today, so a restart never hammers the data API.
+// Adaptive learning + options activity + hedge tick — lightweight schedulers.
+// Adaptive recomputes nightly (after market close); options activity refreshes
+// every 30 min during trading hours; hedge check runs once per cycle inside
+// runStrategy via evaluateAndAlert (see runCycle below).
+let adaptiveDailyHandle = null;
+function scheduleAdaptiveRecompute() {
+  if (adaptiveDailyHandle) clearTimeout(adaptiveDailyHandle);
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(22, 0, 0, 0); // ~17:00 ET, after market close
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  adaptiveDailyHandle = setTimeout(async () => {
+    try {
+      const r = await adaptiveLearning.recomputeFromHistory();
+      console.log(`[Adaptive] Recompute: ${r.symbolBuckets} symbol buckets, ${r.modelBuckets} model buckets, ${r.sourceCloses} closes`);
+    } catch (e) { console.error('[Adaptive] Recompute failed:', e.message); }
+    scheduleAdaptiveRecompute();
+  }, next - now);
+}
+
+let optionsActivityHandle = null;
+function scheduleOptionsActivityRefresh() {
+  if (optionsActivityHandle) clearInterval(optionsActivityHandle);
+  optionsActivityHandle = setInterval(async () => {
+    if (!memoryState.marketOpen) return;
+    try { await optionsActivityService.refreshBatch(WATCHLIST); }
+    catch (e) { console.error('[OptionsActivity] Batch refresh failed:', e.message); }
+  }, 30 * 60 * 1000);
+}
+
 let intelDailyHandle = null;
 function scheduleDailyIntelligence() {
   if (intelDailyHandle) clearTimeout(intelDailyHandle);
@@ -718,6 +802,16 @@ async function getAgentSnapshot() {
 
 scheduleDailyReset();
 scheduleDailyIntelligence();
+scheduleAdaptiveRecompute();
+scheduleOptionsActivityRefresh();
+// Warm adaptive cache + options activity once at startup so the first cycle
+// has fresh context. Both are best-effort and never block boot.
+adaptiveLearning.recomputeFromHistory()
+  .then(r => console.log(`[Adaptive] Startup recompute: ${r.symbolBuckets} symbols, ${r.modelBuckets} models from ${r.sourceCloses} closes`))
+  .catch(e => console.error('[Adaptive] Startup recompute failed:', e.message));
+optionsActivityService.refreshBatch(WATCHLIST)
+  .then(() => console.log(`[OptionsActivity] Startup batch refreshed for ${WATCHLIST.length} symbols`))
+  .catch(e => console.error('[OptionsActivity] Startup refresh failed:', e.message));
 
 (async () => {
   try {

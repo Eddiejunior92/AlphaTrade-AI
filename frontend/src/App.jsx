@@ -11,6 +11,7 @@ import MarketsTab from './components/MarketsTab';
 import ErrorBoundary from './components/ErrorBoundary';
 import MarketClock from './components/MarketClock';
 import PreMarketBriefing from './components/PreMarketBriefing';
+import BacktestPanel from './components/BacktestPanel';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
@@ -19,6 +20,7 @@ const TABS = [
   { id: 'reason',    label: 'Reasoning', icon: '🧠' },
   { id: 'positions', label: 'Positions', icon: '📊' },
   { id: 'trades',    label: 'Trades',    icon: '📜' },
+  { id: 'backtest',  label: 'Backtest',  icon: '🔬' },
   { id: 'settings',  label: 'Settings',  icon: '⚙' },
 ];
 
@@ -387,6 +389,12 @@ export default function App() {
             <h2 className="text-lg font-semibold tracking-tight">Trade History <span className="text-[var(--text-dim)] text-sm font-normal">· {trades.length}</span></h2>
             <TradeLog trades={trades} />
           </div>
+        )}
+
+        {tab === 'backtest' && (
+          <ErrorBoundary>
+            <BacktestPanel />
+          </ErrorBoundary>
         )}
 
         {tab === 'settings' && (

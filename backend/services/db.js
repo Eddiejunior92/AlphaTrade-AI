@@ -43,7 +43,52 @@ async function ensureSchema() {
   `);
   await query(`CREATE INDEX IF NOT EXISTS historical_intelligence_date_idx ON historical_intelligence (as_of_date)`);
 
-  console.log('[DB] Schema ensured (strategy columns + composite PK + historical_intelligence)');
+  // Adaptive learning — closed-trade attribution by (symbol, strategy) and
+  // (model, strategy). Tiny tables, full upsert each pass.
+  await query(`
+    CREATE TABLE IF NOT EXISTS symbol_strategy_performance (
+      symbol     TEXT NOT NULL,
+      strategy   TEXT NOT NULL,
+      n_trades   INTEGER NOT NULL DEFAULT 0,
+      n_wins     INTEGER NOT NULL DEFAULT 0,
+      win_rate   NUMERIC(5,4) NOT NULL DEFAULT 0,
+      avg_pnl    NUMERIC(14,4) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (symbol, strategy)
+    )
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS model_performance (
+      model_id   TEXT NOT NULL,
+      strategy   TEXT NOT NULL,
+      n_trades   INTEGER NOT NULL DEFAULT 0,
+      n_wins     INTEGER NOT NULL DEFAULT 0,
+      gross_pnl  NUMERIC(14,4) NOT NULL DEFAULT 0,
+      win_rate   NUMERIC(5,4) NOT NULL DEFAULT 0,
+      avg_pnl    NUMERIC(14,4) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (model_id, strategy)
+    )
+  `);
+
+  // Backtest runs — full history of dashboard-launched backtests with their
+  // params, equity curve, and trade log. Used for the Backtest tab.
+  await query(`
+    CREATE TABLE IF NOT EXISTS backtest_runs (
+      id           SERIAL PRIMARY KEY,
+      symbols      TEXT[] NOT NULL,
+      start_date   DATE,
+      end_date     DATE,
+      params       JSONB NOT NULL,
+      results      JSONB NOT NULL,
+      equity_curve JSONB,
+      trades       JSONB,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS backtest_runs_created_idx ON backtest_runs (created_at DESC)`);
+
+  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest tables)');
 }
 
 async function getPortfolio() {
