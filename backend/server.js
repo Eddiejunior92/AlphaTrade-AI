@@ -55,7 +55,7 @@ function requireOperatorStrict(req, res, next) {
   next();
 }
 app.use((req, res, next) => {
-  if (req.method === 'POST' && (req.path.startsWith('/api/agent/') || req.path === '/api/broker/chat')) {
+  if (req.method === 'POST' && (req.path.startsWith('/api/agent/') || req.path === '/api/broker/chat' || req.path === '/api/broker/chat-stream')) {
     return requireOperator(req, res, next);
   }
   next();
@@ -200,6 +200,142 @@ app.post('/api/broker/tts', async (req, res) => {
     const msg = e.response?.data ? Buffer.from(e.response.data).toString('utf8') : e.message;
     console.error('[Server] TTS error:', msg);
     res.status(502).json({ error: msg });
+  }
+});
+
+// Streaming voice pipeline:
+//   1. Stream Grok tokens
+//   2. As each sentence completes server-side, fire TTS in parallel
+//   3. Push text deltas + audio chunks (base64 mp3, ordered by seq) over SSE
+//   This lets the client start playing audio ~1s after user stops speaking,
+//   while Grok is still generating the rest of the reply.
+app.post('/api/broker/chat-stream', async (req, res) => {
+  const t0 = Date.now();
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx-style buffering
+  res.flushHeaders?.();
+
+  let closed = false;
+  const send = (event, data) => {
+    if (closed) return;
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+    catch { closed = true; }
+  };
+  const close = () => { try { res.end(); } catch {} };
+  // NOTE: req.on('close') fires when the request body is consumed by express.json(),
+  // not when the client disconnects. Use res.on('close') instead — fires on real
+  // socket close.
+  res.on('close', () => { closed = true; });
+
+  try {
+    const { messages, voice = true } = req.body || {};
+    if (!Array.isArray(messages) || !messages.length) {
+      send('error', { error: 'messages array required' }); return close();
+    }
+
+    const [snapshot, recentTrades, recentAudit] = await Promise.all([
+      getAgentSnapshot(), db.getRecentTrades(10), db.getRecentAudit(20),
+    ]);
+    const recentSignals = Object.values(snapshot.signals || {});
+    send('start', { voice, model: brokerService.GROK_MODEL });
+
+    let textBuf = '';      // tokens since last sentence flush
+    let seq = 0;
+    let firstAudioMs = null;
+    const ttsTasks = [];   // promises that resolve when audio is sent
+
+    // Define kickOffTts FIRST so flushSentenceFromBuffer captures a valid binding.
+    const kickOffTts = (text, final) => {
+      const mySeq = seq++;
+      const task = (async () => {
+        try {
+          const out = await brokerService.synthesize({ text });
+          if (closed) return;
+          const b64 = out.audio.toString('base64');
+          if (firstAudioMs === null) {
+            firstAudioMs = Date.now() - t0;
+            send('timing', { firstAudioMs });
+          }
+          send('audio', { seq: mySeq, b64, contentType: out.contentType, text, final });
+        } catch (e) {
+          send('audio_error', { seq: mySeq, error: e.message });
+        }
+      })();
+      ttsTasks.push(task);
+    };
+
+    // Sentence-flush strategy:
+    //   - Hard boundaries: . ! ? … (always flush, with or without trailing space)
+    //   - Soft boundaries: — ; (em-dash + semicolon) — flush if chunk is long enough
+    //   - First-chunk only: , (comma) — flush early so the opening verdict
+    //     ("No, hold off on NVDA") gets its own tiny TTS request and plays fast
+    const flushSentenceFromBuffer = () => {
+      // try hard sentence boundary first (with optional trailing whitespace)
+      let m = textBuf.match(/[.!?…]/);
+      let boundary = m ? m.index : -1;
+      let consume = boundary + 1;
+      if (boundary !== -1 && textBuf[boundary + 1] === ' ') consume = boundary + 2;
+
+      // soft boundaries (em-dash, semicolon) — only if no period yet AND chunk ≥ 12 chars
+      if (boundary === -1) {
+        const soft = textBuf.match(/[—;]/);
+        if (soft && soft.index >= 12) {
+          boundary = soft.index;
+          consume = boundary + 1;
+        }
+      }
+
+      // first-chunk only: also accept comma if it gives us a tight verdict (2-25 chars).
+      // Lower bound of 2 catches "No," / "Yes," — the most common decisive openings.
+      if (boundary === -1 && seq === 0) {
+        const c = textBuf.indexOf(',');
+        if (c >= 2 && c <= 25 && textBuf.length > c + 1) {
+          boundary = c;
+          consume = c + 1;
+        }
+      }
+
+      if (boundary === -1) return;
+      const sentence = textBuf.slice(0, boundary + 1).trim();
+      textBuf = textBuf.slice(consume).trimStart();
+      if (sentence.length < 2) return;
+      kickOffTts(sentence, /*final*/ false);
+    };
+
+    const result = await brokerService.chatStream(
+      { messages, snapshot, recentSignals, recentTrades, voice },
+      (delta) => {
+        if (closed) return;
+        send('delta', { text: delta });
+        textBuf += delta;
+        // Flush as soon as a boundary appears; loop in case multiple boundaries
+        // arrived in a burst (rare with token-level streaming, but safe).
+        let prevSeq;
+        do {
+          prevSeq = seq;
+          if (textBuf.length > 6) flushSentenceFromBuffer();
+        } while (seq !== prevSeq);
+      }
+    );
+
+    // Flush any tail
+    if (textBuf.trim()) kickOffTts(textBuf.trim(), true);
+
+    const firstTokenMs = Date.now() - t0; // approximate; full text done time
+    await Promise.allSettled(ttsTasks);
+    send('done', {
+      reply: result.reply,
+      totalMs: Date.now() - t0,
+      sentences: seq,
+      firstAudioMs,
+    });
+    close();
+  } catch (e) {
+    console.error('[Server] chat-stream error:', e.message);
+    send('error', { error: e.message });
+    close();
   }
 });
 

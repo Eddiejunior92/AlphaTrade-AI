@@ -10,8 +10,13 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
   const [input, setInput] = useState('');
   const [thinking, setThinking] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
+  const [latency, setLatency] = useState(null); // {firstAudio, total} ms
   const scrollRef = useRef(null);
   const greetedRef = useRef(false);
+
+  const { listening, speaking, interim, supported, voices, voiceId, setVoiceId, engine, startListening, stopListening, speak, stopSpeaking, streamChat } =
+    useVoice({ onTranscript: (t) => send(t) });
+  const currentVoice = voices.find(v => v.voice_id === voiceId);
 
   const send = useCallback(async (text) => {
     if (!text || thinking) return;
@@ -19,21 +24,65 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
     setMessages(next);
     setInput('');
     setThinking(true);
-    try {
-      const r = await brokerChat(next.map(m => ({ role: m.role, content: m.content })));
-      const reply = r?.reply || 'Sorry, no response.';
-      setMessages(m => [...m, { role: 'assistant', content: reply }]);
-      if (autoSpeak) speak(reply);
-    } catch (e) {
-      setMessages(m => [...m, { role: 'assistant', content: `Connection error: ${e.message}` }]);
-    } finally {
-      setThinking(false);
-    }
-  }, [messages, thinking, brokerChat, autoSpeak]);
+    setLatency(null);
+    // Insert a placeholder assistant bubble that streams in
+    let assistantIdx;
+    setMessages(m => {
+      assistantIdx = m.length;
+      return [...m, { role: 'assistant', content: '' }];
+    });
 
-  const { listening, speaking, interim, supported, voices, voiceId, setVoiceId, engine, startListening, stopListening, speak, stopSpeaking } =
-    useVoice({ onTranscript: (t) => send(t) });
-  const currentVoice = voices.find(v => v.voice_id === voiceId);
+    if (autoSpeak) {
+      // Streaming voice path: parallel TTS per sentence
+      try {
+        await streamChat(
+          next.map(m => ({ role: m.role, content: m.content })),
+          {
+            onDelta: (_chunk, full) => {
+              setMessages(m => {
+                const copy = [...m];
+                if (copy[assistantIdx]) copy[assistantIdx] = { role: 'assistant', content: full };
+                return copy;
+              });
+            },
+            onDone: ({ firstAudioMs, totalMs }) => {
+              setLatency({ firstAudio: firstAudioMs, total: totalMs });
+              setThinking(false);
+            },
+            onError: (e) => {
+              setMessages(m => {
+                const copy = [...m];
+                copy[assistantIdx] = { role: 'assistant', content: `Connection error: ${e.message}` };
+                return copy;
+              });
+              setThinking(false);
+            },
+          }
+        );
+      } catch (e) {
+        setThinking(false);
+      }
+    } else {
+      // Text-only path: single non-streaming request, no audio
+      try {
+        const r = await brokerChat(next.map(m => ({ role: m.role, content: m.content })));
+        const reply = r?.reply || 'Sorry, no response.';
+        setMessages(m => {
+          const copy = [...m];
+          copy[assistantIdx] = { role: 'assistant', content: reply };
+          return copy;
+        });
+      } catch (e) {
+        setMessages(m => {
+          const copy = [...m];
+          copy[assistantIdx] = { role: 'assistant', content: `Connection error: ${e.message}` };
+          return copy;
+        });
+      } finally {
+        setThinking(false);
+      }
+    }
+  }, [messages, thinking, brokerChat, autoSpeak, streamChat]);
 
   useEffect(() => {
     if (open && !greetedRef.current && autoSpeak) {
@@ -66,8 +115,11 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
                 <div className="font-semibold text-[15px]">Alpha · Your Broker</div>
                 <div className="text-[11px] text-[var(--text-dim)] flex items-center gap-1.5">
                   <span className={`w-1.5 h-1.5 rounded-full ${listening ? 'bg-[var(--red)]' : speaking ? 'bg-[var(--blue)]' : 'bg-[var(--green)]'}`} />
-                  {listening ? 'Listening…' : speaking ? 'Speaking…' : thinking ? 'Thinking…' : 'Ready'}
+                  {listening ? 'Listening…' : speaking ? 'Speaking…' : thinking ? 'Alpha is thinking…' : 'Ready'}
                   <span className="opacity-60 ml-1">· {engine === 'grok' ? 'Grok TTS' : 'Browser'}{currentVoice ? ` · ${currentVoice.name}` : ''}</span>
+                  {latency?.firstAudio != null && (
+                    <span className="opacity-60 ml-1">· first audio {(latency.firstAudio / 1000).toFixed(2)}s</span>
+                  )}
                 </div>
               </div>
             </div>

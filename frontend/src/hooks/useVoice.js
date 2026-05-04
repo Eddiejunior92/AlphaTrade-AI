@@ -31,6 +31,9 @@ export function useVoice({ onTranscript, defaultVoiceId = 'eve' } = {}) {
   const audioRef = useRef(null);
   const speakSeqRef = useRef(0);
   const objectUrlRef = useRef(null);
+  // Ordered audio queue for streamed TTS chunks (one per sentence)
+  const queueSessionRef = useRef(0);
+  const queueRef = useRef({ next: 0, pending: new Map(), playing: false, urls: [] });
 
   // Load Grok voices once
   useEffect(() => {
@@ -77,6 +80,11 @@ export function useVoice({ onTranscript, defaultVoiceId = 'eve' } = {}) {
       URL.revokeObjectURL(objectUrlRef.current);
       objectUrlRef.current = null;
     }
+    // Clear streamed-audio queue
+    const q = queueRef.current;
+    q.urls.forEach(u => { try { URL.revokeObjectURL(u); } catch {} });
+    queueRef.current = { next: 0, pending: new Map(), playing: false, urls: [] };
+    queueSessionRef.current++;
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   }, []);
 
@@ -157,9 +165,131 @@ export function useVoice({ onTranscript, defaultVoiceId = 'eve' } = {}) {
     setSpeaking(false);
   }, [stopAudio]);
 
+  // Drain the queue: play audio chunks in seq order. Each chunk is an MP3 blob URL.
+  const drainQueue = useCallback((session) => {
+    const q = queueRef.current;
+    if (q.playing || session !== queueSessionRef.current) return;
+    const url = q.pending.get(q.next);
+    if (!url) return; // wait for next-in-order chunk
+    q.pending.delete(q.next);
+    q.next++;
+    q.playing = true;
+    setSpeaking(true);
+    setEngine('grok');
+    const audio = new Audio(url);
+    audio.preload = 'auto';
+    audio.playbackRate = 1.12;
+    audio.preservesPitch = true;
+    audio.mozPreservesPitch = true;
+    audio.webkitPreservesPitch = true;
+    audioRef.current = audio;
+    const cleanupAndNext = () => {
+      try { URL.revokeObjectURL(url); } catch {}
+      q.urls = q.urls.filter(u => u !== url);
+      q.playing = false;
+      if (session !== queueSessionRef.current) return;
+      if (q.pending.size > 0 || q.next === 0) {
+        drainQueue(session);
+      } else {
+        // No more pending right now — speaking may resume when next chunk arrives
+        setSpeaking(false);
+      }
+    };
+    audio.onended = cleanupAndNext;
+    audio.onerror = cleanupAndNext;
+    audio.play().catch(cleanupAndNext);
+  }, []);
+
+  // Streamed chat: POSTs to /api/broker/chat-stream (SSE), parses events,
+  // and pipes per-sentence audio chunks straight into the play queue.
+  const streamChat = useCallback(async (messages, { onDelta, onDone, onError } = {}) => {
+    stopAudio(); // cancel any in-flight playback
+    const session = queueSessionRef.current; // captured AFTER stopAudio bumps it
+    let fullText = '';
+    let firstAudioAt = null;
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/api/broker/chat-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, voice: true }),
+      });
+      if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const handleEvent = (event, dataStr) => {
+        if (session !== queueSessionRef.current) return;
+        let data; try { data = JSON.parse(dataStr); } catch { return; }
+        if (event === 'delta') {
+          fullText += data.text;
+          onDelta?.(data.text, fullText);
+        } else if (event === 'audio') {
+          // base64 → Blob → object URL → enqueue
+          const bin = atob(data.b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const blob = new Blob([bytes], { type: data.contentType || 'audio/mpeg' });
+          const url = URL.createObjectURL(blob);
+          if (firstAudioAt === null) firstAudioAt = performance.now() - t0;
+          const q = queueRef.current;
+          q.pending.set(data.seq, url);
+          q.urls.push(url);
+          drainQueue(session);
+        } else if (event === 'done') {
+          onDone?.({
+            reply: data.reply || fullText,
+            totalMs: data.totalMs,
+            firstAudioMs: data.firstAudioMs,
+            firstAudioClientMs: firstAudioAt,
+          });
+        } else if (event === 'audio_error') {
+          // Skip the failed seq so later chunks don't deadlock waiting in queue
+          const q = queueRef.current;
+          if (typeof data.seq === 'number') {
+            q.pending.delete(data.seq);
+            if (data.seq === q.next) {
+              q.next++;
+              drainQueue(session);
+            }
+          }
+          console.warn('[Voice] audio_error seq=', data.seq, data.error);
+        } else if (event === 'error') {
+          onError?.(new Error(data.error || 'stream error'));
+        }
+      };
+
+      // SSE parser: events delimited by blank line; lines like "event: x" / "data: ..."
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let event = 'message';
+          let dataLines = [];
+          for (const line of block.split('\n')) {
+            if (line.startsWith('event:')) event = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+          }
+          if (dataLines.length) handleEvent(event, dataLines.join('\n'));
+        }
+      }
+    } catch (e) {
+      console.error('[Voice] streamChat error:', e.message);
+      onError?.(e);
+    }
+    return { reply: fullText, firstAudioClientMs: firstAudioAt };
+  }, [stopAudio, drainQueue]);
+
   return {
     listening, speaking, interim, supported,
     voices, voiceId, setVoiceId, engine,
     startListening, stopListening, speak, stopSpeaking,
+    streamChat,
   };
 }

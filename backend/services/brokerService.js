@@ -25,6 +25,15 @@ Format (this is spoken aloud at a brisk pace — write FOR the ear, punchy and t
 - Lead with the call, then the reason. Verbs over adverbs. Cut filler ("well", "you know", "I mean", "basically").
 - 1–3 tight sentences for voice, mixed lengths. Hard cap: 55 words unless they ask for depth.`;
 
+// Voice mode is even tighter — every word adds ~80ms to the first-audio latency.
+const SYSTEM_PROMPT_VOICE = SYSTEM_PROMPT + `
+
+VOICE MODE — read this carefully:
+- Front-load the answer in the FIRST sentence so playback starts fast.
+- Hard cap: 35 words total. Ideally 1–2 sentences. No preamble, no "let me check", just the answer.
+- Open with a 3–6 word verdict ("Cash for now." / "NVDA looks hot." / "Stay put."), THEN one short reason.
+- If they ask a yes/no, lead with "Yes," or "No," — never bury the call.`;
+
 function buildContextSummary(snapshot, recentSignals, recentTrades) {
   const lines = [];
   const modeNote = snapshot.mode === 'live' ? '⚠ LIVE MODE — real money' : 'Paper mode (simulated)';
@@ -50,19 +59,22 @@ function buildContextSummary(snapshot, recentSignals, recentTrades) {
   return lines.join('\n');
 }
 
-async function chat({ messages, snapshot, recentSignals, recentTrades }) {
+function buildMessages({ messages, snapshot, recentSignals, recentTrades, voice }) {
+  const context = buildContextSummary(snapshot, recentSignals, recentTrades);
+  return [
+    { role: 'system', content: voice ? SYSTEM_PROMPT_VOICE : SYSTEM_PROMPT },
+    { role: 'system', content: `Live portfolio context (refreshes every turn):\n${context}` },
+    ...messages,
+  ];
+}
+
+async function chat({ messages, snapshot, recentSignals, recentTrades, voice = false }) {
   const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) {
     return { reply: "I need an xAI API key to talk. Please add XAI_API_KEY to your secrets so Grok can power my voice.", error: true };
   }
 
-  const context = buildContextSummary(snapshot, recentSignals, recentTrades);
-
-  const fullMessages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'system', content: `Live portfolio context (refreshes every turn):\n${context}` },
-    ...messages,
-  ];
+  const fullMessages = buildMessages({ messages, snapshot, recentSignals, recentTrades, voice });
 
   try {
     const res = await axios.post(
@@ -70,7 +82,7 @@ async function chat({ messages, snapshot, recentSignals, recentTrades }) {
       {
         model: GROK_MODEL,
         messages: fullMessages,
-        max_tokens: 350,
+        max_tokens: voice ? 120 : 350,   // voice replies are tight — ~35 words
         temperature: 0.7,
         top_p: 0.95,
       },
@@ -89,6 +101,58 @@ async function chat({ messages, snapshot, recentSignals, recentTrades }) {
     console.error('[Broker/Grok] error:', msg);
     return { reply: `Sorry, I had trouble thinking just now. ${msg}`, error: true };
   }
+}
+
+// Streaming chat — yields token deltas as they arrive from Grok.
+// Returns the full reply when complete. Calls onDelta(textChunk) for each chunk.
+async function chatStream({ messages, snapshot, recentSignals, recentTrades, voice = true }, onDelta) {
+  const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
+  if (!key) throw new Error('XAI_API_KEY required');
+
+  const fullMessages = buildMessages({ messages, snapshot, recentSignals, recentTrades, voice });
+
+  const res = await axios.post(
+    XAI_URL,
+    {
+      model: GROK_MODEL,
+      messages: fullMessages,
+      max_tokens: voice ? 120 : 350,
+      temperature: 0.7,
+      top_p: 0.95,
+      stream: true,
+    },
+    {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      responseType: 'stream',
+      timeout: 30000,
+    }
+  );
+
+  return new Promise((resolve, reject) => {
+    let full = '';
+    let buffer = '';
+    res.data.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // keep incomplete tail
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let j;
+        try { j = JSON.parse(payload); } catch { continue; /* partial JSON */ }
+        const delta = j?.choices?.[0]?.delta?.content;
+        if (delta) {
+          full += delta;
+          try { onDelta(delta); }
+          catch (e) { console.error('[chatStream] onDelta threw:', e?.message, e?.stack); }
+        }
+      }
+    });
+    res.data.on('end', () => resolve({ reply: full.trim(), model: GROK_MODEL, provider: 'xai-grok' }));
+    res.data.on('error', reject);
+  });
 }
 
 // ---- xAI Grok TTS ----
@@ -138,4 +202,4 @@ async function synthesize({ text, voice, language = 'en' }) {
   };
 }
 
-module.exports = { chat, listVoices, synthesize, GROK_MODEL, DEFAULT_VOICE };
+module.exports = { chat, chatStream, listVoices, synthesize, GROK_MODEL, DEFAULT_VOICE };
