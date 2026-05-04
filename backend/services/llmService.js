@@ -36,7 +36,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, strategyName }) {
   const positionLine = holding
     ? `Current position: ${holding.qty} shares @ avg $${holding.avg_cost} (stop: $${holding.stop_loss}, target: $${holding.take_profit})`
     : 'Current position: NONE';
@@ -45,7 +45,9 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
     ? `News sentiment (Grok, last 24-48h): ${newsSentiment.label} (score ${newsSentiment.score >= 0 ? '+' : ''}${newsSentiment.score}) — ${newsSentiment.summary}${newsSentiment.insights?.length ? '\nKey insights: ' + newsSentiment.insights.map(i => '• ' + i).join('  ') : ''}`
     : 'News sentiment: unavailable';
 
-  return `You are a ${role}
+  // --- Day strategy (unchanged) ----------------------------------------
+  if (strategyName !== 'swing') {
+    return `You are a ${role}
 Analyze ${symbol} for an autonomous trading agent.
 
 ${positionLine}
@@ -63,6 +65,69 @@ You must respond in EXACTLY this format (no markdown, no extra text):
 DECISION: BUY|SELL|HOLD
 CONFIDENCE: <integer 0-100>
 RATIONALE: <one or two sentences>`;
+  }
+
+  // --- Swing (longer-hold) — richer prompt with patterns + fundamentals -
+  let patternsBlock = 'Pattern analysis: unavailable';
+  if (patterns && patterns.ok) {
+    const s = patterns.structure || {};
+    const sup = (patterns.supports || []).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none identified';
+    const res = (patterns.resistances || []).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none identified';
+    const ns = patterns.nearestSupport ? `$${patterns.nearestSupport.price} (${patterns.nearestSupport.distPct}% below)` : 'n/a';
+    const nr = patterns.nearestResistance ? `$${patterns.nearestResistance.price} (${patterns.nearestResistance.distPct}% above)` : 'n/a';
+    patternsBlock = `Pattern analysis (computed from 60×15-min bars):
+  Trend: ${patterns.trend} (slope ${patterns.slopePctPerBar}%/bar)
+  Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'} ($${patterns.sma20}) · Above SMA50: ${patterns.aboveSma50 ? 'yes' : 'no'} ($${patterns.sma50})
+  Structure: higherHighs=${s.higherHighs} higherLows=${s.higherLows} lowerHighs=${s.lowerHighs} lowerLows=${s.lowerLows}
+  Recent swing highs: ${(s.recentHighs || []).map(p => '$' + p).join(' → ') || 'n/a'}
+  Recent swing lows:  ${(s.recentLows || []).map(p => '$' + p).join(' → ') || 'n/a'}
+  Support levels: ${sup}
+  Resistance levels: ${res}
+  Nearest support: ${ns} · Nearest resistance: ${nr}
+  Breakout state: ${patterns.breakout}`;
+  }
+
+  let fundamentalsBlock = 'Fundamentals: unavailable';
+  if (fundamentals) {
+    const pe   = fundamentals.pe_ratio != null ? fundamentals.pe_ratio : 'n/a';
+    const eps  = fundamentals.eps_growth_yoy_pct != null ? `${fundamentals.eps_growth_yoy_pct}%` : 'n/a';
+    const rev  = fundamentals.revenue_growth_yoy_pct != null ? `${fundamentals.revenue_growth_yoy_pct}%` : 'n/a';
+    const earn = fundamentals.earnings_next_date || 'n/a';
+    const sur  = fundamentals.earnings_recent_surprise_pct != null ? `${fundamentals.earnings_recent_surprise_pct}%` : 'n/a';
+    const sect30 = fundamentals.sector_strength_30d_pct != null ? `${fundamentals.sector_strength_30d_pct}%` : 'n/a';
+    fundamentalsBlock = `Fundamentals & macro (Grok, refreshed ≤6h):
+  Sector: ${fundamentals.sector || 'n/a'} (${fundamentals.sector_strength_label}, 30d ${sect30})
+  Valuation: ${fundamentals.valuation_label} · P/E: ${pe}
+  Latest quarter — Revenue YoY: ${rev}, EPS YoY: ${eps}, EPS surprise vs est: ${sur}
+  Next earnings: ${earn}
+  Macro context: ${fundamentals.macro_context || 'n/a'}`;
+  }
+
+  return `You are a ${role}
+You are evaluating ${symbol} for a SWING (multi-day longer-hold) trade. This is NOT an intraday scalp — you may hold for several sessions, so weigh fundamentals, sector backdrop, and multi-bar structure as much as recent price action.
+
+${positionLine}
+Portfolio cash: $${portfolio.cash_balance}
+Latest price: $${priceData.latest} · Period change: ${priceData.change} · Period high/low: $${priceData.high} / $${priceData.low}
+Recent bars (last 5 of 15-min): ${JSON.stringify(priceData.bars)}
+Short-term price action: ${sentiment}
+${newsLine}
+
+${patternsBlock}
+
+${fundamentalsBlock}
+
+Decision guidance for SWING trades:
+  • Favor BUY when trend is up, structure shows higher highs/lows OR a fresh breakout, sector is strong/flat, valuation is fair-to-cheap or growth strongly justifies a richer multiple, and news sentiment isn't actively bearish.
+  • Favor SELL when trend is down, structure shows lower highs/lows OR a breakdown, sector is weak, or fundamentals deteriorate (negative EPS/revenue growth, recent miss).
+  • AVOID new BUYs within 2 trading days of earnings (use earnings_next_date) — flag in rationale and prefer HOLD.
+  • Conflict between technicals and fundamentals → lower confidence.
+  • If a position is open, weigh whether to hold for the swing target vs. exit; respect the existing trailing stop logic in the agent.
+
+You must respond in EXACTLY this format (no markdown, no extra text):
+DECISION: BUY|SELL|HOLD
+CONFIDENCE: <integer 0-100>
+RATIONALE: <one or two sentences citing the strongest pattern + fundamentals signal>`;
 }
 
 function parseModelResponse(text, modelMeta) {
@@ -144,9 +209,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, strategyName }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, strategyName }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

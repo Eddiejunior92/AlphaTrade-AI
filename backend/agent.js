@@ -4,6 +4,8 @@ const alpacaService = require('./services/alpacaService');
 const discordService = require('./services/discordService');
 const riskManager = require('./services/riskManager');
 const sentimentService = require('./services/sentimentService');
+const fundamentalsService = require('./services/fundamentalsService');
+const patternService = require('./services/patternService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -255,12 +257,27 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   const holding = holdings.find(h => h.symbol === symbol) || null;
   // Pull cached news sentiment (refreshed once per cycle in runCycle).
   const newsSentiment = sentimentService.getCached(symbol);
-  const signal = await llmService.getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio });
+
+  // SWING ONLY: fold in technical patterns + cached Grok fundamentals.
+  // The day strategy stays lean (latency-sensitive intraday loop).
+  let patterns = null;
+  let fundamentals = null;
+  if (sc.name === 'swing') {
+    try { patterns = patternService.analyzePatterns(bars); }
+    catch (e) { patterns = { ok: false, reason: e.message }; }
+    fundamentals = fundamentalsService.getCached(symbol);
+  }
+
+  const signal = await llmService.getEnsembleDecision({
+    symbol, priceData, sentiment, newsSentiment, holding, portfolio,
+    patterns, fundamentals, strategyName: sc.name,
+  });
 
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
-    payload: { priceData, sentiment, newsSentiment, votes: signal.votes, reason: signal.reason, strategy: sc.name },
+    payload: { priceData, sentiment, newsSentiment, patterns, fundamentals,
+      votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
   memoryState.lastSignals[`${sc.name}:${symbol}`] = {
@@ -391,6 +408,14 @@ async function runCycle() {
     // never blocks trading because we use cached/default values downstream.
     sentimentService.getSentimentBatch(WATCHLIST, { concurrency: 4 })
       .catch(e => console.error('[Agent] Sentiment refresh error:', e.message));
+
+    // Refresh swing-only fundamentals (Grok, 6h TTL). Skipped entirely if the
+    // swing strategy is disabled. Background; cached/default values are used
+    // downstream so a slow/failed call never blocks trading.
+    if (portfolio.swing_enabled) {
+      fundamentalsService.getFundamentalsBatch(WATCHLIST, { concurrency: 3 })
+        .catch(e => console.error('[Agent] Fundamentals refresh error:', e.message));
+    }
 
     // Apply the user's chosen risk scale to each strategy before running.
     // This dynamically adjusts confidence gate, $ risk per trade, and stop/target ratios.
