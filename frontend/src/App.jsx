@@ -9,6 +9,7 @@ import VoiceChat from './components/VoiceChat';
 import Tooltip from './components/Tooltip';
 import MarketsTab from './components/MarketsTab';
 import ErrorBoundary from './components/ErrorBoundary';
+import MarketClock from './components/MarketClock';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
@@ -181,6 +182,9 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* Live market clock + countdown */}
+            <MarketClock />
 
             {/* Risk Scale — prominent user control */}
             <RiskScaleSelector

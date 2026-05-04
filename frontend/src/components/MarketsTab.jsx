@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import MarketCard from './MarketCard';
 import ErrorBoundary from './ErrorBoundary';
+import MarketClock from './MarketClock';
 
 export default function MarketsTab() {
   const [data, setData] = useState(null);
@@ -32,6 +33,7 @@ export default function MarketsTab() {
 
   return (
     <div className="space-y-4">
+      <MarketClock />
       <div className="flex items-center justify-between px-1">
         <div>
           <div className="text-base font-semibold tracking-tight">Markets</div>

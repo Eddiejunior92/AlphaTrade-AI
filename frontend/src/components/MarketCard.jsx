@@ -84,6 +84,39 @@ function MarketCard({ card }) {
   const yPad = (yMax - yMin) * 0.08 || yMax * 0.005 || 1;
   const yDomain = [yMin - yPad, yMax + yPad];
 
+  // X-axis ticks:
+  //   1d → top of each ET hour inside the data range (avoids overnight gaps).
+  //   5d → first bar of each unique ET calendar day (one label per session).
+  const xTicks = (() => {
+    if (series.length < 2) return [];
+    if (range === '1d') {
+      const stepMs = 60 * 60 * 1000;
+      const start = Math.ceil(series[0].t / stepMs) * stepMs;
+      const ticks = [];
+      for (let t = start; t <= series[series.length - 1].t; t += stepMs) ticks.push(t);
+      return ticks;
+    }
+    // 5d: one tick per unique ET date — picks the first bar of each session.
+    const seen = new Set();
+    const ticks = [];
+    for (const pt of series) {
+      const key = new Date(pt.t).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+      if (!seen.has(key)) { seen.add(key); ticks.push(pt.t); }
+    }
+    return ticks;
+  })();
+  const xTickFmt = (v) => {
+    if (range === '1d') {
+      return new Date(v).toLocaleTimeString('en-US', {
+        timeZone: 'America/New_York', hour: 'numeric', hour12: true,
+      }).replace(/\s/g, '').toLowerCase();
+    }
+    return new Date(v).toLocaleDateString('en-US', {
+      timeZone: 'America/New_York', month: 'numeric', day: 'numeric',
+    });
+  };
+  const yTickFmt = (v) => `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
+
   return (
     <div className="rounded-3xl bg-white/[0.03] border border-white/5 p-4 sm:p-5 backdrop-blur-xl">
       {/* Header */}
@@ -112,7 +145,7 @@ function MarketCard({ card }) {
       </div>
 
       {/* Chart area — fixed height, ResponsiveContainer needs explicit parent height */}
-      <div style={{ width: '100%', height: 128 }}>
+      <div style={{ width: '100%', height: 180 }}>
         {status === 'loading' && (
           <div className="h-full flex items-center justify-center text-[10px] text-[var(--text-dim)]">
             <div className="animate-pulse">Loading chart…</div>
@@ -131,21 +164,39 @@ function MarketCard({ card }) {
         )}
         {status === 'ready' && (
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={series} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+            <AreaChart data={series} margin={{ top: 6, right: 8, left: 0, bottom: 4 }}>
               <defs>
                 <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor={lineColor} stopOpacity={0.35} />
                   <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
                 </linearGradient>
               </defs>
-              <YAxis hide domain={yDomain} />
-              <XAxis dataKey="t" hide type="number" domain={['dataMin', 'dataMax']} />
+              <YAxis
+                domain={yDomain}
+                width={48}
+                tick={{ fill: '#9CA3AF', fontSize: 10 }}
+                axisLine={false}
+                tickLine={false}
+                tickFormatter={yTickFmt}
+                orientation="left"
+              />
+              <XAxis
+                dataKey="t"
+                type="number"
+                domain={['dataMin', 'dataMax']}
+                ticks={xTicks}
+                tick={{ fill: '#9CA3AF', fontSize: 10 }}
+                axisLine={false}
+                tickLine={false}
+                tickFormatter={xTickFmt}
+                minTickGap={20}
+              />
               <RTip
                 contentStyle={{
                   background: 'rgba(20,20,22,0.95)', border: '1px solid rgba(255,255,255,0.1)',
                   borderRadius: 12, fontSize: 11, padding: '6px 10px', color: '#fff',
                 }}
-                labelFormatter={(v) => new Date(v).toLocaleString()}
+                labelFormatter={(v) => new Date(v).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' ET'}
                 formatter={(v) => [`$${fmtPrice(v)}`, 'Price']}
               />
               <Area
