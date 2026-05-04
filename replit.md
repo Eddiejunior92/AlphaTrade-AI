@@ -13,16 +13,21 @@ Production-ready autonomous multi-LLM high-frequency trading agent.
   - `services/brokerService.js` — "Alpha" personal-broker chat (Claude 3.7 via OpenRouter), strategy/mode-aware.
   - `services/db.js` — PostgreSQL with `ensureSchema()` migration. `holdings` has composite PK `(symbol, strategy)` so the same symbol can be held in both strategies independently.
   - `services/discordService.js` — webhook alerts.
-- **Frontend** (`frontend/`, port 5000): React + Vite + Tailwind v4. iPhone-16 glassmorphism dashboard. Tabs: Home, Strategies, Reasoning, Positions, Trades, Settings. Tooltips on every button. Strategy ON/OFF toggles, paper↔live mode switcher with confirmation modal. Voice broker (`VoiceChat` + `useVoice` hook) via Web Speech API.
+  - `services/sentimentService.js` — Grok-powered news sentiment per symbol. Returns `{score: -1..+1, label, summary, insights, sources}`. Cached 30 min per symbol; refreshed in background each cycle. Injected into the LLM ensemble prompt and exposed to the dashboard.
+- **Frontend** (`frontend/`, port 5000): React + Vite + Tailwind v4. iPhone-16 glassmorphism dashboard. Tabs: Home, Markets, Strategies, Reasoning, Positions, Trades, Settings. Tooltips on every button. Strategy ON/OFF toggles, paper↔live mode switcher with confirmation modal. Voice broker (`VoiceChat` + `useVoice` hook) via Web Speech API. Markets tab shows a clean recharts price chart per watchlist symbol (1d / 5d toggle) with live AI confidence, news sentiment score, and key insights.
 - **Database**: PostgreSQL — `portfolio` (with `day_enabled`, `swing_enabled`, `trading_mode`), `holdings` (composite PK), `trades` (strategy-tagged), `audit_log`.
 
 ## Strategy Configs (in `backend/strategies.js`)
-- **Day**: 1Min bars, 60s cadence, 0.5%/1% stop/target, $50–$100 risk/trade, max 4 holdings, 3% position cap, auto-flatten 5m before close.
-- **Swing**: 15Min bars, 300s cadence, 2%/5% stop/target, $75–$200 risk/trade, max 3 holdings, 5% position cap, can hold overnight.
+- **Day**: 1Min bars, 60s cadence, 0.5%/1% stop/target, $50–$100 risk/trade, max 4 holdings, 3% position cap, auto-flatten 5m before close. No trailing stop (intraday only).
+- **Swing**: 15Min bars, 300s cadence, 2%/5% stop/target, $75–$200 risk/trade, max 3 holdings, 5% position cap, can hold overnight. **Trailing stop**: arms once +2% above entry, then ratchets stop to `peak × (1 − 2.5%)` — never moves down.
+
+## Watchlist (15 symbols, override via `WATCHLIST` env)
+`AAPL, NVDA, MSFT, AMZN, META, GOOGL, TSLA, AMD, AVGO, NFLX, JPM, BAC, COST, SPY, QQQ`
 
 ## Risk Defaults (env-overridable)
 - `MAX_DAILY_LOSS_USD=100`, `MAX_DAILY_DRAWDOWN_PCT=0.05`
-- `WATCHLIST=AAPL,NVDA,TSLA,MSFT,AMZN,META,GOOGL,SPY`
+- `WATCHLIST` (comma-separated; defaults to the 15-symbol list above)
+- `SENTIMENT_TTL_SECONDS=1800` (30 min cache for Grok news sentiment)
 - `AGENT_INTERVAL_SECONDS=60` (base loop tick)
 - `FORCE_FLATTEN_MINUTES_BEFORE_CLOSE=5` (day strategy only)
 - `OPERATOR_TOKEN` — REQUIRED to enable LIVE mode switch and to deploy in production.

@@ -204,12 +204,47 @@ async function evaluateStops({ symbol, currentPrice, holding }) {
   const stop = parseFloat(holding.stop_loss);
   const target = parseFloat(holding.take_profit);
   if (stop && currentPrice <= stop) {
-    return { trigger: 'STOP_LOSS', qty: parseFloat(holding.qty), reason: `Price ${currentPrice} hit stop-loss ${stop}` };
+    const trailing = !!holding.trailing_armed;
+    return { trigger: trailing ? 'TRAILING_STOP' : 'STOP_LOSS', qty: parseFloat(holding.qty),
+      reason: `Price ${currentPrice} hit ${trailing ? 'trailing' : 'stop'}-loss ${stop}` };
   }
   if (target && currentPrice >= target) {
     return { trigger: 'TAKE_PROFIT', qty: parseFloat(holding.qty), reason: `Price ${currentPrice} hit take-profit ${target}` };
   }
   return null;
+}
+
+// Trailing-stop ratchet — pure compute, returns the new trailing state for a
+// holding given the current price and strategy config. Caller persists.
+//   - Only ratchets stops UP, never down.
+//   - Arms only after price reaches entry × (1 + trailingActivatePct).
+//   - Returns null if strategy doesn't use trailing or no change is needed.
+function computeTrailingUpdate({ holding, currentPrice, strategyConfig }) {
+  const trailPct = strategyConfig?.trailingStopPct;
+  const armPct = strategyConfig?.trailingActivatePct;
+  if (!trailPct || !armPct) return null;
+  if (!currentPrice || currentPrice <= 0) return null;
+  const entry = parseFloat(holding.avg_cost);
+  if (!entry || entry <= 0) return null;
+
+  const prevPeak = parseFloat(holding.highest_price) || entry;
+  const newPeak = Math.max(prevPeak, currentPrice);
+  const armed = !!holding.trailing_armed;
+  const shouldArm = armed || currentPrice >= entry * (1 + armPct);
+  if (!shouldArm) {
+    // Just track the peak so when we DO arm, we use the right anchor.
+    if (newPeak > prevPeak) return { highest_price: +newPeak.toFixed(4) };
+    return null;
+  }
+  const trailingStop = +(newPeak * (1 - trailPct)).toFixed(2);
+  const currentStop = parseFloat(holding.stop_loss) || 0;
+  const newStop = Math.max(currentStop, trailingStop);
+
+  const update = {};
+  if (newPeak > prevPeak) update.highest_price = +newPeak.toFixed(4);
+  if (!armed) update.trailing_armed = true;
+  if (newStop > currentStop + 0.0001) update.stop_loss = newStop;
+  return Object.keys(update).length ? update : null;
 }
 
 function getConfig(portfolio) {
@@ -225,6 +260,7 @@ module.exports = {
   evaluateBuy, evaluateSell, evaluateStops, getConfig,
   effectiveDailyLossBudget,
   computeDynamicScaling, computeTargetRisk,
+  computeTrailingUpdate,
   // tunables exported for UI introspection
   tunables: { GROWTH_STEP, GROWTH_BUMP, GROWTH_MIN, GROWTH_MAX, PERF_TRADE_WINDOW, PERF_GAIN_GAIN, PERF_MIN, PERF_MAX, ABS_RISK_CEILING_MULT },
 };

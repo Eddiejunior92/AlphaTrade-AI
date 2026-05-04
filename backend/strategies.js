@@ -1,6 +1,19 @@
+// Default 15-symbol high-liquidity watchlist. Override with env WATCHLIST=...
+// Mix of mega-cap tech, semis, broad-market ETFs, financials, and consumer.
+const DEFAULT_WATCHLIST = [
+  'AAPL', 'NVDA', 'MSFT', 'AMZN', 'META',     // mega-cap tech
+  'GOOGL', 'TSLA', 'AMD', 'AVGO', 'NFLX',     // tech / semis / streaming
+  'JPM', 'BAC', 'COST',                        // financials + consumer staple
+  'SPY', 'QQQ',                                // broad-market ETFs
+];
+
 // Base strategy templates. Per-trade risk numbers, confidence gates, and
 // stop/target multipliers are scaled at runtime by the user's chosen Risk Scale
 // (see RISK_SCALES below + applyRiskScale).
+//
+// Trailing stops: `trailingStopPct` (e.g. 0.025 = 2.5%) — once a position is in
+// profit, the stop ratchets up to `peak * (1 - trailingStopPct)`, never down.
+// Day strategy uses null (positions are flattened intraday anyway).
 const STRATEGIES = {
   day: {
     name: 'day',
@@ -17,11 +30,13 @@ const STRATEGIES = {
     holdOvernight: false,
     minDirectionalAgreement: 3, // quorum NEVER relaxed by risk scale
     maxPositionPct: 0.03,
+    trailingStopPct: null,           // not used intraday
+    trailingActivatePct: null,
   },
   swing: {
     name: 'swing',
     label: 'Longer Hold',
-    description: 'Multi-day swing trades on 15-minute bars. Wider stops, larger targets, can hold overnight.',
+    description: 'Multi-day swing trades on 15-minute bars. Wider stops, larger targets, can hold overnight. Trailing stop locks in 2.5% below peak once +2% in profit.',
     timeframe: '15Min',
     lookback: 60,
     intervalSeconds: 300,
@@ -32,6 +47,8 @@ const STRATEGIES = {
     holdOvernight: true,
     minDirectionalAgreement: 3,
     maxPositionPct: 0.05,
+    trailingStopPct: 0.025,           // 2.5% trail below peak
+    trailingActivatePct: 0.02,        // arms once +2% above entry
   },
 };
 
@@ -119,7 +136,12 @@ function listRiskScales() {
   return Object.values(RISK_SCALES);
 }
 
+function getWatchlist() {
+  const fromEnv = (process.env.WATCHLIST || '').split(',').map(s => s.trim()).filter(Boolean);
+  return fromEnv.length ? fromEnv : DEFAULT_WATCHLIST;
+}
+
 module.exports = {
-  STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE,
+  STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE, DEFAULT_WATCHLIST, getWatchlist,
   getStrategy, listStrategies, getRiskScale, applyRiskScale, listRiskScales,
 };

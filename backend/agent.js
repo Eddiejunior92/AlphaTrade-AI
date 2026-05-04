@@ -3,11 +3,11 @@ const llmService = require('./services/llmService');
 const alpacaService = require('./services/alpacaService');
 const discordService = require('./services/discordService');
 const riskManager = require('./services/riskManager');
+const sentimentService = require('./services/sentimentService');
 const db = require('./services/db');
-const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE } = require('./strategies');
+const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
-const WATCHLIST = (process.env.WATCHLIST || 'AAPL,NVDA,TSLA,MSFT,AMZN,META,GOOGL,SPY')
-  .split(',').map(s => s.trim()).filter(Boolean);
+const WATCHLIST = getWatchlist();
 const BASE_INTERVAL_SECONDS = Math.max(30, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
@@ -106,10 +106,28 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
   return trade;
 }
 
-async function evaluateExistingPositions(strategyHoldings, lookup, stale) {
+async function evaluateExistingPositions(strategyHoldings, lookup, stale, strategyConfig) {
   for (const h of strategyHoldings) {
     const price = lookup[h.symbol];
     if (!price || stale[h.symbol]) continue;
+
+    // Ratchet trailing stop BEFORE evaluating the (possibly updated) stop.
+    if (strategyConfig?.trailingStopPct) {
+      const update = riskManager.computeTrailingUpdate({ holding: h, currentPrice: price, strategyConfig });
+      if (update) {
+        await db.updateTrailing(h.symbol, h.strategy, update);
+        if (update.stop_loss) {
+          h.stop_loss = update.stop_loss;
+          await db.recordAudit({
+            event_type: 'TRAILING_STOP_RATCHET', symbol: h.symbol, decision: 'HOLD',
+            payload: { strategy: h.strategy, newStop: update.stop_loss, peak: update.highest_price ?? h.highest_price, currentPrice: price },
+          });
+        }
+        if (update.trailing_armed) h.trailing_armed = true;
+        if (update.highest_price) h.highest_price = update.highest_price;
+      }
+    }
+
     const trigger = await riskManager.evaluateStops({ symbol: h.symbol, currentPrice: price, holding: h });
     if (trigger) {
       await db.recordAudit({ event_type: trigger.trigger, symbol: h.symbol, decision: 'SELL',
@@ -235,12 +253,14 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   const holding = holdings.find(h => h.symbol === symbol) || null;
-  const signal = await llmService.getEnsembleDecision({ symbol, priceData, sentiment, holding, portfolio });
+  // Pull cached news sentiment (refreshed once per cycle in runCycle).
+  const newsSentiment = sentimentService.getCached(symbol);
+  const signal = await llmService.getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio });
 
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
-    payload: { priceData, sentiment, votes: signal.votes, reason: signal.reason, strategy: sc.name },
+    payload: { priceData, sentiment, newsSentiment, votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
   memoryState.lastSignals[`${sc.name}:${symbol}`] = {
@@ -248,6 +268,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     price: latest, change: `${change}%`,
     signal: signal.consensus, confidence: signal.confidence,
     votes: signal.votes, models: signal.models, reason: signal.reason,
+    newsSentiment,
   };
 
   if (signal.consensus === 'BUY') {
@@ -296,7 +317,7 @@ async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
   }
 
   const stratHoldings = await db.getHoldings(sc.name);
-  await evaluateExistingPositions(stratHoldings, fullPriceLookup, {});
+  await evaluateExistingPositions(stratHoldings, fullPriceLookup, {}, sc);
 
   for (const symbol of WATCHLIST) {
     try {
@@ -364,6 +385,12 @@ async function runCycle() {
       const bars = await alpacaService.getBars(sym, '1Min', 1);
       if (bars.length) fullLookup[sym] = bars[bars.length - 1].c;
     }));
+
+    // Refresh news sentiment for the watchlist (cached, TTL-bounded — only
+    // hits Grok when stale). Runs in parallel; a slow/failed sentiment call
+    // never blocks trading because we use cached/default values downstream.
+    sentimentService.getSentimentBatch(WATCHLIST, { concurrency: 4 })
+      .catch(e => console.error('[Agent] Sentiment refresh error:', e.message));
 
     // Apply the user's chosen risk scale to each strategy before running.
     // This dynamically adjusts confidence gate, $ risk per trade, and stop/target ratios.
@@ -579,6 +606,7 @@ async function getAgentSnapshot() {
     strategies,
     providers: llmService.getProviderStatus(),
     watchlist: WATCHLIST,
+    sentiment: sentimentService.getAllCached(),
     intervalSeconds: BASE_INTERVAL_SECONDS,
     forceFlattenMinutesBeforeClose: FORCE_FLATTEN_MINUTES_BEFORE_CLOSE,
   };

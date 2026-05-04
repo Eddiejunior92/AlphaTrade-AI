@@ -7,9 +7,11 @@ import HoldingsTable from './components/HoldingsTable';
 import ReasoningFeed from './components/ReasoningFeed';
 import VoiceChat from './components/VoiceChat';
 import Tooltip from './components/Tooltip';
+import MarketsTab from './components/MarketsTab';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
+  { id: 'markets',   label: 'Markets',   icon: '📈' },
   { id: 'strategies', label: 'Strategies', icon: '⚡' },
   { id: 'reason',    label: 'Reasoning', icon: '🧠' },
   { id: 'positions', label: 'Positions', icon: '📊' },
@@ -272,6 +274,8 @@ export default function App() {
           </div>
         )}
 
+        {tab === 'markets' && <MarketsTab />}
+
         {tab === 'strategies' && (
           <div className="space-y-5">
             <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
@@ -465,6 +469,7 @@ export default function App() {
           {TABS.map(t => (
             <Tooltip key={t.id} text={
               t.id === 'home' ? 'Dashboard overview' :
+              t.id === 'markets' ? 'Live charts, AI signals, news sentiment per stock' :
               t.id === 'strategies' ? 'Toggle day & swing strategies' :
               t.id === 'reason' ? "See Alpha's reasoning live" :
               t.id === 'positions' ? 'Your open positions' :

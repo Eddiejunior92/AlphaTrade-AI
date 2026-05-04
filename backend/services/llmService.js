@@ -36,10 +36,14 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, holding, portfolio, role }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role }) {
   const positionLine = holding
     ? `Current position: ${holding.qty} shares @ avg $${holding.avg_cost} (stop: $${holding.stop_loss}, target: $${holding.take_profit})`
     : 'Current position: NONE';
+
+  const newsLine = newsSentiment
+    ? `News sentiment (Grok, last 24-48h): ${newsSentiment.label} (score ${newsSentiment.score >= 0 ? '+' : ''}${newsSentiment.score}) — ${newsSentiment.summary}${newsSentiment.insights?.length ? '\nKey insights: ' + newsSentiment.insights.map(i => '• ' + i).join('  ') : ''}`
+    : 'News sentiment: unavailable';
 
   return `You are a ${role}
 Analyze ${symbol} for an autonomous trading agent.
@@ -50,7 +54,10 @@ Recent bars (last 5): ${JSON.stringify(priceData.bars)}
 Latest price: $${priceData.latest}
 Period change: ${priceData.change}
 Period high/low: $${priceData.high} / $${priceData.low}
-Market sentiment: ${sentiment}
+Price action: ${sentiment}
+${newsLine}
+
+Weigh both technicals and news sentiment. A bullish price trend with bearish news is a yellow flag; the reverse is a yellow flag too. Strong agreement between both raises confidence.
 
 You must respond in EXACTLY this format (no markdown, no extra text):
 DECISION: BUY|SELL|HOLD
@@ -137,9 +144,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, holding, portfolio }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, holding, portfolio, role: m.role }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

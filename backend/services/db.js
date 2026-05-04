@@ -20,6 +20,9 @@ async function ensureSchema() {
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS risk_scale TEXT NOT NULL DEFAULT 'balanced'`);
+  // Trailing-stop tracking: highest price seen since entry, used to ratchet stop_loss UP.
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS highest_price NUMERIC(12,4)`);
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS trailing_armed BOOLEAN NOT NULL DEFAULT FALSE`);
   // Holdings PK was symbol-only; allow same symbol in multiple strategies.
   try {
     await query(`ALTER TABLE holdings DROP CONSTRAINT IF EXISTS holdings_pkey`);
@@ -86,6 +89,19 @@ async function deleteHolding(symbol, strategy = 'day') {
   await query('DELETE FROM holdings WHERE symbol = $1 AND strategy = $2', [symbol, strategy]);
 }
 
+// Used by the trailing-stop ratchet. Only writes the trailing fields — no risk
+// of clobbering qty / avg_cost mid-cycle.
+async function updateTrailing(symbol, strategy, { highest_price, trailing_armed, stop_loss }) {
+  await query(
+    `UPDATE holdings SET
+       highest_price = COALESCE($3, highest_price),
+       trailing_armed = COALESCE($4, trailing_armed),
+       stop_loss = COALESCE($5, stop_loss)
+     WHERE symbol = $1 AND strategy = $2`,
+    [symbol, strategy, highest_price, trailing_armed, stop_loss]
+  );
+}
+
 async function recordTrade(trade) {
   const { rows } = await query(
     `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy)
@@ -120,4 +136,5 @@ module.exports = {
   getHoldings, getHolding, upsertHolding, deleteHolding,
   recordTrade, getRecentTrades,
   recordAudit, getRecentAudit,
+  updateTrailing,
 };

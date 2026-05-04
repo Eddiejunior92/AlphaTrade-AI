@@ -11,7 +11,9 @@ const {
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
 const brokerService = require('./services/brokerService');
+const sentimentService = require('./services/sentimentService');
 const db = require('./services/db');
+const { getWatchlist } = require('./strategies');
 
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3001;
@@ -179,6 +181,98 @@ app.get('/api/audit', async (req, res) => {
 });
 
 app.get('/api/account', async (req, res) => { res.json(await alpacaService.getAccount()); });
+
+// --- Charts: price bars per symbol -----------------------------------------
+// GET /api/bars/:symbol?range=1d|5d  → { symbol, range, bars: [{t, o, h, l, c, v}] }
+// 1d → 5-minute bars (78 bars), 5d → 30-minute bars (~65 bars). Cached briefly.
+const BARS_CACHE = new Map(); // key=`${sym}:${range}` → {ts, data}
+const BARS_TTL_MS = 30000;
+app.get('/api/bars/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const range = (req.query.range || '1d').toLowerCase();
+    if (!['1d', '5d'].includes(range)) return res.status(400).json({ error: 'range must be 1d or 5d' });
+    const cacheKey = `${symbol}:${range}`;
+    const cached = BARS_CACHE.get(cacheKey);
+    if (cached && Date.now() - cached.ts < BARS_TTL_MS) return res.json(cached.data);
+
+    const cfg = range === '1d' ? { timeframe: '5Min', limit: 80 } : { timeframe: '30Min', limit: 70 };
+    const bars = await alpacaService.getBars(symbol, cfg.timeframe, cfg.limit);
+    const data = { symbol, range, timeframe: cfg.timeframe, bars };
+    BARS_CACHE.set(cacheKey, { ts: Date.now(), data });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- News sentiment per symbol --------------------------------------------
+// Symbol must be in the active watchlist (prevents arbitrary-symbol cost-DoS
+// against Grok). `force=1` requires the operator token, since it bypasses the
+// TTL cache and triggers a fresh upstream call.
+app.get('/api/sentiment/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    if (!allowed.has(symbol)) {
+      return res.status(404).json({ error: 'Symbol not in watchlist' });
+    }
+    const force = req.query.force === '1';
+    if (force) {
+      if (!OPERATOR_TOKEN) return res.status(403).json({ error: 'force=1 requires OPERATOR_TOKEN configured' });
+      const provided = req.get('x-operator-token') || req.query.token;
+      if (provided !== OPERATOR_TOKEN) return res.status(401).json({ error: 'Operator token required for force=1' });
+    }
+    const data = await sentimentService.getSentiment(symbol, { force });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Combined market overview for the dashboard Markets tab ---------------
+// Returns one card per watchlist symbol: latest price, % change, AI signal,
+// confidence, and news sentiment. No bars (those load lazily per-symbol).
+app.get('/api/markets', async (req, res) => {
+  try {
+    const watchlist = getWatchlist();
+    const snap = await getAgentSnapshot();
+    const sigs = snap.signals || {};
+    const sents = sentimentService.getAllCached();
+
+    // Latest price per symbol — single 1Min bar, parallel.
+    const prices = await Promise.all(watchlist.map(async sym => {
+      try {
+        const bars = await alpacaService.getBars(sym, '1Min', 2);
+        if (!bars.length) return [sym, null];
+        const c = bars[bars.length - 1].c;
+        const prev = bars.length > 1 ? bars[bars.length - 2].c : c;
+        return [sym, { price: c, changePct: prev ? +(((c - prev) / prev) * 100).toFixed(2) : 0 }];
+      } catch { return [sym, null]; }
+    }));
+    const priceMap = Object.fromEntries(prices);
+
+    // Pick the most recent signal per symbol across both strategies.
+    const sigBySym = {};
+    for (const [k, s] of Object.entries(sigs)) {
+      const sym = k.split(':')[1] || s.symbol;
+      const prev = sigBySym[sym];
+      if (!prev || new Date(s.timestamp) > new Date(prev.timestamp)) sigBySym[sym] = s;
+    }
+
+    const cards = watchlist.map(sym => ({
+      symbol: sym,
+      price: priceMap[sym]?.price ?? null,
+      changePct: priceMap[sym]?.changePct ?? null,
+      signal: sigBySym[sym] ? {
+        consensus: sigBySym[sym].signal,
+        confidence: sigBySym[sym].confidence,
+        reason: sigBySym[sym].reason,
+        strategy: sigBySym[sym].strategy,
+        timestamp: sigBySym[sym].timestamp,
+      } : null,
+      sentiment: sents[sym] || null,
+    }));
+
+    res.json({ watchlist, cards, fetchedAt: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/broker/voices', async (_req, res) => {
   try {
