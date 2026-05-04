@@ -36,7 +36,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, strategyName, premarket }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, strategyName, premarket }) {
   // Pre-market briefing injection (only present during the first ~60 min after open).
   const premarketBlock = premarket ? `\nPRE-MARKET BRIEFING (use as PRIOR — overrides nothing, but explains gaps & catalysts):\n${premarket}\n` : '';
   const positionLine = holding
@@ -67,28 +67,73 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   Volatility: ATR ${vol ? vol.atrPct + '%' : 'n/a'} · stdev ${vol ? vol.stddevPctPerBar + '%/bar' : 'n/a'} (${vol ? vol.label : 'n/a'})`;
   }
 
-  // --- Day strategy (unchanged) ----------------------------------------
+  // --- Day strategy (intraday scalp) -----------------------------------
   if (strategyName !== 'swing') {
+    // Compact intraday-pattern block (last ~60 1-min bars)
+    let dayPatternsBlock = 'Intraday structure (last 60 min): unavailable';
+    if (patterns && patterns.ok) {
+      const s = patterns.structure || {};
+      const ns = patterns.nearestSupport ? `$${patterns.nearestSupport.price} (${patterns.nearestSupport.distPct}% below)` : 'n/a';
+      const nr = patterns.nearestResistance ? `$${patterns.nearestResistance.price} (${patterns.nearestResistance.distPct}% above)` : 'n/a';
+      const sup = (patterns.supports || []).slice(0, 2).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none';
+      const res = (patterns.resistances || []).slice(0, 2).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none';
+      dayPatternsBlock = `Intraday structure (last ~60 min, 1-min bars):
+  Trend: ${patterns.trend} (slope ${patterns.slopePctPerBar}%/bar) · Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'}
+  Structure: HH=${s.higherHighs} HL=${s.higherLows} LH=${s.lowerHighs} LL=${s.lowerLows}
+  Recent swing highs: ${(s.recentHighs || []).map(p => '$' + p).join(' → ') || 'n/a'}
+  Recent swing lows:  ${(s.recentLows || []).map(p => '$' + p).join(' → ') || 'n/a'}
+  Support: ${sup} · Resistance: ${res}
+  Nearest support: ${ns} · Nearest resistance: ${nr}
+  Breakout state: ${patterns.breakout}`;
+    }
+
+    // Tactical setup flags — dip-buy / profit-take.
+    // Distinguish "no setup found" (clean scan) from "couldn't compute"
+    // (insufficient bars) so models don't conflate them.
+    let intradayBlock;
+    if (!intraday || !intraday.ok) {
+      intradayBlock = `Tactical setups: unavailable (${intraday?.reason || 'not computed'}).`;
+    } else {
+      const parts = [];
+      if (intraday.dipBuy) {
+        parts.push(`🟢 DIP-BUY SETUP (${intraday.dipBuy.strength}, score ${intraday.dipBuy.score}/5): ${intraday.dipBuy.description}`);
+      }
+      if (intraday.profitTake) {
+        parts.push(`🟡 PROFIT-TAKE SETUP (${intraday.profitTake.strength}): ${intraday.profitTake.description}`);
+      }
+      intradayBlock = parts.length
+        ? `Tactical setups detected:\n  ${parts.join('\n  ')}`
+        : `Tactical setups: scanned, none triggered this cycle (no dip-buy or profit-take pattern present).`;
+    }
+
     return `You are a ${role}
-Analyze ${symbol} for an autonomous trading agent.
+You are evaluating ${symbol} for an INTRADAY DAY-TRADE (scalp on 1-min bars, auto-flattens before close — no overnight risk). Decisions must respect the last 30-60 minutes of price action far more than longer-term context.
 
 ${positionLine}
 Portfolio cash: $${portfolio.cash_balance}
-Recent bars (last 5): ${JSON.stringify(priceData.bars)}
-Latest price: $${priceData.latest}
-Period change: ${priceData.change}
-Period high/low: $${priceData.high} / $${priceData.low}
-Price action: ${sentiment}
+Recent bars (last 5 of 1-min): ${JSON.stringify(priceData.bars)}
+Latest price: $${priceData.latest} · Period change: ${priceData.change} · Period high/low: $${priceData.high} / $${priceData.low}
+Short-term price action: ${sentiment}
 ${newsLine}
 
 ${indicatorsLine}
+
+${dayPatternsBlock}
+
+${intradayBlock}
 ${premarketBlock}
-Weigh price action, technical indicators (RSI/MACD/volume/volatility), and real-time news+social sentiment together. Conflict between channels (e.g. bullish price but bearish social, overbought RSI on weak volume) is a yellow flag — lower confidence. Strong multi-channel agreement raises confidence. For an intraday scalp, a fresh MACD bullish cross with expanding volume and RSI < 70 is a strong setup.
+Decision guidance for INTRADAY trades:
+  • DIP-BUY (favor BUY) — pullback to support after a leg up, with reversal candle + rising volume + RSI 30-60 + news/social not bearish. The strongest dip-buys have a confirmed higher-low forming AND price within 0.6% of a clustered support level. A flagged DIP_BUY_SETUP above is a strong prior — weight it heavily, especially if score ≥ 4.
+  • BREAKOUT (favor BUY) — fresh close above a 60-min resistance with expanding volume, MACD bullish cross, RSI < 70. Avoid chasing if RSI > 75 or volume is flat.
+  • PROFIT-TAKE (favor SELL when holding) — open position is in profit and price is at/within 0.4% of resistance, OR RSI ≥ 70 with first lower close, OR MACD bearish cross, OR volume drying up. A flagged PROFIT_TAKE_SETUP above is a strong prior to exit. Don't give back a winner because you're greedy.
+  • SELL also when an open position breaks support, MACD turns bearish on rising volume, or news/social turns sharply negative.
+  • Prefer HOLD when channels conflict (e.g. bullish price but bearish social, overbought RSI on weak volume), when no clear pattern is present, when within 5 minutes of a major resistance/support and direction is ambiguous, or when volatility label is "high" with no clear setup.
+  • A tactical setup flagged above is a structured prior — strong agreement across price action + indicators + setup + sentiment should give 80%+ confidence; mixed signals should stay under 70%.
 
 You must respond in EXACTLY this format (no markdown, no extra text):
 DECISION: BUY|SELL|HOLD
 CONFIDENCE: <integer 0-100>
-RATIONALE: <one or two sentences>`;
+RATIONALE: <one or two sentences citing the strongest setup or signal>`;
   }
 
   // --- Swing (longer-hold) — richer prompt with patterns + fundamentals -
@@ -236,9 +281,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, strategyName, premarket }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, strategyName, premarket }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, strategyName, premarket }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, strategyName, premarket }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

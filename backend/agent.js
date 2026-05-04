@@ -8,6 +8,7 @@ const sentimentService = require('./services/sentimentService');
 const fundamentalsService = require('./services/fundamentalsService');
 const patternService = require('./services/patternService');
 const indicatorsService = require('./services/indicatorsService');
+const intradayService = require('./services/intradayService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -266,13 +267,27 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   try { indicators = indicatorsService.computeIndicators(bars); }
   catch (e) { indicators = { ok: false, reason: e.message }; }
 
-  // SWING ONLY: fold in pattern recognition + cached Grok fundamentals.
+  // Pattern recognition — used by BOTH strategies now.
+  // For day strategy on 1Min bars with lookback=60, this gives us higher-highs/
+  // higher-lows, support/resistance clusters, breakout state etc. over the last
+  // ~60 minutes — exactly the intraday structure window we want.
   let patterns = null;
+  try { patterns = patternService.analyzePatterns(bars); }
+  catch (e) { patterns = { ok: false, reason: e.message }; }
+
+  // Fundamentals — swing only (intraday doesn't react to quarterly fundamentals)
   let fundamentals = null;
   if (sc.name === 'swing') {
-    try { patterns = patternService.analyzePatterns(bars); }
-    catch (e) { patterns = { ok: false, reason: e.message }; }
     fundamentals = fundamentalsService.getCached(symbol);
+  }
+
+  // Intraday tactical setups — day strategy only.
+  // Looks at the last 30–60 1-min bars for dip-buy and profit-take patterns.
+  // Purely informational; quorum + confidence gate are unchanged.
+  let intraday = null;
+  if (sc.name === 'day') {
+    try { intraday = intradayService.analyzeIntraday(bars, indicators, patterns, holding); }
+    catch (e) { intraday = { ok: false, reason: e.message }; }
   }
 
   // Pre-market briefing context — only present during first 60 min after open.
@@ -284,13 +299,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
 
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-    patterns, fundamentals, indicators, strategyName: sc.name, premarket,
+    patterns, fundamentals, indicators, intraday, strategyName: sc.name, premarket,
   });
 
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
-    payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals,
+    payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals, intraday,
       votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
