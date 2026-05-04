@@ -187,6 +187,9 @@ export default function App() {
               onChange={setRiskScale}
             />
 
+            {/* Dynamic Sizing — compounding × confidence × performance */}
+            <DynamicSizingPanel riskScale={riskScale} />
+
             {/* Strategy mini-toggles */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {[dayStrat, swingStrat].filter(Boolean).map(s => (
@@ -527,6 +530,91 @@ export default function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function DynamicSizingPanel({ riskScale }) {
+  if (!riskScale?.dynamic) return null;
+  const { dynamic, effectiveBand, minRiskUSD, maxRiskUSD, label } = riskScale;
+  const growthPct = ((dynamic.growthMult - 1) * 100);
+  const perfPct = ((dynamic.perfMult - 1) * 100);
+  const compoundPct = ((dynamic.compoundMult - 1) * 100);
+  const growthColor = growthPct >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]';
+  const perfColor = perfPct >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]';
+  const compoundColor = compoundPct >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]';
+  const equityChangePct = (dynamic.growthRatio * 100);
+  return (
+    <Tooltip text="Position size auto-scales with account growth, recent performance, and per-signal confidence. Quorum, circuit breaker, and daily loss cap are unchanged.">
+      <section className="glass p-4 sm:p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">Dynamic Sizing · {label}</div>
+            <div className="text-[10px] text-[var(--text-dim)] mt-0.5">
+              Compounding · Confidence-Weighted · Performance-Curved
+            </div>
+          </div>
+          <div className="text-right">
+            <div className={`text-[11px] font-bold ${compoundColor}`}>
+              {compoundPct >= 0 ? '+' : ''}{compoundPct.toFixed(1)}%
+            </div>
+            <div className="text-[9px] text-[var(--text-dim)]">vs base sizing</div>
+          </div>
+        </div>
+
+        {/* Effective risk band (after growth × performance multipliers) */}
+        <div className="bg-white/3 rounded-xl p-3 mb-3">
+          <div className="flex items-center justify-between text-[10px] text-[var(--text-dim)] uppercase tracking-wider">
+            <span>Effective $ risk per trade</span>
+            <span>Base ${minRiskUSD}–${maxRiskUSD}</span>
+          </div>
+          <div className="text-base font-semibold mt-1">
+            ${effectiveBand?.minRiskUSD?.toFixed(0) ?? minRiskUSD}
+            <span className="text-[var(--text-dim)] mx-1">–</span>
+            ${effectiveBand?.maxRiskUSD?.toFixed(0) ?? maxRiskUSD}
+            <span className="text-[10px] text-[var(--text-dim)] ml-2 font-normal">
+              · ceiling ${effectiveBand?.ceilingUSD?.toFixed(0)}
+            </span>
+          </div>
+          <div className="text-[10px] text-[var(--text-dim)] mt-1">
+            Higher-confidence signals trade nearer the top of this band; lower-confidence near the bottom.
+          </div>
+        </div>
+
+        {/* Three multipliers */}
+        <div className="grid grid-cols-3 gap-2">
+          <MultBadge
+            icon="📈" label="Growth"
+            value={`×${dynamic.growthMult.toFixed(2)}`}
+            sub={`${equityChangePct >= 0 ? '+' : ''}${equityChangePct.toFixed(1)}% equity · ${dynamic.growthSteps} step${Math.abs(dynamic.growthSteps) === 1 ? '' : 's'}`}
+            color={growthColor}
+          />
+          <MultBadge
+            icon="🎯" label="Confidence"
+            value="band"
+            sub={`Lerp ${(riskScale.confidenceThreshold*100).toFixed(0)}–100% conf → min–max risk`}
+            color="text-[var(--blue)]"
+          />
+          <MultBadge
+            icon="🔥" label="Performance"
+            value={`×${dynamic.perfMult.toFixed(2)}`}
+            sub={`${dynamic.perfNetPnL >= 0 ? '+' : ''}$${dynamic.perfNetPnL.toFixed(0)} · last ${dynamic.perfTradesUsed} trade${dynamic.perfTradesUsed === 1 ? '' : 's'}`}
+            color={perfColor}
+          />
+        </div>
+      </section>
+    </Tooltip>
+  );
+}
+
+function MultBadge({ icon, label, value, sub, color }) {
+  return (
+    <div className="bg-white/3 rounded-xl p-2.5">
+      <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-dim)] uppercase tracking-wider">
+        <span>{icon}</span><span>{label}</span>
+      </div>
+      <div className={`text-[13px] font-semibold mt-0.5 ${color}`}>{value}</div>
+      <div className="text-[9px] text-[var(--text-dim)] leading-tight mt-0.5">{sub}</div>
     </div>
   );
 }

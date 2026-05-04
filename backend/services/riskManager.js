@@ -7,6 +7,23 @@ const MAX_DAILY_DRAWDOWN_PCT = parseFloat(process.env.MAX_DAILY_DRAWDOWN_PCT || 
 // even an Aggressive scale during early testing.
 const MAX_DAILY_LOSS_USD_ENV = parseFloat(process.env.MAX_DAILY_LOSS_USD || '0') || null;
 
+// --- Compounding scaling tunables -------------------------------------------
+// Account-growth: every +GROWTH_STEP equity → +GROWTH_BUMP risk multiplier.
+const GROWTH_STEP = 0.10;   // 10% growth per step
+const GROWTH_BUMP = 0.05;   // +5% per step
+const GROWTH_MIN  = 0.50;   // shrink to 50% on deep drawdown
+const GROWTH_MAX  = 2.00;   // never exceed 2× base sizing from growth alone
+// Performance curve: last-N closed trades, net PnL as % of starting balance.
+const PERF_TRADE_WINDOW = 20;
+const PERF_GAIN_GAIN    = 2.0;  // 1 + 2× pnl_pct → e.g. +5% → +10% sizing
+const PERF_MIN          = 0.80;
+const PERF_MAX          = 1.20;
+// Confidence weighting: confidence in [threshold, 1] → fraction in [0, 1].
+// Final per-trade $ risk = lerp(min, max, fraction) × growth × performance.
+const ABS_RISK_CEILING_MULT = 2.0; // hard ceiling vs scale.maxRiskUSD
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
 function effectiveDailyLossBudget(portfolio) {
   const scale = getRiskScale(portfolio?.risk_scale || DEFAULT_RISK_SCALE);
   const scaleBudget = scale.maxDailyLossUSD;
@@ -60,7 +77,62 @@ function checkQuorum(signal, sc) {
   return { ok: true };
 }
 
-async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, strategyConfig }) {
+// ---------------------------------------------------------------------------
+// Compounding-confidence scaling. Pure function — deterministic given inputs.
+//   growthMult: account-growth scaling. Steps every 10% of starting equity.
+//   perfMult:   performance curve from recent closed PnL.
+//   confFraction: where in the [min, max] risk band this trade lands.
+// ---------------------------------------------------------------------------
+function computeDynamicScaling({ equity, startingBalance, recentClosedTrades = [] }) {
+  // Growth multiplier — discrete steps so it's predictable, not jittery.
+  // Symmetric stepping: only count a step when a FULL ±10% move has occurred.
+  // Math.trunc rounds toward zero so a -0.1% dip doesn't immediately step down.
+  const growthRatio = startingBalance > 0 ? (equity / startingBalance - 1) : 0;
+  const growthSteps = Math.trunc(growthRatio / GROWTH_STEP);
+  const growthMult = clamp(1 + growthSteps * GROWTH_BUMP, GROWTH_MIN, GROWTH_MAX);
+
+  // Performance multiplier — last N closed trades' net PnL as % of starting balance.
+  const closed = recentClosedTrades
+    .filter(t => t.pnl !== null && t.pnl !== undefined)
+    .slice(0, PERF_TRADE_WINDOW);
+  const netPnL = closed.reduce((s, t) => s + parseFloat(t.pnl || 0), 0);
+  const perfPct = startingBalance > 0 ? (netPnL / startingBalance) : 0;
+  const perfMult = clamp(1 + PERF_GAIN_GAIN * perfPct, PERF_MIN, PERF_MAX);
+
+  return {
+    growthMult: +growthMult.toFixed(4),
+    growthSteps,
+    growthRatio: +growthRatio.toFixed(4),
+    perfMult: +perfMult.toFixed(4),
+    perfNetPnL: +netPnL.toFixed(2),
+    perfTradesUsed: closed.length,
+    compoundMult: +(growthMult * perfMult).toFixed(4),
+  };
+}
+
+function confidenceFraction(confidence, threshold) {
+  if (threshold >= 1) return 1;
+  return clamp((confidence - threshold) / (1 - threshold), 0, 1);
+}
+
+// Returns the dynamic per-trade target $-risk for a given signal under the
+// active scale + dynamic multipliers. Pure function — caller still applies
+// position-cap and cash limits.
+function computeTargetRisk({ scale, signal, dynamic }) {
+  const frac = confidenceFraction(signal.confidence, scale.confidenceThreshold);
+  const baseRisk = scale.minRiskUSD + (scale.maxRiskUSD - scale.minRiskUSD) * frac;
+  const target = baseRisk * dynamic.growthMult * dynamic.perfMult;
+  const ceiling = scale.maxRiskUSD * ABS_RISK_CEILING_MULT;
+  const floor = scale.minRiskUSD * 0.5; // never below half the floor
+  return {
+    confFraction: +frac.toFixed(4),
+    baseRiskUSD: +baseRisk.toFixed(2),
+    targetRiskUSD: +clamp(target, floor, ceiling).toFixed(2),
+    ceilingUSD: ceiling,
+  };
+}
+
+async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, strategyConfig, dynamic }) {
   const sc = strategyConfig;
   if (signal.consensus !== 'BUY') return { allow: false, reason: 'Not a BUY signal' };
   const q = checkQuorum(signal, sc);
@@ -79,22 +151,25 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   const riskPerShare = price - stopLossPrice;
   if (riskPerShare <= 0) return { allow: false, reason: 'Invalid risk-per-share' };
 
-  const qtyByRisk = Math.floor(sc.maxRiskUSD / riskPerShare);
+  // Dynamic target: confidence-weighted and compounding-scaled.
+  const dyn = dynamic || { growthMult: 1, perfMult: 1, compoundMult: 1 };
+  const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
+
+  const qtyByRisk = Math.floor(target.targetRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
   const remainingBudgetUSD = Math.min(maxPositionUSD, cash);
   const qtyByPosition = Math.floor(remainingBudgetUSD / price);
 
   const qty = Math.max(0, Math.min(qtyByRisk, qtyByPosition));
   if (qty < 1) {
-    return { allow: false, reason: `Computed qty<1 (risk-cap=${qtyByRisk}, position-cap=${qtyByPosition})` };
+    return { allow: false, reason: `Computed qty<1 (target=$${target.targetRiskUSD}, risk-cap=${qtyByRisk}, position-cap=${qtyByPosition})` };
   }
 
   const tradeRisk = qty * riskPerShare;
-  if (tradeRisk < sc.minRiskUSD) {
-    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} < $${sc.minRiskUSD} minimum` };
-  }
-  if (tradeRisk > sc.maxRiskUSD + 0.01) {
-    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} > $${sc.maxRiskUSD} maximum` };
+  // Hard absolute ceiling — should never be hit thanks to target clamp, but defends
+  // against future param changes.
+  if (tradeRisk > target.ceilingUSD + 0.01) {
+    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} > absolute ceiling $${target.ceilingUSD}` };
   }
 
   return {
@@ -103,6 +178,14 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
     take_profit: parseFloat((price * (1 + sc.takeProfitPct)).toFixed(2)),
     notional: qty * price,
     riskUSD: parseFloat(tradeRisk.toFixed(2)),
+    sizing: {
+      targetRiskUSD: target.targetRiskUSD,
+      baseRiskUSD: target.baseRiskUSD,
+      confFraction: target.confFraction,
+      growthMult: dyn.growthMult,
+      perfMult: dyn.perfMult,
+      compoundMult: dyn.compoundMult,
+    },
   };
 }
 
@@ -141,4 +224,7 @@ module.exports = {
   computeEquity, checkCircuitBreaker,
   evaluateBuy, evaluateSell, evaluateStops, getConfig,
   effectiveDailyLossBudget,
+  computeDynamicScaling, computeTargetRisk,
+  // tunables exported for UI introspection
+  tunables: { GROWTH_STEP, GROWTH_BUMP, GROWTH_MIN, GROWTH_MAX, PERF_TRADE_WINDOW, PERF_GAIN_GAIN, PERF_MIN, PERF_MAX, ABS_RISK_CEILING_MULT },
 };

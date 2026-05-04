@@ -23,6 +23,7 @@ const memoryState = {
   lastFlatten: null,
   strategyLastRun: {},
   strategyCycles: {},
+  lastDynamic: null,
 };
 
 let intervalHandle = null;
@@ -215,7 +216,7 @@ async function flattenAllPositions(reason = 'Manual flatten') {
   }
 }
 
-async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, strategyConfig) {
+async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, strategyConfig, dynamic) {
   const sc = strategyConfig;
   const bars = await alpacaService.getBars(symbol, sc.timeframe, sc.lookback);
   if (!bars.length) return null;
@@ -250,12 +251,14 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
-    const eval_ = await riskManager.evaluateBuy({ symbol, signal, price: latest, equity, cash, holdings, strategyConfig: sc });
+    const eval_ = await riskManager.evaluateBuy({ symbol, signal, price: latest, equity, cash, holdings, strategyConfig: sc, dynamic });
     if (eval_.allow) {
+      const sz = eval_.sizing || {};
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal, stop_loss: eval_.stop_loss, take_profit: eval_.take_profit,
-        reason: `${signal.reason} | risk $${eval_.riskUSD}`,
+        reason: `${signal.reason} | risk $${eval_.riskUSD}` +
+          (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : ''),
         strategy: sc.name,
       });
     } else {
@@ -284,7 +287,7 @@ function minutesUntilClose(clock) {
   return Math.max(0, (close - now) / 60000);
 }
 
-async function runStrategy(sc, portfolio, clock, fullPriceLookup) {
+async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
   const minsLeft = minutesUntilClose(clock);
   if (sc.forceFlattenBeforeClose && minsLeft <= FORCE_FLATTEN_MINUTES_BEFORE_CLOSE) {
     console.log(`[${sc.name}] ${minsLeft.toFixed(1)}m to close — flattening day positions`);
@@ -307,7 +310,7 @@ async function runStrategy(sc, portfolio, clock, fullPriceLookup) {
         await flattenAllPositions(cb2.reason || 'Circuit breaker tripped mid-cycle');
         break;
       }
-      await analyzeAndTradeSymbol(symbol, portfolio, sh, live.equity, live.cash, sc);
+      await analyzeAndTradeSymbol(symbol, portfolio, sh, live.equity, live.cash, sc, dynamic);
     } catch (e) {
       console.error(`[${sc.name}] ${symbol} error:`, e.message);
     }
@@ -365,6 +368,17 @@ async function runCycle() {
     // Apply the user's chosen risk scale to each strategy before running.
     // This dynamically adjusts confidence gate, $ risk per trade, and stop/target ratios.
     const scaleName = portfolio.risk_scale || DEFAULT_RISK_SCALE;
+
+    // Compute dynamic compounding scaling for THIS cycle (account-growth + performance curve).
+    // Confidence weighting is per-signal and added inside evaluateBuy.
+    const recentClosed = await db.getRecentTrades(50);
+    const dynamic = riskManager.computeDynamicScaling({
+      equity,
+      startingBalance: parseFloat(portfolio.starting_balance),
+      recentClosedTrades: recentClosed,
+    });
+    memoryState.lastDynamic = dynamic;
+
     const strategies = [
       { sc: applyRiskScale(STRATEGIES.day, scaleName), enabled: portfolio.day_enabled },
       { sc: applyRiskScale(STRATEGIES.swing, scaleName), enabled: portfolio.swing_enabled },
@@ -374,7 +388,7 @@ async function runCycle() {
       const lastRun = memoryState.strategyLastRun[sc.name];
       const elapsed = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 1000 : Infinity;
       if (elapsed < sc.intervalSeconds - 5) continue;
-      await runStrategy(sc, portfolio, clock, fullLookup);
+      await runStrategy(sc, portfolio, clock, fullLookup, dynamic);
     }
 
     memoryState.lastError = null;
@@ -494,6 +508,30 @@ async function getAgentSnapshot() {
 
   const scaleName = portfolio.risk_scale || DEFAULT_RISK_SCALE;
   const activeScale = getRiskScale(scaleName);
+
+  // Dynamic compounding scaling — recompute on demand so the UI reflects the
+  // current state even between cycles (e.g. after intraday MTM moves).
+  const recentClosed = await db.getRecentTrades(50);
+  const dynamic = riskManager.computeDynamicScaling({
+    equity,
+    startingBalance: parseFloat(portfolio.starting_balance),
+    recentClosedTrades: recentClosed,
+  });
+  // Effective per-trade $ risk band after compounding multipliers (before
+  // per-signal confidence weighting). UI shows this so users see how the band
+  // shifts as the account grows or recent performance changes.
+  const compound = dynamic.compoundMult;
+  // Clamp displayed band to executable floor/ceiling so the UI never advertises
+  // sizing the engine wouldn't actually take.
+  const absCeiling = activeScale.maxRiskUSD * riskManager.tunables.ABS_RISK_CEILING_MULT;
+  const absFloor = activeScale.minRiskUSD * 0.5;
+  const effectiveBand = {
+    minRiskUSD: +Math.max(absFloor, activeScale.minRiskUSD * compound).toFixed(2),
+    maxRiskUSD: +Math.min(absCeiling, activeScale.maxRiskUSD * compound).toFixed(2),
+    ceilingUSD: +absCeiling.toFixed(2),
+    floorUSD: +absFloor.toFixed(2),
+  };
+
   const strategies = listStrategies(scaleName).map(s => ({
     ...s,
     enabled: s.name === 'day' ? !!portfolio.day_enabled : !!portfolio.swing_enabled,
@@ -534,6 +572,8 @@ async function getAgentSnapshot() {
     riskScale: {
       current: scaleName,
       ...activeScale,
+      dynamic,
+      effectiveBand,
     },
     riskScales: listRiskScales(),
     strategies,
