@@ -12,6 +12,7 @@ const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
 const brokerService = require('./services/brokerService');
 const sentimentService = require('./services/sentimentService');
+const premarketService = require('./services/premarketService');
 const db = require('./services/db');
 const bus = require('./services/eventBus');
 const { getWatchlist } = require('./strategies');
@@ -103,6 +104,16 @@ function broadcastAudit(row) {
   }
 }
 bus.on('audit', broadcastAudit);
+
+// Live push of fresh pre-market briefings to all dashboards.
+bus.on('premarket', (payload) => {
+  if (!payload || wsClients.size === 0) return;
+  const msg = JSON.stringify({ type: 'premarket', data: payload });
+  for (const ws of [...wsClients]) {
+    if (ws.readyState !== WebSocket.OPEN) { wsClients.delete(ws); continue; }
+    try { ws.send(msg); } catch { wsClients.delete(ws); try { ws.terminate(); } catch {} }
+  }
+});
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -312,6 +323,23 @@ app.get('/api/markets', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// --- Pre-market briefing ---------------------------------------------------
+// Latest stored briefing (today or earlier). Public read, no auth.
+app.get('/api/premarket/latest', async (_req, res) => {
+  try {
+    const briefing = await premarketService.getLatestBriefing();
+    res.json(briefing || { empty: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Force a fresh briefing run (operator-token gated by the global POST guard).
+app.post('/api/agent/premarket-refresh', async (_req, res) => {
+  try {
+    const result = await premarketService.runDailyBriefing(getWatchlist());
+    res.json(result);
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 app.get('/api/broker/voices', async (_req, res) => {
   try {
     const voices = await brokerService.listVoices();
@@ -492,6 +520,14 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] Alpaca configured: ${alpacaService.isConfigured()} | live keys available: ${alpacaService.hasLiveCredentials()}`);
   const status = llmService.getProviderStatus();
   console.log(`[Server] OpenRouter: ${status.openrouter ? 'YES' : 'NO'}, xAI/Grok: ${status.xai ? 'YES' : 'NO'}`);
+  // Pre-market briefing: ensure schema, schedule daily 08:00 ET run, and
+  // generate today's briefing now if we don't already have one.
+  premarketService.ensureSchema()
+    .then(() => {
+      premarketService.schedule(getWatchlist);
+      premarketService.bootstrapIfMissing(getWatchlist);
+    })
+    .catch(e => console.error('[Premarket] init error:', e.message));
 });
 
 process.on('uncaughtException', (e) => console.error('[Process] uncaughtException:', e));

@@ -1,5 +1,6 @@
 require('dotenv').config();
 const llmService = require('./services/llmService');
+const premarketService = require('./services/premarketService');
 const alpacaService = require('./services/alpacaService');
 const discordService = require('./services/discordService');
 const riskManager = require('./services/riskManager');
@@ -274,9 +275,16 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     fundamentals = fundamentalsService.getCached(symbol);
   }
 
+  // Pre-market briefing context — only present during first 60 min after open.
+  // Returns null otherwise; LLM prompt is unchanged. Never throws.
+  const premarket = await premarketService.getActiveBriefingContext(symbol, {
+    open: memoryState.marketOpen,
+    nextClose: memoryState.nextClose,
+  });
+
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-    patterns, fundamentals, indicators, strategyName: sc.name,
+    patterns, fundamentals, indicators, strategyName: sc.name, premarket,
   });
 
   await db.recordAudit({

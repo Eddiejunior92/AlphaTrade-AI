@@ -20,6 +20,7 @@ export function useAgent() {
   const [state, setState] = useState(null);
   const [trades, setTrades] = useState([]);
   const [audit, setAudit] = useState([]);
+  const [premarket, setPremarket] = useState(null);
   const [connected, setConnected] = useState(false);
   const [liveAuditAt, setLiveAuditAt] = useState(0);
   const [loading, setLoading] = useState({});
@@ -54,6 +55,7 @@ export function useAgent() {
 
   useEffect(() => {
     apiGet('/state').then(setState).catch(() => {});
+    apiGet('/premarket/latest').then(b => { if (b && !b.empty) setPremarket(b); }).catch(() => {});
     refreshLogs();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -74,6 +76,7 @@ export function useAgent() {
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'state') setState(msg.data);
+          else if (msg.type === 'premarket' && msg.data) setPremarket(msg.data);
           else if (msg.type === 'audit' && msg.data) {
             setAudit(prev => {
               // Dedupe by id, prepend newest, cap at 200 entries.
@@ -110,8 +113,17 @@ export function useAgent() {
     return res.json();
   }, []);
 
+  const refreshPremarket = useCallback(async () => {
+    setLoad('premarket', true);
+    try {
+      const r = await apiPost('/agent/premarket-refresh');
+      if (r && r.ok) setPremarket(r);
+      return r;
+    } finally { setLoad('premarket', false); }
+  }, []);
+
   return {
-    state, trades, audit, connected, liveAuditAt, loading, brokerChat,
+    state, trades, audit, premarket, refreshPremarket, connected, liveAuditAt, loading, brokerChat,
     startAgent: wrap('start', () => apiPost('/agent/start')),
     stopAgent: wrap('stop', () => apiPost('/agent/stop')),
     runNow: wrap('runNow', () => apiPost('/agent/run-now')),

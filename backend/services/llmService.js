@@ -36,7 +36,9 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, strategyName }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, strategyName, premarket }) {
+  // Pre-market briefing injection (only present during the first ~60 min after open).
+  const premarketBlock = premarket ? `\nPRE-MARKET BRIEFING (use as PRIOR — overrides nothing, but explains gaps & catalysts):\n${premarket}\n` : '';
   const positionLine = holding
     ? `Current position: ${holding.qty} shares @ avg $${holding.avg_cost} (stop: $${holding.stop_loss}, target: $${holding.take_profit})`
     : 'Current position: NONE';
@@ -80,7 +82,7 @@ Price action: ${sentiment}
 ${newsLine}
 
 ${indicatorsLine}
-
+${premarketBlock}
 Weigh price action, technical indicators (RSI/MACD/volume/volatility), and real-time news+social sentiment together. Conflict between channels (e.g. bullish price but bearish social, overbought RSI on weak volume) is a yellow flag — lower confidence. Strong multi-channel agreement raises confidence. For an intraday scalp, a fresh MACD bullish cross with expanding volume and RSI < 70 is a strong setup.
 
 You must respond in EXACTLY this format (no markdown, no extra text):
@@ -140,7 +142,7 @@ ${indicatorsLine}
 ${patternsBlock}
 
 ${fundamentalsBlock}
-
+${premarketBlock}
 Decision guidance for SWING trades:
   • Favor BUY when trend is up, indicators confirm (RSI 45-70, MACD positive or fresh bullish cross, expanding volume), structure shows higher highs/lows OR a fresh breakout, sector is strong/flat, valuation is fair-to-cheap or growth strongly justifies a richer multiple, and news+social sentiment isn't actively bearish.
   • Favor SELL when trend is down, indicators deteriorate (RSI rolling over from overbought, MACD bearish cross, volume drying up), structure shows lower highs/lows OR a breakdown, sector is weak, or fundamentals weaken (negative EPS/revenue growth, recent miss).
@@ -234,9 +236,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, strategyName }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, strategyName, premarket }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, strategyName }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, strategyName, premarket }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

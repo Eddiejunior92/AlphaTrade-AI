@@ -10,6 +10,7 @@ import Tooltip from './components/Tooltip';
 import MarketsTab from './components/MarketsTab';
 import ErrorBoundary from './components/ErrorBoundary';
 import MarketClock from './components/MarketClock';
+import PreMarketBriefing from './components/PreMarketBriefing';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
@@ -56,7 +57,8 @@ export default function App() {
   const [modeError, setModeError] = useState('');
   const [modeConfirmText, setModeConfirmText] = useState('');
   const {
-    state, trades, audit, connected, liveAuditAt, loading, brokerChat,
+    state, trades, audit, premarket, refreshPremarket,
+    connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
     toggleStrategy, setTradingMode, setRiskScale,
@@ -214,6 +216,9 @@ export default function App() {
 
             {/* Live market clock + countdown */}
             <MarketClock />
+
+            {/* Pre-market briefing — overnight Grok research, surfaced for the open */}
+            <PreMarketBriefing briefing={premarket} onRefresh={refreshPremarket} loading={loading.premarket} />
 
             {/* Risk Scale — prominent user control */}
             <RiskScaleSelector
