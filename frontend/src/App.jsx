@@ -9,11 +9,12 @@ import VoiceChat from './components/VoiceChat';
 import Tooltip from './components/Tooltip';
 
 const TABS = [
-  { id: 'home',    label: 'Home',     icon: '◐' },
-  { id: 'reason',  label: 'Reasoning', icon: '🧠' },
+  { id: 'home',      label: 'Home',      icon: '◐' },
+  { id: 'strategies', label: 'Strategies', icon: '⚡' },
+  { id: 'reason',    label: 'Reasoning', icon: '🧠' },
   { id: 'positions', label: 'Positions', icon: '📊' },
-  { id: 'trades',  label: 'Trades',   icon: '📜' },
-  { id: 'settings', label: 'Settings', icon: '⚙' },
+  { id: 'trades',    label: 'Trades',    icon: '📜' },
+  { id: 'settings',  label: 'Settings',  icon: '⚙' },
 ];
 
 function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }
@@ -21,10 +22,13 @@ function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { min
 export default function App() {
   const [tab, setTab] = useState('home');
   const [chatOpen, setChatOpen] = useState(false);
+  const [modeModal, setModeModal] = useState(null); // 'paper' | 'live' | null
+  const [modeError, setModeError] = useState('');
   const {
     state, trades, audit, connected, loading, brokerChat,
     startAgent, stopAgent, runNow,
-    emergencyPause, resume, resetCircuitBreaker,
+    emergencyPause, resume, resetCircuitBreaker, flatten,
+    toggleStrategy, setTradingMode,
   } = useAgent();
 
   const equity = state?.equity || 0;
@@ -41,6 +45,19 @@ export default function App() {
   const activeModels = (providers.openrouter ? 3 : 0) + (providers.xai ? 1 : 0);
   const risk = state?.risk;
   const mode = state?.mode || 'paper';
+  const liveAvailable = state?.liveAvailable;
+  const strategies = state?.strategies || [];
+  const dayStrat = strategies.find(s => s.name === 'day');
+  const swingStrat = strategies.find(s => s.name === 'swing');
+  const enabledStrategies = strategies.filter(s => s.enabled);
+
+  const handleModeSwitch = async () => {
+    setModeError('');
+    const target = modeModal;
+    const r = await setTradingMode(target, target === 'live' ? 'I_UNDERSTAND_LIVE' : undefined);
+    if (r?.success) setModeModal(null);
+    else setModeError(r?.error || 'Switch failed');
+  };
 
   return (
     <div className="min-h-screen pb-28 sm:pb-24">
@@ -50,7 +67,11 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-2xl bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-base font-bold">α</div>
             <div>
-              <div className="font-semibold text-[15px] tracking-tight">AlphaTrade <span className="text-[10px] font-medium text-[var(--blue)] ml-1">· Day Trading</span></div>
+              <div className="font-semibold text-[15px] tracking-tight flex items-center gap-1.5">
+                AlphaTrade
+                <span className="text-[10px] font-medium text-[var(--blue)]">·</span>
+                <span className="text-[10px] font-medium text-[var(--text-dim)]">{enabledStrategies.map(s => s.label).join(' + ') || 'No strategy'}</span>
+              </div>
               <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5">
                 <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-[var(--green)] pulse-live' : 'bg-[var(--red)]'}`} />
                 {connected ? 'Live' : 'Reconnecting…'} · Cycle #{state?.cycleCount ?? 0}
@@ -63,10 +84,15 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Tooltip text={`Currently ${mode === 'paper' ? 'paper trading (simulated, safe)' : 'LIVE trading with real money'}`}>
-              <span className={`text-[10px] font-bold px-2.5 py-1 rounded-full ${
-                mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
-              }`}>{mode.toUpperCase()}</span>
+            <Tooltip text={`Tap to switch to ${mode === 'paper' ? 'LIVE (real money)' : 'paper (simulated)'} mode`}>
+              <button
+                onClick={() => { setModeError(''); setModeModal(mode === 'paper' ? 'live' : 'paper'); }}
+                className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition-colors ${
+                  mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)] hover:bg-[var(--yellow)]/25'
+                                   : 'bg-[var(--red)]/15 text-[var(--red)] hover:bg-[var(--red)]/25'
+                }`}>
+                {mode.toUpperCase()}
+              </button>
             </Tooltip>
             <Tooltip text="Talk to Alpha — your AI broker">
               <button onClick={() => setChatOpen(true)}
@@ -100,7 +126,7 @@ export default function App() {
               <div className="text-xl">🚨</div>
               <div>
                 <div className="text-sm font-semibold text-[var(--red)]">Circuit Breaker Tripped</div>
-                <div className="text-[11px] text-[var(--text-dim)]">Daily drawdown exceeded {(risk?.maxDailyDrawdownPct * 100).toFixed(0)}%. Reset to resume.</div>
+                <div className="text-[11px] text-[var(--text-dim)]">Daily loss budget exceeded. All positions flattened. Reset to resume.</div>
               </div>
             </div>
             <button onClick={resetCircuitBreaker} disabled={loading.cbReset} className="ios-btn ios-btn-danger text-xs">
@@ -142,7 +168,7 @@ export default function App() {
                 </div>
                 <div>
                   <div className="text-[10px] text-[var(--text-dim)] uppercase">Positions</div>
-                  <div className="text-base font-semibold">{holdings.length} <span className="text-[var(--text-dim)] text-[11px] font-normal">/ {risk?.maxHoldings || 8}</span></div>
+                  <div className="text-base font-semibold">{holdings.length}</div>
                 </div>
                 <div>
                   <div className="text-[10px] text-[var(--text-dim)] uppercase">AI Models</div>
@@ -151,9 +177,17 @@ export default function App() {
               </div>
             </div>
 
+            {/* Strategy mini-toggles */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {[dayStrat, swingStrat].filter(Boolean).map(s => (
+                <StrategyMini key={s.name} s={s} loading={loading[`strat:${s.name}`]}
+                  onToggle={() => toggleStrategy(s.name, !s.enabled)} />
+              ))}
+            </div>
+
             {/* Quick actions */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <Tooltip text={isRunning ? 'Stop the autonomous trading loop' : `Start the AI day-trader — analyzes the market every ${state?.intervalSeconds ?? 60}s during market hours only`}>
+              <Tooltip text={isRunning ? 'Stop the autonomous trading loop' : 'Start Alpha — runs all enabled strategies on their own cadence during market hours'}>
                 {isRunning ? (
                   <button onClick={stopAgent} disabled={loading.stop} className="ios-btn ios-btn-ghost w-full">
                     <span>⏹</span> {loading.stop ? '…' : 'Stop Agent'}
@@ -184,18 +218,18 @@ export default function App() {
 
             {/* Stats */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <StatCard label="Confidence Gate" icon="🎯" value={`${(risk?.confidenceThreshold * 100).toFixed(0) || 85}%`}
+              <StatCard label="Confidence Gate" icon="🎯" value="85%"
                 sub="Below this, no trade fires" color="text-[var(--blue)]" />
               <StatCard label="Daily Risk Cap" icon="💵" value={`$${risk?.maxDailyLossUSD ?? 100}`}
                 sub={`$${(state?.dailyLossUSD || 0).toFixed(2)} used today`} color="text-[var(--red)]" />
-              <StatCard label="Max Per Trade" icon="🛡" value={`$${risk?.maxRiskPerTradeUSD ?? 100}`}
-                sub={`Stop -${((risk?.stopLossPct || 0) * 100).toFixed(2)}% · Target +${((risk?.takeProfitPct || 0) * 100).toFixed(2)}%`} />
+              <StatCard label="Mode" icon={mode === 'live' ? '🔴' : '🟡'}
+                value={mode.toUpperCase()}
+                color={mode === 'live' ? 'text-[var(--red)]' : 'text-[var(--yellow)]'}
+                sub={mode === 'live' ? 'Real money on the line' : 'Simulated, your money is safe'} />
               <StatCard label="Status" icon="🤖"
                 value={paused ? 'Paused' : isRunning ? (state?.market?.open ? 'Trading' : 'Waiting') : 'Idle'}
                 color={paused ? 'text-[var(--red)]' : isRunning ? (state?.market?.open ? 'text-[var(--green)]' : 'text-[var(--yellow)]') : 'text-[var(--text-dim)]'}
-                sub={state?.market?.open
-                  ? `Auto-flatten ${state?.forceFlattenMinutesBeforeClose || 5}m before close`
-                  : state?.market?.nextOpen ? `Opens ${new Date(state.market.nextOpen).toLocaleString([], { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric' })}` : 'Market closed'} />
+                sub={state?.market?.open ? 'Market open' : state?.market?.nextOpen ? `Opens ${new Date(state.market.nextOpen).toLocaleString([], { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric' })}` : 'Market closed'} />
             </div>
 
             {/* Live signals */}
@@ -206,7 +240,7 @@ export default function App() {
                   <span className="text-[11px] text-[var(--text-dim)]">{signals.length} symbols</span>
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                  {signals.slice(0, 8).map(s => <SignalCard key={s.symbol} signal={s} />)}
+                  {signals.slice(0, 8).map(s => <SignalCard key={`${s.strategy || 'd'}-${s.symbol}`} signal={s} />)}
                 </div>
               </section>
             )}
@@ -224,6 +258,25 @@ export default function App() {
           </div>
         )}
 
+        {tab === 'strategies' && (
+          <div className="space-y-5">
+            <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
+              <div className="flex items-center gap-3">
+                <div className="text-3xl">⚡</div>
+                <div>
+                  <h2 className="text-lg font-semibold tracking-tight">Trading Strategies</h2>
+                  <div className="text-[12px] text-[var(--text-dim)]">Run day trading and longer-hold swings in parallel — independently or together. Each has its own risk profile, holding rules, and watchlist behavior.</div>
+                </div>
+              </div>
+            </div>
+            {strategies.map(s => (
+              <StrategyCard key={s.name} s={s} loading={loading[`strat:${s.name}`]}
+                holdings={holdings.filter(h => h.strategy === s.name)}
+                onToggle={() => toggleStrategy(s.name, !s.enabled)} />
+            ))}
+          </div>
+        )}
+
         {tab === 'reason' && (
           <div className="space-y-4">
             <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
@@ -231,7 +284,7 @@ export default function App() {
                 <div className="text-3xl">🧠</div>
                 <div>
                   <h2 className="text-lg font-semibold tracking-tight">AI Reasoning</h2>
-                  <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes is logged here in real time. Each model votes independently — Alpha only acts when 3+ agree at high confidence.</div>
+                  <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes is logged here in real time. Each model votes independently — Alpha only acts when 3+ agree at 85%+ confidence.</div>
                 </div>
               </div>
             </div>
@@ -242,7 +295,26 @@ export default function App() {
         {tab === 'positions' && (
           <div className="space-y-4">
             <h2 className="text-lg font-semibold tracking-tight">Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {holdings.length}</span></h2>
-            <HoldingsTable holdings={holdings} />
+            {strategies.map(s => {
+              const sh = holdings.filter(h => h.strategy === s.name);
+              if (!sh.length) return null;
+              return (
+                <div key={s.name} className="space-y-2">
+                  <div className="text-[12px] font-semibold text-[var(--text-dim)] uppercase tracking-wider px-1">
+                    {s.label} <span className="font-normal">({sh.length})</span>
+                  </div>
+                  <HoldingsTable holdings={sh} />
+                </div>
+              );
+            })}
+            {!holdings.length && <div className="glass p-6 text-center text-[var(--text-dim)] text-sm">No open positions.</div>}
+            {holdings.length > 0 && (
+              <Tooltip text="Sell every open position immediately at market price">
+                <button onClick={flatten} disabled={loading.flatten} className="ios-btn ios-btn-danger w-full mt-2">
+                  {loading.flatten ? 'Flattening…' : '🛑 Flatten All Positions'}
+                </button>
+              </Tooltip>
+            )}
           </div>
         )}
 
@@ -262,19 +334,37 @@ export default function App() {
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <div className="font-semibold text-[14px]">Trading Mode</div>
-                  <div className="text-[11px] text-[var(--text-dim)]">Paper = simulated · Live = real money</div>
+                  <div className="text-[11px] text-[var(--text-dim)]">Paper = simulated · Live = real money via Alpaca</div>
                 </div>
-                <Tooltip text="Set TRADING_MODE=live in your environment to switch. Restart required.">
-                  <span className={`text-[10px] font-bold px-3 py-1.5 rounded-full ${
-                    mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
-                  }`}>{mode.toUpperCase()}</span>
+                <span className={`text-[10px] font-bold px-3 py-1.5 rounded-full ${
+                  mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
+                }`}>{mode.toUpperCase()}</span>
+              </div>
+              <div className="text-[11px] text-[var(--text-dim)] bg-white/3 rounded-xl p-3 mb-3">
+                {mode === 'paper'
+                  ? 'All orders simulated through the Alpaca paper account — your real money is safe.'
+                  : '⚠ Real capital is at risk. All risk gates and circuit breakers still apply, but losses are real.'}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Tooltip text="Switch to paper trading (safe, simulated)">
+                  <button onClick={() => { setModeError(''); setModeModal('paper'); }} disabled={mode === 'paper' || loading.mode}
+                    className={`ios-btn w-full ${mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'}`}>
+                    🟡 Paper
+                  </button>
+                </Tooltip>
+                <Tooltip text={liveAvailable ? 'Switch to LIVE — requires confirmation' : 'Add ALPACA_LIVE_API_KEY + SECRET to enable'}>
+                  <button onClick={() => { setModeError(''); setModeModal('live'); }}
+                    disabled={mode === 'live' || !liveAvailable || loading.mode}
+                    className={`ios-btn w-full ${mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'}`}>
+                    🔴 Live
+                  </button>
                 </Tooltip>
               </div>
-              <div className="text-[11px] text-[var(--text-dim)] bg-white/3 rounded-xl p-3">
-                Currently in <strong>{mode}</strong> mode. {mode === 'paper'
-                  ? 'All orders simulated through Alpaca paper account — your real money is safe.'
-                  : 'Orders will execute with real capital. Use extreme caution.'}
-              </div>
+              {!liveAvailable && (
+                <div className="text-[10px] text-[var(--text-dim)] mt-2">
+                  Add <span className="font-mono">ALPACA_LIVE_API_KEY</span> and <span className="font-mono">ALPACA_LIVE_SECRET_KEY</span> in Secrets to unlock live trading.
+                </div>
+              )}
             </div>
 
             {/* Funds */}
@@ -326,20 +416,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Risk config */}
-            <div className="glass p-5">
-              <div className="font-semibold text-[14px] mb-3">Risk Guardrails</div>
-              <div className="space-y-2 text-[12px]">
-                <Row label="Confidence required" value={`${(risk?.confidenceThreshold * 100).toFixed(0)}%`} />
-                <Row label="Max position size" value={`${(risk?.maxPositionPct * 100).toFixed(0)}% of portfolio`} />
-                <Row label="Daily drawdown stop" value={`${(risk?.maxDailyDrawdownPct * 100).toFixed(0)}%`} />
-                <Row label="Stop-loss / take-profit" value={`-${(risk?.stopLossPct * 100).toFixed(0)}% / +${(risk?.takeProfitPct * 100).toFixed(0)}%`} />
-                <Row label="Max holdings" value={risk?.maxHoldings} />
-                <Row label="Cycle interval" value={`${state?.intervalSeconds}s`} />
-                <Row label="Watchlist" value={state?.watchlist?.join(', ')} />
-              </div>
-            </div>
-
             {/* AI Models */}
             <div className="glass p-5">
               <div className="font-semibold text-[14px] mb-3">AI Ensemble</div>
@@ -360,23 +436,29 @@ export default function App() {
                 })}
               </div>
             </div>
+
+            <div className="glass p-5">
+              <div className="font-semibold text-[14px] mb-2">Watchlist</div>
+              <div className="text-[12px] text-[var(--text-dim)]">{state?.watchlist?.join(', ')}</div>
+            </div>
           </div>
         )}
       </main>
 
-      {/* Bottom nav (mobile-first) */}
+      {/* Bottom nav */}
       <nav className="fixed bottom-0 inset-x-0 z-50 px-3 pb-3 safe-bottom">
         <div className="max-w-md mx-auto glass-strong px-2 py-2 flex items-center justify-between">
           {TABS.map(t => (
             <Tooltip key={t.id} text={
               t.id === 'home' ? 'Dashboard overview' :
+              t.id === 'strategies' ? 'Toggle day & swing strategies' :
               t.id === 'reason' ? "See Alpha's reasoning live" :
               t.id === 'positions' ? 'Your open positions' :
               t.id === 'trades' ? 'Trade history' :
               'Settings, funds, mode toggle'
             }>
               <button onClick={() => setTab(t.id)}
-                className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-2xl transition-all ${
+                className={`flex flex-col items-center gap-0.5 px-2.5 py-1.5 rounded-2xl transition-all ${
                   tab === t.id ? 'bg-white/10 text-white' : 'text-[var(--text-dim)] hover:text-white'
                 }`}>
                 <span className="text-base leading-none">{t.icon}</span>
@@ -396,15 +478,117 @@ export default function App() {
       </Tooltip>
 
       <VoiceChat open={chatOpen} onClose={() => setChatOpen(false)} brokerChat={brokerChat} />
+
+      {/* Mode-switch confirmation modal */}
+      {modeModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 anim-fade">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={() => setModeModal(null)} />
+          <div className="relative glass-strong w-full max-w-md p-6 anim-slide-up">
+            <div className="text-3xl mb-2">{modeModal === 'live' ? '🔴' : '🟡'}</div>
+            <h3 className="text-xl font-semibold tracking-tight mb-2">
+              Switch to {modeModal === 'live' ? 'LIVE Trading' : 'Paper Trading'}?
+            </h3>
+            {modeModal === 'live' ? (
+              <div className="text-[13px] text-[var(--text-dim)] space-y-2">
+                <p><strong className="text-[var(--red)]">This uses real money.</strong> All trades will execute on your live Alpaca brokerage account immediately.</p>
+                <p>All risk gates remain active — 85% confidence, 3-of-4 quorum, $100/day loss budget — but actual losses will be real.</p>
+                <p className="text-[var(--yellow)]">Make sure you understand your strategy and risk before continuing.</p>
+              </div>
+            ) : (
+              <div className="text-[13px] text-[var(--text-dim)]">
+                Switching back to paper mode. All future trades will be simulated through your Alpaca paper account. Your live positions will remain untouched on the broker side.
+              </div>
+            )}
+            {modeError && (
+              <div className="mt-3 text-[12px] text-[var(--red)] bg-[var(--red)]/10 rounded-xl p-3">
+                {modeError}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 mt-5">
+              <button onClick={() => setModeModal(null)} disabled={loading.mode} className="ios-btn ios-btn-ghost">
+                Cancel
+              </button>
+              <button onClick={handleModeSwitch} disabled={loading.mode}
+                className={`ios-btn ${modeModal === 'live' ? 'ios-btn-danger' : 'ios-btn-success'}`}>
+                {loading.mode ? '…' : modeModal === 'live' ? 'Yes, Go Live' : 'Switch to Paper'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function Row({ label, value }) {
+function StrategyMini({ s, loading, onToggle }) {
   return (
-    <div className="flex items-center justify-between py-1.5 border-b border-white/5 last:border-0">
-      <span className="text-[var(--text-dim)]">{label}</span>
-      <span className="font-medium text-right">{value}</span>
+    <Tooltip text={`${s.description} Tap to ${s.enabled ? 'disable' : 'enable'}.`}>
+      <button onClick={onToggle} disabled={loading}
+        className={`w-full glass p-4 text-left transition-all ${s.enabled ? 'border-[var(--green)]/40' : 'border-white/5 opacity-70'}`}>
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-[13px] font-semibold flex items-center gap-2">
+              {s.label}
+              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+                s.enabled ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/5 text-[var(--text-dim)]'
+              }`}>{s.enabled ? 'ON' : 'OFF'}</span>
+            </div>
+            <div className="text-[10px] text-[var(--text-dim)] mt-0.5">
+              {s.timeframe} bars · {s.holdings} held · stop {(s.stopLossPct * 100).toFixed(1)}% / target {(s.takeProfitPct * 100).toFixed(1)}%
+            </div>
+          </div>
+          <div className={`w-10 h-6 rounded-full p-0.5 transition-colors ${s.enabled ? 'bg-[var(--green)]' : 'bg-white/10'}`}>
+            <div className={`w-5 h-5 rounded-full bg-white transition-transform ${s.enabled ? 'translate-x-4' : ''}`} />
+          </div>
+        </div>
+      </button>
+    </Tooltip>
+  );
+}
+
+function StrategyCard({ s, loading, holdings, onToggle }) {
+  return (
+    <div className={`glass p-5 ${s.enabled ? '' : 'opacity-70'}`}>
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            <h3 className="text-[15px] font-semibold tracking-tight">{s.label}</h3>
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+              s.enabled ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/5 text-[var(--text-dim)]'
+            }`}>{s.enabled ? 'RUNNING' : 'PAUSED'}</span>
+          </div>
+          <div className="text-[11px] text-[var(--text-dim)]">{s.description}</div>
+        </div>
+        <Tooltip text={s.enabled ? `Pause ${s.label}` : `Enable ${s.label}`}>
+          <button onClick={onToggle} disabled={loading}
+            className={`w-12 h-7 rounded-full p-0.5 transition-colors flex-shrink-0 ${s.enabled ? 'bg-[var(--green)]' : 'bg-white/10'}`}>
+            <div className={`w-6 h-6 rounded-full bg-white transition-transform ${s.enabled ? 'translate-x-5' : ''}`} />
+          </button>
+        </Tooltip>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+        <Spec label="Timeframe" value={s.timeframe} />
+        <Spec label="Cadence" value={`${s.intervalSeconds}s`} />
+        <Spec label="Stop / Target" value={`${(s.stopLossPct * 100).toFixed(1)}% / ${(s.takeProfitPct * 100).toFixed(1)}%`} />
+        <Spec label="Risk per trade" value={`$${s.minRiskUSD}–$${s.maxRiskUSD}`} />
+        <Spec label="Max holdings" value={s.maxHoldings} />
+        <Spec label="Position cap" value={`${(s.maxPositionPct * 100).toFixed(1)}%`} />
+        <Spec label="Hold overnight" value={s.holdOvernight ? 'Yes' : 'No'} />
+        <Spec label="Auto-flatten" value={s.forceFlattenBeforeClose ? 'Before close' : 'Never'} />
+      </div>
+      <div className="text-[11px] text-[var(--text-dim)] flex items-center justify-between border-t border-white/5 pt-3">
+        <span>{holdings.length} open · {s.cycles} cycles run</span>
+        <span>{s.lastRun ? `Last: ${new Date(s.lastRun).toLocaleTimeString()}` : 'Not yet run'}</span>
+      </div>
+    </div>
+  );
+}
+
+function Spec({ label, value }) {
+  return (
+    <div className="bg-white/3 rounded-xl px-3 py-2">
+      <div className="text-[9px] text-[var(--text-dim)] uppercase tracking-wider">{label}</div>
+      <div className="text-[12px] font-semibold mt-0.5">{value}</div>
     </div>
   );
 }

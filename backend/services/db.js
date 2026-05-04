@@ -13,6 +13,20 @@ async function query(sql, params = []) {
   return result;
 }
 
+async function ensureSchema() {
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS strategy TEXT NOT NULL DEFAULT 'day'`);
+  await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS strategy TEXT`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
+  // Holdings PK was symbol-only; allow same symbol in multiple strategies.
+  try {
+    await query(`ALTER TABLE holdings DROP CONSTRAINT IF EXISTS holdings_pkey`);
+    await query(`ALTER TABLE holdings ADD PRIMARY KEY (symbol, strategy)`);
+  } catch (e) { /* already converted */ }
+  console.log('[DB] Schema ensured (strategy columns + composite PK)');
+}
+
 async function getPortfolio() {
   const { rows } = await query('SELECT * FROM portfolio WHERE id = 1');
   return rows[0] || null;
@@ -21,6 +35,7 @@ async function getPortfolio() {
 const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'cash_balance', 'starting_balance', 'day_start_equity',
   'circuit_breaker', 'emergency_pause', 'agent_running',
+  'day_enabled', 'swing_enabled', 'trading_mode',
 ]);
 
 async function updatePortfolio(updates) {
@@ -28,54 +43,54 @@ async function updatePortfolio(updates) {
   if (!fields.length) return;
   const sets = fields.map((f, i) => `${f} = $${i + 1}`).join(', ');
   const values = fields.map(f => updates[f]);
-  await query(
-    `UPDATE portfolio SET ${sets}, updated_at = NOW() WHERE id = 1`,
-    values
-  );
+  await query(`UPDATE portfolio SET ${sets}, updated_at = NOW() WHERE id = 1`, values);
 }
 
 async function adjustCash(delta) {
   const { rows } = await query(
     `UPDATE portfolio SET cash_balance = cash_balance + $1, updated_at = NOW()
-     WHERE id = 1 RETURNING cash_balance`,
-    [delta]
+     WHERE id = 1 RETURNING cash_balance`, [delta]
   );
   return rows[0] ? parseFloat(rows[0].cash_balance) : null;
 }
 
-async function getHoldings() {
-  const { rows } = await query('SELECT * FROM holdings ORDER BY symbol');
+async function getHoldings(strategy = null) {
+  if (strategy) {
+    const { rows } = await query('SELECT * FROM holdings WHERE strategy = $1 ORDER BY symbol', [strategy]);
+    return rows;
+  }
+  const { rows } = await query('SELECT * FROM holdings ORDER BY strategy, symbol');
   return rows;
 }
 
-async function getHolding(symbol) {
-  const { rows } = await query('SELECT * FROM holdings WHERE symbol = $1', [symbol]);
+async function getHolding(symbol, strategy = 'day') {
+  const { rows } = await query('SELECT * FROM holdings WHERE symbol = $1 AND strategy = $2', [symbol, strategy]);
   return rows[0] || null;
 }
 
-async function upsertHolding({ symbol, qty, avg_cost, stop_loss, take_profit }) {
+async function upsertHolding({ symbol, strategy = 'day', qty, avg_cost, stop_loss, take_profit }) {
   await query(
-    `INSERT INTO holdings (symbol, qty, avg_cost, stop_loss, take_profit)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (symbol) DO UPDATE SET
+    `INSERT INTO holdings (symbol, strategy, qty, avg_cost, stop_loss, take_profit)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (symbol, strategy) DO UPDATE SET
        qty = EXCLUDED.qty,
        avg_cost = EXCLUDED.avg_cost,
        stop_loss = COALESCE(EXCLUDED.stop_loss, holdings.stop_loss),
        take_profit = COALESCE(EXCLUDED.take_profit, holdings.take_profit)`,
-    [symbol, qty, avg_cost, stop_loss, take_profit]
+    [symbol, strategy, qty, avg_cost, stop_loss, take_profit]
   );
 }
 
-async function deleteHolding(symbol) {
-  await query('DELETE FROM holdings WHERE symbol = $1', [symbol]);
+async function deleteHolding(symbol, strategy = 'day') {
+  await query('DELETE FROM holdings WHERE symbol = $1 AND strategy = $2', [symbol, strategy]);
 }
 
 async function recordTrade(trade) {
   const { rows } = await query(
-    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
     [trade.symbol, trade.side, trade.qty, trade.price, trade.confidence,
-     trade.consensus, trade.order_id, trade.status, trade.pnl || null, trade.reason]
+     trade.consensus, trade.order_id, trade.status, trade.pnl || null, trade.reason, trade.strategy || null]
   );
   return rows[0];
 }
@@ -100,7 +115,7 @@ async function getRecentAudit(limit = 50) {
 }
 
 module.exports = {
-  query, getPortfolio, updatePortfolio, adjustCash,
+  query, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
   getHoldings, getHolding, upsertHolding, deleteHolding,
   recordTrade, getRecentTrades,
   recordAudit, getRecentAudit,

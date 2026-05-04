@@ -1,15 +1,7 @@
 const db = require('./db');
 
-const MAX_POSITION_PCT = parseFloat(process.env.MAX_POSITION_PCT || '0.03');
 const MAX_DAILY_DRAWDOWN_PCT = parseFloat(process.env.MAX_DAILY_DRAWDOWN_PCT || '0.05');
-const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '0.005');
-const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || '0.01');
-const MAX_HOLDINGS = parseInt(process.env.MAX_HOLDINGS || '4');
-const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || '100');
-const MAX_RISK_PER_TRADE_USD = parseFloat(process.env.MAX_RISK_PER_TRADE_USD || '100');
-const MIN_RISK_PER_TRADE_USD = parseFloat(process.env.MIN_RISK_PER_TRADE_USD || '50');
-const MIN_DIRECTIONAL_AGREEMENT = parseInt(process.env.MIN_DIRECTIONAL_AGREEMENT || '3');
 
 async function computeEquity(holdings, priceLookup) {
   const portfolio = await db.getPortfolio();
@@ -35,7 +27,6 @@ async function checkCircuitBreaker(equity) {
     });
     return { tripped: true, drawdown, lossUSD, reason: `Daily loss $${lossUSD.toFixed(2)} ≥ $${MAX_DAILY_LOSS_USD} budget` };
   }
-
   if (drawdown >= MAX_DAILY_DRAWDOWN_PCT && !portfolio.circuit_breaker) {
     await db.updatePortfolio({ circuit_breaker: true });
     await db.recordAudit({
@@ -44,38 +35,42 @@ async function checkCircuitBreaker(equity) {
     });
     return { tripped: true, drawdown, lossUSD, reason: `Drawdown ${(drawdown * 100).toFixed(2)}% ≥ ${(MAX_DAILY_DRAWDOWN_PCT * 100).toFixed(0)}%` };
   }
-
   return { tripped: portfolio.circuit_breaker, drawdown, lossUSD };
 }
 
-function checkQuorum(signal) {
-  if (signal.confidence < CONFIDENCE_THRESHOLD) {
-    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(CONFIDENCE_THRESHOLD * 100)}% gate` };
+function checkQuorum(signal, sc) {
+  if (signal.confidence < sc.confidenceThreshold) {
+    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(sc.confidenceThreshold * 100)}% gate` };
   }
   const agreement = signal.agreementCount ?? 0;
-  if (agreement < MIN_DIRECTIONAL_AGREEMENT) {
-    return { ok: false, reason: `Only ${agreement} models agree (need ${MIN_DIRECTIONAL_AGREEMENT}-of-${signal.totalModels || 4})` };
+  if (agreement < sc.minDirectionalAgreement) {
+    return { ok: false, reason: `Only ${agreement} models agree (need ${sc.minDirectionalAgreement}-of-${signal.totalModels || 4})` };
   }
   return { ok: true };
 }
 
-async function evaluateBuy({ symbol, signal, price, equity, cash, holdings }) {
+async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, strategyConfig }) {
+  const sc = strategyConfig;
   if (signal.consensus !== 'BUY') return { allow: false, reason: 'Not a BUY signal' };
-  const q = checkQuorum(signal);
+  const q = checkQuorum(signal, sc);
   if (!q.ok) return { allow: false, reason: q.reason };
-  if (holdings.length >= MAX_HOLDINGS && !holdings.find(h => h.symbol === symbol)) {
-    return { allow: false, reason: `Max holdings (${MAX_HOLDINGS}) reached — diversification limit` };
+  // Reject averaging-in: if symbol already held in this strategy, force a new
+  // sell-or-hold cycle before re-entering. Avoids local-state corruption from
+  // upsertHolding (which replaces qty rather than accumulating).
+  if (holdings.find(h => h.symbol === symbol)) {
+    return { allow: false, reason: 'Already long in this strategy — no averaging-in' };
+  }
+  if (holdings.length >= sc.maxHoldings) {
+    return { allow: false, reason: `Max ${sc.label || sc.name} holdings (${sc.maxHoldings}) reached` };
   }
 
-  const stopLossPrice = price * (1 - STOP_LOSS_PCT);
+  const stopLossPrice = price * (1 - sc.stopLossPct);
   const riskPerShare = price - stopLossPrice;
   if (riskPerShare <= 0) return { allow: false, reason: 'Invalid risk-per-share' };
 
-  const qtyByRisk = Math.floor(MAX_RISK_PER_TRADE_USD / riskPerShare);
-  const maxPositionUSD = equity * MAX_POSITION_PCT;
-  const existing = holdings.find(h => h.symbol === symbol);
-  const existingValue = existing ? parseFloat(existing.qty) * price : 0;
-  const remainingBudgetUSD = Math.min(maxPositionUSD - existingValue, cash);
+  const qtyByRisk = Math.floor(sc.maxRiskUSD / riskPerShare);
+  const maxPositionUSD = equity * sc.maxPositionPct;
+  const remainingBudgetUSD = Math.min(maxPositionUSD, cash);
   const qtyByPosition = Math.floor(remainingBudgetUSD / price);
 
   const qty = Math.max(0, Math.min(qtyByRisk, qtyByPosition));
@@ -84,26 +79,25 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings }) {
   }
 
   const tradeRisk = qty * riskPerShare;
-  if (tradeRisk < MIN_RISK_PER_TRADE_USD) {
-    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} < $${MIN_RISK_PER_TRADE_USD} minimum` };
+  if (tradeRisk < sc.minRiskUSD) {
+    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} < $${sc.minRiskUSD} minimum` };
   }
-  if (tradeRisk > MAX_RISK_PER_TRADE_USD + 0.01) {
-    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} > $${MAX_RISK_PER_TRADE_USD} maximum` };
+  if (tradeRisk > sc.maxRiskUSD + 0.01) {
+    return { allow: false, reason: `Trade risk $${tradeRisk.toFixed(2)} > $${sc.maxRiskUSD} maximum` };
   }
 
   return {
-    allow: true,
-    qty,
+    allow: true, qty,
     stop_loss: parseFloat(stopLossPrice.toFixed(2)),
-    take_profit: parseFloat((price * (1 + TAKE_PROFIT_PCT)).toFixed(2)),
+    take_profit: parseFloat((price * (1 + sc.takeProfitPct)).toFixed(2)),
     notional: qty * price,
     riskUSD: parseFloat(tradeRisk.toFixed(2)),
   };
 }
 
-async function evaluateSell({ symbol, signal, holdings }) {
+async function evaluateSell({ symbol, signal, holdings, strategyConfig }) {
   if (signal.consensus !== 'SELL') return { allow: false, reason: 'Not a SELL signal' };
-  const q = checkQuorum(signal);
+  const q = checkQuorum(signal, strategyConfig);
   if (!q.ok) return { allow: false, reason: q.reason };
   const holding = holdings.find(h => h.symbol === symbol);
   if (!holding || parseFloat(holding.qty) <= 0) {
@@ -126,25 +120,12 @@ async function evaluateStops({ symbol, currentPrice, holding }) {
 
 function getConfig() {
   return {
-    maxPositionPct: MAX_POSITION_PCT,
     maxDailyDrawdownPct: MAX_DAILY_DRAWDOWN_PCT,
-    stopLossPct: STOP_LOSS_PCT,
-    takeProfitPct: TAKE_PROFIT_PCT,
-    maxHoldings: MAX_HOLDINGS,
-    confidenceThreshold: CONFIDENCE_THRESHOLD,
     maxDailyLossUSD: MAX_DAILY_LOSS_USD,
-    maxRiskPerTradeUSD: MAX_RISK_PER_TRADE_USD,
-    minRiskPerTradeUSD: MIN_RISK_PER_TRADE_USD,
-    minDirectionalAgreement: MIN_DIRECTIONAL_AGREEMENT,
-    strategy: 'day-trading',
   };
 }
 
 module.exports = {
-  computeEquity,
-  checkCircuitBreaker,
-  evaluateBuy,
-  evaluateSell,
-  evaluateStops,
-  getConfig,
+  computeEquity, checkCircuitBreaker,
+  evaluateBuy, evaluateSell, evaluateStops, getConfig,
 };

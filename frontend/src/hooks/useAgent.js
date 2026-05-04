@@ -2,8 +2,12 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 const API = '/api';
 
-async function apiPost(path) {
-  const res = await fetch(`${API}${path}`, { method: 'POST' });
+async function apiPost(path, body) {
+  const res = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
   return res.json();
 }
 
@@ -88,5 +92,22 @@ export function useAgent() {
     emergencyPause: wrap('pause', () => apiPost('/agent/emergency-pause')),
     resume: wrap('resume', () => apiPost('/agent/resume')),
     resetCircuitBreaker: wrap('cbReset', () => apiPost('/agent/reset-circuit-breaker')),
+    flatten: wrap('flatten', () => apiPost('/agent/flatten', { reason: 'Manual flatten via dashboard' })),
+    toggleStrategy: async (name, enabled) => {
+      setLoad(`strat:${name}`, true);
+      try {
+        const r = await apiPost(`/agent/strategy/${name}/toggle`, { enabled });
+        await refreshLogs();
+        return r;
+      } finally { setLoad(`strat:${name}`, false); }
+    },
+    setTradingMode: async (mode, confirm) => {
+      setLoad('mode', true);
+      try {
+        const r = await apiPost('/agent/trading-mode', { mode, confirm });
+        await refreshLogs();
+        return r;
+      } finally { setLoad('mode', false); }
+    },
   };
 }
