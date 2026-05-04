@@ -114,6 +114,15 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     confidence: signal?.confidence || 1, reason: `[${strategy}] ${reason}`,
   });
 
+  // REAL-TIME adaptive learning — every closed trade with realized P&L feeds
+  // immediately into the rolling-window stats so the next LLM cycle (and the
+  // next BUY's sizing multiplier) already reflects this outcome. Fire-and-
+  // forget; recordOutcome swallows errors internally so it can never block.
+  if (side === 'SELL' && pnl !== null && Number.isFinite(pnl)) {
+    adaptiveLearning.recordOutcome({ symbol, strategy, pnl, closedAt: new Date() })
+      .catch(() => {});
+  }
+
   return trade;
 }
 
@@ -179,6 +188,8 @@ async function flattenStrategyPositions(strategyName, reason) {
     });
     await db.recordAudit({ event_type: 'FORCE_FLATTEN', symbol: h.symbol, decision: 'SELL',
       payload: { qty, price, pnl, reason, strategy: strategyName } });
+    adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: strategyName, pnl, closedAt: new Date() })
+      .catch(() => {});
     closed++;
   }
   return { closed };
@@ -234,6 +245,8 @@ async function flattenAllPositions(reason = 'Manual flatten') {
       });
       await db.recordAudit({ event_type: 'FORCE_FLATTEN', symbol: h.symbol, decision: 'SELL',
         payload: { qty, price, pnl, reason, strategy: h.strategy } });
+      adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: h.strategy, pnl, closedAt: new Date() })
+        .catch(() => {});
     }
     memoryState.lastFlatten = new Date().toISOString();
     await discordService.sendCircuitBreakerAlert(`Flatten complete — ${holdings.length} positions closed`);
