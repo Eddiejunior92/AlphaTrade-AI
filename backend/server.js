@@ -487,6 +487,98 @@ app.get('/api/llm-weights', async (req, res) => {
 // frequency), current weight-delta state, regime-threshold drift, tick
 // counters. Strictly read-only. The underlying layer cannot bypass any
 // existing safety check — see continuousLearningService.js header.
+// [Data Depth] Earnings-transcript introspection — most-recent quarterly
+// call summary (tone, guidance, capex/buyback, surprises, forward catalysts).
+// Read-only; symbol must be in the combined watchlist. Returns the cached
+// JSON payload + the rendered prompt block for parity with other endpoints.
+app.get('/api/earnings-transcript/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allow = new Set(getCombinedWatchlist());
+    if (!allow.has(symbol)) return res.status(403).json({ error: 'symbol_not_in_watchlist' });
+    // [Data Depth] US-only contract: earnings transcripts are sourced via Grok
+    // and we don't have ASX coverage. Reject ASX symbols here so an ad-hoc
+    // dashboard hit can't drive unintended XAI quota usage.
+    try {
+      if (marketRegistry.getSymbolInfo(symbol).market !== 'US') {
+        return res.status(400).json({ error: 'us_only', hint: 'earnings transcript service does not cover ASX' });
+      }
+    } catch (_) { return res.status(400).json({ error: 'unknown_symbol' }); }
+    const earningsTranscriptService = require('./services/earningsTranscriptService');
+    // Use getOrRefresh so an on-demand call hits Grok if cache is empty/stale.
+    const data = await earningsTranscriptService.getOrRefresh(symbol);
+    if (!data) return res.status(404).json({ error: 'no_transcript', hint: 'XAI key required + first refresh ~2 min after boot' });
+    res.json({ symbol, ...data, prompt: earningsTranscriptService.renderForPrompt(data) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// [Data Depth] Composite per-symbol data-depth view — bundles the four new
+// signal layers (enhanced order flow, expanded options-chain analytics,
+// earnings transcript summary, expanded macro composites) for one ticker.
+// Read-only; intended for the dashboard so users can see exactly what new
+// context the LLMs are now seeing. Falls back gracefully on any missing
+// layer (returns null for that block; never 500s on partial coverage).
+app.get('/api/data-depth/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allow = new Set(getCombinedWatchlist());
+    if (!allow.has(symbol)) return res.status(403).json({ error: 'symbol_not_in_watchlist' });
+    const orderFlowService = require('./services/orderFlowService');
+    const optionsFlowService = require('./services/optionsFlowService');
+    const earningsTranscriptService = require('./services/earningsTranscriptService');
+    const macroFactorService = require('./services/macroFactorService');
+    const alpacaService = require('./services/alpacaService');
+    let orderFlow = null;
+    try {
+      const bars = await alpacaService.getBars(symbol, '1Min', 30);
+      if (Array.isArray(bars) && bars.length >= 25) orderFlow = orderFlowService.analyzeOrderFlow(bars);
+    } catch (_) {}
+    const optsRaw = optionsFlowService.getCachedRaw(symbol);
+    const optionsDepth = optsRaw ? {
+      contracts: optsRaw.contracts, ivAvg: optsRaw.ivAvg, ivRank: optsRaw.ivRank,
+      ivSkew: optsRaw.ivSkew,
+      ivFront: optsRaw.ivFront, ivMid: optsRaw.ivMid, ivBack: optsRaw.ivBack,
+      ivTermSlope: optsRaw.ivTermSlope, ivTermLabel: optsRaw.ivTermLabel,
+      gammaExposureProxy: optsRaw.gammaExposureProxy, gexLabel: optsRaw.gexLabel,
+      pcrRank: optsRaw.pcrRank, pcrSamples: optsRaw.pcrSamples,
+      unusual: optsRaw.unusual, _stale: optsRaw._stale,
+    } : null;
+    let transcript = null;
+    try {
+      const tx = earningsTranscriptService.getCached(symbol);
+      if (tx) transcript = { ...tx, _prompt: earningsTranscriptService.renderForPrompt(tx) };
+    } catch (_) {}
+    let macro = null;
+    try {
+      const m = macroFactorService.getCached();
+      if (m) macro = {
+        composites: m.composites,
+        depthAdditions: {
+          hyIgSpread5d: m.composites?.hyIgSpread5d,
+          btcRet5d: m.composites?.btcRet5d,
+          curveChg1d: m.composites?.curveChg1d,
+        },
+        ts: m.ts,
+      };
+    } catch (_) {}
+    res.json({
+      symbol,
+      ts: Date.now(),
+      orderFlow: orderFlow?.ok ? {
+        cumDelta: orderFlow.cumDelta, cumDeltaSlope: orderFlow.cumDeltaSlope,
+        cumDeltaLabel: orderFlow.cumDeltaLabel,
+        confirmedSweeps: orderFlow.confirmedSweeps,
+        vpin: orderFlow.vpin, vpinLabel: orderFlow.vpinLabel,
+        vwap: orderFlow.vwap, vwapDevPct: orderFlow.vwapDevPct,
+        description: orderFlow.description,
+      } : null,
+      optionsDepth,
+      earningsTranscript: transcript,
+      macro,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/continuous-learning/dashboard', async (_req, res) => {
   try {
     const continuousLearning = require('./services/continuousLearningService');

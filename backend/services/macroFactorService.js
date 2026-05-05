@@ -31,7 +31,9 @@ const PROXIES = {
   gold:       'GLD',
   oil:        'USO',
   commod:     'DBC',
-  credit:     'HYG',
+  credit:     'HYG',     // high-yield (HY) credit
+  ig_credit:  'LQD',     // [Data Depth] investment-grade credit — pair w/ HYG for true HY-IG spread
+  btc:        'BITO',    // [Data Depth] 24/7 crypto risk-appetite proxy
   equity:     'SPY',
   em:         'EEM',
 };
@@ -123,10 +125,24 @@ async function getFactors() {
     // Credit-equity divergence: HYG underperforming SPY = credit warning.
     const hyg5 = factors.credit?.ret5d, spy5 = factors.equity?.ret5d;
     composites.creditEquityDiv5d = (hyg5 != null && spy5 != null) ? +(hyg5 - spy5).toFixed(3) : null;
-    // Risk-on/off composite — equity + EM + credit minus VIX + USD + gold.
+    // [Data Depth] HY-IG credit spread proxy: HYG 5d − LQD 5d. Negative =
+    // HY underperforming IG = credit stress widening. Stronger leading
+    // indicator than HYG alone since IG controls for duration moves.
+    const lqd5 = factors.ig_credit?.ret5d;
+    composites.hyIgSpread5d = (hyg5 != null && lqd5 != null) ? +(hyg5 - lqd5).toFixed(3) : null;
+    // [Data Depth] BTC 24/7 risk-appetite proxy. Crypto trades around the
+    // clock so its 5d return often leads US equity risk on/off shifts.
+    composites.btcRet5d = factors.btc?.ret5d ?? null;
+    // [Data Depth] Refined yield-curve slope: TLT 1d − IEF 1d as today's
+    // marginal change (curveChg5d above is the 5d cumulative).
+    const tlt1 = factors.rate_long?.ret1d, ief1 = factors.rate_mid?.ret1d;
+    composites.curveChg1d = (tlt1 != null && ief1 != null) ? +(tlt1 - ief1).toFixed(3) : null;
+
+    // Risk-on/off composite — equity + EM + credit + BTC minus VIX + USD + gold.
     // Each component is its 5d return in pp; equal-weighted average. Range
-    // typically -3 to +3 pp; positive = risk-on.
-    const riskOnParts = [factors.equity?.ret5d, factors.em?.ret5d, factors.credit?.ret5d];
+    // typically -3 to +3 pp; positive = risk-on. BTC included as 24/7 risk
+    // proxy (only when BITO data is available; null is filtered by avg()).
+    const riskOnParts  = [factors.equity?.ret5d, factors.em?.ret5d, factors.credit?.ret5d, factors.btc?.ret5d];
     const riskOffParts = [factors.vix?.ret5d, factors.usd?.ret5d, factors.gold?.ret5d];
     const onAvg  = avg(riskOnParts);
     const offAvg = avg(riskOffParts);

@@ -182,9 +182,56 @@ function analyzeContracts(contracts, spot) {
     .sort((a, b) => b.vol - a.vol)
     .slice(0, 5);
 
+  // ---- Data Depth additions ----------------------------------------------
+  // IV term structure — bin contracts by DTE buckets, compute avg ATM IV per
+  // bucket. Slope = back-month IV − front-month IV. Positive (contango) is
+  // normal; sharply negative (backwardation) signals near-term fear / event.
+  const dteBuckets = { front: { lo: 0,  hi: 7,  ivs: [] },   // 0-7 d
+                       mid:   { lo: 8,  hi: 30, ivs: [] },   // 8-30 d
+                       back:  { lo: 31, hi: 60, ivs: [] } }; // 31-60 d
+  for (const c of contracts) {
+    if (c.iv == null || Math.abs(c.strike - spot) > spot * 0.025) continue;
+    for (const b of Object.values(dteBuckets)) {
+      if (c.dte >= b.lo && c.dte <= b.hi) { b.ivs.push(c.iv); break; }
+    }
+  }
+  const bucketAvg = b => b.ivs.length ? +(b.ivs.reduce((s, x) => s + x, 0) / b.ivs.length).toFixed(4) : null;
+  const ivFront = bucketAvg(dteBuckets.front);
+  const ivMid   = bucketAvg(dteBuckets.mid);
+  const ivBack  = bucketAvg(dteBuckets.back);
+  // Term-structure slope: back − front; null when either end missing.
+  const ivTermSlope = (ivFront != null && ivBack != null)
+    ? +(ivBack - ivFront).toFixed(4)
+    : null;
+  const ivTermLabel = ivTermSlope == null ? 'n/a'
+    : ivTermSlope <= -0.02 ? 'backwardation (near-term fear/event)'
+    : ivTermSlope <= 0.005 ? 'flat'
+    : ivTermSlope >= 0.04 ? 'steep contango (calm front)'
+    : 'normal contango';
+
+  // Gamma exposure proxy — Σ (sign × OI × strike-proximity weight). Sign
+  // = +1 for calls (dealers typically short), -1 for puts. Proximity weight
+  // = max(0, 1 - |strike-spot|/(0.10*spot)) so only ±10%-of-spot strikes
+  // matter. Positive ⇒ dealers net-long gamma ⇒ they sell rallies / buy
+  // dips ⇒ chop/pinning likely. Negative ⇒ short gamma ⇒ they amplify
+  // moves ⇒ trend-day risk. Pure proxy — no Greeks pulled.
+  let gex = 0;
+  for (const c of contracts) {
+    const prox = Math.max(0, 1 - Math.abs(c.strike - spot) / (spot * 0.10));
+    if (prox <= 0) continue;
+    const sign = c.type === 'call' ? +1 : -1;
+    gex += sign * c.oi * prox;
+  }
+  const gammaExposureProxy = +gex.toFixed(0);
+  const gexLabel = Math.abs(gammaExposureProxy) < 1000 ? 'flat'
+                 : gammaExposureProxy > 0  ? (gammaExposureProxy > 10000 ? 'strong long-gamma (pin/chop bias)' : 'long-gamma (mild pinning)')
+                                           : (gammaExposureProxy < -10000 ? 'strong short-gamma (trend-day risk)' : 'short-gamma (move-amplifying)');
+
   return { ok: true, contracts: contracts.length,
            callVol, putVol, callOi, putOi,
-           pcVolRatio, pcOiRatio, ivAvg, ivSkew, unusual };
+           pcVolRatio, pcOiRatio, ivAvg, ivSkew, unusual,
+           ivFront, ivMid, ivBack, ivTermSlope, ivTermLabel,
+           gammaExposureProxy, gexLabel };
 }
 
 // IV-history persistence + rank computation. Best-effort — failures swallow.
@@ -198,6 +245,44 @@ async function ensureSchema() {
     )
   `);
   await db.query(`CREATE INDEX IF NOT EXISTS iv_history_symbol_date_idx ON iv_history (symbol, as_of_date DESC)`);
+  // Data Depth: rolling P/C-vol-ratio history for percentile ranking.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pcr_history (
+      symbol      TEXT NOT NULL,
+      as_of_date  DATE NOT NULL,
+      pcr_vol     DOUBLE PRECISION NOT NULL,
+      PRIMARY KEY (symbol, as_of_date)
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS pcr_history_symbol_date_idx ON pcr_history (symbol, as_of_date DESC)`);
+}
+
+async function persistPcr(symbol, pcrVol) {
+  if (pcrVol == null) return;
+  await db.query(`
+    INSERT INTO pcr_history (symbol, as_of_date, pcr_vol)
+    VALUES ($1, CURRENT_DATE, $2::float8)
+    ON CONFLICT (symbol, as_of_date) DO UPDATE SET pcr_vol = EXCLUDED.pcr_vol
+  `, [symbol, pcrVol]);
+}
+
+// 60-trading-day rolling percentile rank. 100 = today's PCR is the highest
+// in the window (extreme bearish positioning), 0 = lowest (extreme bullish).
+async function computePcrRank(symbol, pcrToday) {
+  if (pcrToday == null) return { pcrRank: null, samples: 0 };
+  const { rows } = await db.query(`
+    SELECT MIN(pcr_vol)::float8 AS lo, MAX(pcr_vol)::float8 AS hi, COUNT(*)::int AS n
+    FROM (
+      SELECT pcr_vol FROM pcr_history WHERE symbol = $1
+      ORDER BY as_of_date DESC LIMIT 60
+    ) recent
+  `, [symbol]);
+  const r = rows[0];
+  if (!r || !r.n || r.n < 5 || r.hi == null || r.lo == null || r.hi - r.lo < 1e-6) {
+    return { pcrRank: null, samples: r?.n || 0 };
+  }
+  const rank = ((pcrToday - r.lo) / (r.hi - r.lo)) * 100;
+  return { pcrRank: +Math.max(0, Math.min(100, rank)).toFixed(1), samples: r.n };
 }
 
 async function persistIv(symbol, ivAvg) {
@@ -263,13 +348,27 @@ async function refresh(symbol, spotPrice) {
     await persistIv(symbol, m.ivAvg);
     ({ ivRank, samples } = await computeIvRank(symbol, m.ivAvg));
   }
+  // Persist + rank the put/call vol ratio over a rolling 60-day window so we
+  // can flag *historical* extremes (today's PCR vs its own recent range)
+  // rather than just absolute thresholds. Best-effort, swallow on failure.
+  let pcrRank = null, pcrSamples = 0;
+  if (m.pcVolRatio != null) {
+    try {
+      await persistPcr(symbol, m.pcVolRatio);
+      ({ pcrRank, samples: pcrSamples } = await computePcrRank(symbol, m.pcVolRatio));
+    } catch (_) {}
+  }
   const data = { symbol, ok: m.ok, ts: Date.now(), spot,
                  contracts: m.contracts || 0,
                  callVol: m.callVol, putVol: m.putVol,
                  callOi: m.callOi, putOi: m.putOi,
                  pcVolRatio: m.pcVolRatio, pcOiRatio: m.pcOiRatio,
                  ivAvg: m.ivAvg, ivRank, ivRankSamples: samples,
-                 ivSkew: m.ivSkew, unusual: m.unusual || [] };
+                 ivSkew: m.ivSkew, unusual: m.unusual || [],
+                 ivFront: m.ivFront, ivMid: m.ivMid, ivBack: m.ivBack,
+                 ivTermSlope: m.ivTermSlope, ivTermLabel: m.ivTermLabel,
+                 gammaExposureProxy: m.gammaExposureProxy, gexLabel: m.gexLabel,
+                 pcrRank, pcrSamples };
   _cache.set(symbol, { ts: Date.now(), data });
   return data;
 }
@@ -329,6 +428,23 @@ function renderForPrompt(d) {
     const top = d.unusual.slice(0, 3).map(u =>
       `${u.kind} ${u.type} ${u.strike} exp ${u.expiry} (vol ${u.vol}${u.volOiRatio != null ? `, ${u.volOiRatio}× OI` : ''})`);
     parts.push(`  Unusual activity: ${top.join(' | ')}`);
+  }
+  // Data Depth: term structure + gamma exposure + PCR rank lines.
+  const termBits = [];
+  if (d.ivFront != null) termBits.push(`front ${(d.ivFront * 100).toFixed(1)}%`);
+  if (d.ivMid   != null) termBits.push(`mid ${(d.ivMid * 100).toFixed(1)}%`);
+  if (d.ivBack  != null) termBits.push(`back ${(d.ivBack * 100).toFixed(1)}%`);
+  if (termBits.length && d.ivTermSlope != null) {
+    parts.push(`  IV term structure: ${termBits.join(' / ')} → slope ${(d.ivTermSlope * 100).toFixed(1)}pp (${d.ivTermLabel}).`);
+  }
+  if (d.gammaExposureProxy != null && Math.abs(d.gammaExposureProxy) >= 1000) {
+    parts.push(`  Dealer gamma proxy: ${d.gammaExposureProxy >= 0 ? '+' : ''}${d.gammaExposureProxy.toLocaleString()} (${d.gexLabel}).`);
+  }
+  if (d.pcrRank != null) {
+    let pcrTag = '';
+    if (d.pcrRank >= 90)      pcrTag = ' — 60-day extreme bearish positioning (potential contrarian setup)';
+    else if (d.pcrRank <= 10) pcrTag = ' — 60-day extreme bullish positioning (frothiness warning)';
+    parts.push(`  P/C rank: ${d.pcrRank.toFixed(0)}/100 over 60 sessions${pcrTag}.`);
   }
   return parts.join('\n');
 }

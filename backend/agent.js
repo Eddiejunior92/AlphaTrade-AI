@@ -37,6 +37,7 @@ const propagationService = require('./services/propagationService');
 const feedbackService = require('./services/feedbackService');
 const marketPretrainService = require('./services/marketPretrainService');
 const earningsSignalService = require('./services/earningsSignalService');
+const earningsTranscriptService = require('./services/earningsTranscriptService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
 
@@ -731,11 +732,26 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     }
   } catch (_) {}
 
+  // [Data Depth] Earnings-transcript summary block — Grok-generated 4-6
+  // bullet structured summary of the most recent quarterly call (tone,
+  // guidance, capex, Q&A surprises, forward catalysts). Cached per symbol
+  // 30 days; cache-only read here so the per-symbol cycle never blocks on
+  // a Grok call. The boot scheduler refreshes weekly + before earnings.
+  // US-only (no transcripts for ASX in our pipeline).
+  let earningsTranscript = null;
+  if (!isAsxSymbol) {
+    try {
+      const tx = earningsTranscriptService.getCached(symbol);
+      if (tx) earningsTranscript = earningsTranscriptService.renderForPrompt(tx);
+    } catch (_) {}
+  }
+
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
+    earningsTranscript,
     regimeContext, knowledgeContext, macroForecast, scenarioSim,
     // Dynamic-weighting + meta-reasoner context. Both are strictly
     // informational; raw quorum + confidence gate retain full veto.
@@ -1357,6 +1373,50 @@ function scheduleOptionsFlowRefresh() {
   }, 30 * 60 * 1000);
 }
 
+// [Data Depth] Earnings-transcript refresh — quarterly cadence with a
+// near-earnings sweep. Boots warm a small batch on first start; subsequent
+// scheduled runs target stale entries + names within ~5 days of earnings.
+// US-only (we don't have ASX transcript coverage).
+let earningsTranscriptHandle = null;
+function scheduleEarningsTranscriptRefresh() {
+  if (earningsTranscriptHandle) clearInterval(earningsTranscriptHandle);
+  // Run every 12h during US market hours. Each call hits Grok serially with
+  // a small inter-symbol delay (250ms) inside refreshBatch.
+  earningsTranscriptHandle = setInterval(async () => {
+    if (!memoryState.marketOpen) return;
+    try {
+      const usSymbols = WATCHLIST.filter(s => {
+        try { return marketRegistry.getSymbolInfo(s).market === 'US'; }
+        catch (_) { return false; }
+      });
+      // Pull near-earnings days from fundamentals so we can force-refresh
+      // pre-print. fundamentalsService stores `earnings_next_date`.
+      const nearLookup = {};
+      for (const s of usSymbols) {
+        try {
+          const f = fundamentalsService.getCached(s);
+          const dt = f?.earnings_next_date;
+          if (dt) {
+            const days = Math.floor((new Date(dt).getTime() - Date.now()) / 86400000);
+            if (Number.isFinite(days)) nearLookup[s] = days;
+          }
+        } catch (_) {}
+      }
+      // Refresh in two passes: imminent earnings first (within 5d), then the
+      // rest. Limits: at most 12 symbols per scheduled tick to bound XAI
+      // usage. Stale entries beyond that wait for the next tick.
+      const imminent = usSymbols.filter(s => Number.isFinite(nearLookup[s]) && nearLookup[s] >= 0 && nearLookup[s] < 5);
+      const others = usSymbols.filter(s => !imminent.includes(s));
+      const batch = [...imminent, ...others].slice(0, 12);
+      for (const s of batch) {
+        try {
+          await earningsTranscriptService.getOrRefresh(s, { nearEarningsDays: nearLookup[s] });
+        } catch (_) {}
+      }
+    } catch (e) { console.error('[EarningsTranscript] Batch refresh failed:', e.message); }
+  }, 12 * 60 * 60 * 1000);
+}
+
 // --- Macro-forecast refresh -----------------------------------------------
 // Cross-asset factor snapshot is refreshed every 60 minutes during US market
 // hours. Macro signals move on the daily timescale, so an hourly cadence is
@@ -1582,6 +1642,27 @@ setTimeout(() => {
     .catch(e => console.error('[Macro] Startup forecast failed:', e.message));
 }, 75_000);
 scheduleMacroForecastRefresh();
+
+// [Data Depth] Earnings-transcript warm-up — delayed 105s. Initial batch
+// targets the first 6 US watchlist symbols only so we don't burn a chunk
+// of XAI quota at boot; the 12h scheduler picks up the rest opportunistically.
+setTimeout(() => {
+  (async () => {
+    try {
+      const usSyms = WATCHLIST.filter(s => {
+        try { return marketRegistry.getSymbolInfo(s).market === 'US'; }
+        catch (_) { return false; }
+      }).slice(0, 6);
+      let warmed = 0;
+      for (const s of usSyms) {
+        try { if (await earningsTranscriptService.getOrRefresh(s)) warmed += 1; }
+        catch (_) {}
+      }
+      console.log(`[EarningsTranscript] Startup warmed ${warmed}/${usSyms.length} symbols`);
+    } catch (e) { console.error('[EarningsTranscript] Startup failed:', e.message); }
+  })();
+}, 105_000);
+scheduleEarningsTranscriptRefresh();
 
 // Causal-inference + counterfactual warm-up — delayed 90s so the audit_log
 // + trades joins don't pile on with the other startup queries. Runs once at
