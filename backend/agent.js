@@ -38,6 +38,14 @@ const feedbackService = require('./services/feedbackService');
 const marketPretrainService = require('./services/marketPretrainService');
 const earningsSignalService = require('./services/earningsSignalService');
 const earningsTranscriptService = require('./services/earningsTranscriptService');
+// [Capital & Risk Capacity / Upgrade #3] — purely additive prompt context.
+// All three layers below feed the LLM ensemble informational blocks; the
+// existing safety stack (quorum, 75-85% gate, $100/day loss budget, 5%
+// drawdown breaker, kill switch, sizing math, no-averaging-in, trailing
+// stops) is unchanged and retains full veto power.
+const varStressService = require('./services/varStressService');
+const dynamicHedgingService = require('./services/dynamicHedgingService');
+const liquidityService = require('./services/liquidityService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
 
@@ -746,12 +754,34 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     } catch (_) {}
   }
 
+  // [Capital & Risk Capacity] Three new prompt-context blocks. All cache-only
+  // reads (refreshers run on independent schedulers) so a slow downstream
+  // never blocks the trading cycle. Strictly informational — no execution
+  // path consumes any of these values.
+  let varBlock = null;
+  let hedgeBlock = null;
+  let liquidityLine = null;
+  try {
+    const v = varStressService.getCached();
+    if (v) varBlock = varStressService.renderForPrompt(v);
+  } catch (_) {}
+  try {
+    const h = dynamicHedgingService.getCached();
+    if (h) hedgeBlock = dynamicHedgingService.renderForPrompt(h);
+  } catch (_) {}
+  try {
+    const liq = liquidityService.getCached(symbol);
+    if (liq) liquidityLine = liquidityService.renderForPrompt(liq);
+  } catch (_) {}
+
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
     earningsTranscript,
+    // [Capital & Risk Capacity] new prompt-context blocks
+    varStress: varBlock, dynamicHedging: hedgeBlock, liquidityProfile: liquidityLine,
     regimeContext, knowledgeContext, macroForecast, scenarioSim,
     // Dynamic-weighting + meta-reasoner context. Both are strictly
     // informational; raw quorum + confidence gate retain full veto.
@@ -1664,6 +1694,88 @@ setTimeout(() => {
 }, 105_000);
 scheduleEarningsTranscriptRefresh();
 
+// [Capital & Risk Capacity / Upgrade #3] Three independent schedulers, all
+// purely additive prompt context. Failures swallow to null — no scheduler
+// failure can crash the trading loop or bypass safety rails.
+//
+// VaR + stress + dynamic-hedging refresh: portfolio-level, every 30 min during
+// market hours. Pulls current holdings, current USD prices, current portfolio
+// equity + daily loss budget, and computes:
+//   • Historical VaR (1d, 95%/99%) from synthetic portfolio returns
+//   • Monte-Carlo VaR (5000 sims, normal-fit μ/σ)
+//   • Stress scenarios (market crash, vol spike, rates up, crypto crash, etc.)
+//   • Dynamic hedging suggestions derived from VaR + concentration + regime
+let varHedgingHandle = null;
+async function refreshVarAndHedging() {
+  try {
+    const allH = await db.getHoldings();
+    const pmap = await buildPriceLookup(allH);
+    const { equity, portfolio } = await riskManager.computeEquity(allH, pmap.usdLookup);
+    const dailyLossBudget = riskManager.effectiveDailyLossBudget(portfolio);
+    const varSnap = await varStressService.refresh(allH, pmap.usdLookup, equity, dailyLossBudget);
+    const macroData = (() => { try { return macroForecastService.getCachedRaw?.(); } catch (_) { return null; } })();
+    const macroRegime = macroData?.current?.regime || macroData?.regime || null;
+    // Realised intraday loss utilization vs the same daily budget. Used to
+    // surface the "we're already deep into the budget" advisory line.
+    const dayStart = parseFloat(portfolio?.day_start_equity || equity);
+    const realisedLossUSD = Math.max(0, dayStart - equity);
+    const lossUtil = dailyLossBudget > 0 ? +(realisedLossUSD / dailyLossBudget * 100).toFixed(1) : null;
+    await dynamicHedgingService.refresh(allH, pmap.usdLookup, varSnap, macroRegime, lossUtil);
+  } catch (e) { console.error('[VaRStress/Hedging] refresh failed:', e.message); }
+}
+function scheduleVarHedgingRefresh() {
+  if (varHedgingHandle) clearInterval(varHedgingHandle);
+  varHedgingHandle = setInterval(() => {
+    if (!memoryState.marketOpen) return;
+    refreshVarAndHedging();
+  }, 30 * 60 * 1000);
+}
+
+// Liquidity refresh: per-symbol ADV + spread proxy. Computed from
+// already-cached daily bars (`historical_intelligence`), so no extra API
+// calls. 4-hour cadence — ADV moves slowly. 12 symbols/tick to bound work.
+let liquidityHandle = null;
+let liquidityCursor = 0;
+function scheduleLiquidityRefresh() {
+  if (liquidityHandle) clearInterval(liquidityHandle);
+  liquidityHandle = setInterval(async () => {
+    if (!memoryState.marketOpen) return;
+    try {
+      const batch = [];
+      for (let i = 0; i < 12 && liquidityCursor < WATCHLIST.length; i++, liquidityCursor++) {
+        batch.push(WATCHLIST[liquidityCursor]);
+      }
+      if (liquidityCursor >= WATCHLIST.length) liquidityCursor = 0;
+      if (batch.length) await liquidityService.refreshBatch(batch);
+    } catch (e) { console.error('[Liquidity] Batch refresh failed:', e.message); }
+  }, 60 * 60 * 1000); // 1h tick × 12 syms = full 30 syms in ~3h, refreshed every ~6-8h
+}
+
+// Warm-ups: VaR/hedging (delayed 120s — needs holdings + price lookup +
+// historical intelligence to be loaded), liquidity (delayed 135s).
+setTimeout(() => {
+  refreshVarAndHedging()
+    .then(() => {
+      const v = varStressService.getCached();
+      if (v?.ok) {
+        const h95 = v.historicalVaR?.confidence_95?.lossUSD;
+        console.log(`[VaRStress] Startup snapshot: 1d 95% VaR -$${h95?.toFixed(0) ?? '?'}, util ${v.varUtilizationPct ?? '?'}%, contributors ${v.contributors}`);
+      } else {
+        console.log(`[VaRStress] Startup snapshot: ${v?.reason || 'unavailable'}`);
+      }
+    })
+    .catch(e => console.error('[VaRStress] Startup failed:', e.message));
+}, 120_000);
+scheduleVarHedgingRefresh();
+
+setTimeout(async () => {
+  try {
+    const r = await liquidityService.refreshBatch(WATCHLIST.slice(0, 12));
+    console.log(`[Liquidity] Startup batch refreshed ${r.refreshed}/${r.total}`);
+  } catch (e) { console.error('[Liquidity] Startup failed:', e.message); }
+}, 135_000);
+scheduleLiquidityRefresh();
+
 // Causal-inference + counterfactual warm-up — delayed 90s so the audit_log
 // + trades joins don't pile on with the other startup queries. Runs once at
 // startup, then every 30 min. Both refreshes are independent, mutually
@@ -1804,4 +1916,8 @@ module.exports = {
   emergencyPause, resetCircuitBreaker, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, WATCHLIST,
+  // Exposed for the /api/risk-capacity endpoint so it can compute on-demand
+  // pre-warmup. Read-only USD price-lookup builder; identical logic to the
+  // per-cycle path. Does NOT touch trading state.
+  buildPriceLookup,
 };

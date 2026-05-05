@@ -579,6 +579,64 @@ app.get('/api/data-depth/:symbol', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// [Capital & Risk Capacity / Upgrade #3] Portfolio-level VaR + stress-test +
+// dynamic-hedging snapshot. Strictly read-only; the underlying layers cannot
+// bypass any existing safety check. Returns the fresh refresh on demand if
+// no cache is present yet. The dynamic-hedging block is computed on-the-fly
+// off the same VaR snapshot so the two are always self-consistent.
+app.get('/api/risk-capacity', async (_req, res) => {
+  try {
+    const varStressService = require('./services/varStressService');
+    const dynamicHedgingService = require('./services/dynamicHedgingService');
+    const macroForecastService = require('./services/macroForecastService');
+    const riskManager = require('./services/riskManager');
+    const db = require('./services/db');
+    let varSnap = varStressService.getCachedRaw();
+    let hedgeSnap = dynamicHedgingService.getCachedRaw();
+    if (!varSnap || varSnap._stale) {
+      // Fall back to an on-demand refresh so the dashboard isn't empty pre-warmup.
+      const allH = await db.getHoldings();
+      const agent = require('./agent');
+      const pmap = await agent.buildPriceLookup(allH);
+      const { equity, portfolio } = await riskManager.computeEquity(allH, pmap.usdLookup);
+      const dailyLossBudget = riskManager.effectiveDailyLossBudget(portfolio);
+      varSnap = await varStressService.refresh(allH, pmap.usdLookup, equity, dailyLossBudget);
+      const macroData = macroForecastService.getCachedRaw?.();
+      const macroRegime = macroData?.current?.regime || macroData?.regime || null;
+      const dayStart = parseFloat(portfolio?.day_start_equity || equity);
+      const realisedLossUSD = Math.max(0, dayStart - equity);
+      const lossUtil = dailyLossBudget > 0 ? +(realisedLossUSD / dailyLossBudget * 100).toFixed(1) : null;
+      hedgeSnap = await dynamicHedgingService.refresh(allH, pmap.usdLookup, varSnap, macroRegime, lossUtil);
+    }
+    res.json({
+      ts: Date.now(),
+      varStress: varSnap,
+      dynamicHedging: hedgeSnap,
+      varPrompt: varStressService.renderForPrompt(varSnap),
+      hedgingPrompt: dynamicHedgingService.renderForPrompt(hedgeSnap),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// [Capital & Risk Capacity] Per-symbol liquidity profile — ADV (shares + USD),
+// spread proxy in bps, prudent max position size at 0.5% of $ADV. Whitelist-
+// gated. Read-only and advisory; the existing riskManager sizing math
+// (`evaluateBuy()`) is unchanged and retains full control over the actual
+// quantity executed.
+app.get('/api/liquidity/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allow = new Set(getCombinedWatchlist());
+    if (!allow.has(symbol)) return res.status(403).json({ error: 'symbol_not_in_watchlist' });
+    const liquidityService = require('./services/liquidityService');
+    const data = await liquidityService.getOrRefresh(symbol);
+    if (!data?.ok) return res.status(404).json({ error: data?.reason || 'unavailable', symbol });
+    const proposedUSDRaw = req.query.proposedUSD ? Number(req.query.proposedUSD) : null;
+    const proposedUSD = Number.isFinite(proposedUSDRaw) && proposedUSDRaw > 0 ? proposedUSDRaw : null;
+    res.json({ ...data, prompt: liquidityService.renderForPrompt(data, proposedUSD) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/continuous-learning/dashboard', async (_req, res) => {
   try {
     const continuousLearning = require('./services/continuousLearningService');
