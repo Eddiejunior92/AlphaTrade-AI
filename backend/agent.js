@@ -34,6 +34,7 @@ const safetySuggestion = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
 const feedbackService = require('./services/feedbackService');
+const marketPretrainService = require('./services/marketPretrainService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -216,6 +217,13 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     // symbol/strategy starts with a fresh "log on first decision" memo
     // instead of inheriting the closed trade's last action.
     try { rlExecution.clearAuditMemo(symbol, strategy); } catch (_) {}
+    // Self-Supervised Market Pre-Training fine-tune — Bayesian-update the
+    // codeword's regime distribution with this realised trade outcome.
+    // Effective-sample-size 1 so own trades cannot dominate the prior.
+    // Best-effort; silent no-op on any failure.
+    marketPretrainService.applyTradeFineTune({
+      symbol, strategy, exitPrice: parseFloat(price), exitAt: new Date(),
+    }).catch(() => {});
   }
 
   return trade;
@@ -695,6 +703,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   // CURRENTLY in the conditioning state. Strictly informational priors.
   let propagationContext = null;
   try { propagationContext = propagationService.renderForPrompt(symbol); } catch (_) {}
+  // Self-Supervised Market Pre-Training prior — pre-trained on years of
+  // historical daily bars, fine-tuned on Alpha's own trade outcomes. Pure
+  // informational prompt block; quorum + confidence gate retain full veto.
+  let marketPriorContext = null;
+  try { marketPriorContext = await marketPretrainService.renderForPrompt(symbol); } catch (_) {}
   // Human-in-the-Loop feedback — pre-rendered summary of recent USER ratings
   // + the bounded confidence-shrinkage factor for this (strategy, regime,
   // market) bucket. Both strictly informational/tightening; the shrinkage
@@ -733,6 +746,8 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // Human-in-the-Loop layer: prompt summary + bounded shrinkage factor.
     // Both can ONLY tighten the existing gate, never relax it.
     feedbackContext, feedbackShrinkage,
+    // Self-Supervised Market Pre-Training prior. Strictly informational.
+    marketPriorContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -1641,6 +1656,23 @@ setTimeout(async () => {
 setInterval(() => {
   strategyDiscoveryService.refresh().catch(() => {});
 }, 4 * 60 * 60 * 1000);
+
+// Self-Supervised Market Pre-Training warm-up. Mines years of historical
+// daily bars from Alpaca for the recently-active US watchlist, builds the
+// codeword → next-bar regime distribution table, then runs WEEKLY thereafter.
+// Heavy + slow (multi-symbol Alpaca pagination) so this is delayed to +240s
+// and runs only after the lighter learning layers have warmed. Failures
+// are logged + swallowed — the service produces no prompt block when cold.
+setTimeout(async () => {
+  try {
+    const r = await marketPretrainService.runPretraining({ force: true });
+    if (r?.error) console.error('[MarketPretrain] Startup pre-training failed:', r.error);
+    else console.log(`[MarketPretrain] Startup pre-training: learned ${r?.codewordsLearned ?? 0} codewords from ${r?.totalContexts ?? 0} contexts across ${r?.symbolsScanned ?? 0} symbols${r?.reason ? ` (${r.reason})` : ''}`);
+  } catch (e) { console.error('[MarketPretrain] Startup pre-training failed:', e.message); }
+}, 240_000);
+setInterval(() => {
+  marketPretrainService.runPretraining().catch(() => {});
+}, 7 * 24 * 60 * 60 * 1000);
 
 (async () => {
   try {

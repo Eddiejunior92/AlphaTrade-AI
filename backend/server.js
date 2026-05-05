@@ -341,6 +341,7 @@ const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
 const feedbackService = require('./services/feedbackService');
 const strategyDiscoveryService = require('./services/strategyDiscoveryService');
+const marketPretrainService = require('./services/marketPretrainService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -687,6 +688,19 @@ app.delete('/api/strategy-overlays/:id', requireOperator, async (req, res) => {
 });
 app.post('/api/strategy-discovery/refresh', requireOperator, async (_req, res) => {
   try { res.json({ ok: true, ...(await strategyDiscoveryService.refresh({ force: true })) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Self-Supervised Market Pre-Training endpoints. GET is public (read-only
+// summary of learned codewords + last-pretrain meta). POST /refresh is
+// operator-gated because it triggers many Alpaca API calls (paginated
+// multi-year daily bars per symbol) and rewrites the codeword table.
+app.get('/api/market-pretrain/summary', async (_req, res) => {
+  try { res.json(await marketPretrainService.getSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/market-pretrain/refresh', requireOperator, async (_req, res) => {
+  try { res.json({ ok: true, ...(await marketPretrainService.runPretraining({ force: true })) }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

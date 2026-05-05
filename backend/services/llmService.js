@@ -38,7 +38,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
@@ -88,6 +88,10 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // for the symbol's (market × sector) bucket where the source bucket is
   // CURRENTLY in the conditioning state. Strictly informational priors.
   const propBlock = propagationContext ? `\n${propagationContext}\n` : '';
+  // Self-Supervised Market Pre-Training prior — pre-trained on years of
+  // historical daily bars and fine-tuned on Alpha's own trade outcomes.
+  // STRICTLY informational; quorum + confidence gate retain full veto.
+  const marketPriorBlock = marketPriorContext ? `\n${marketPriorContext}\n` : '';
   // Human-in-the-Loop feedback block — pre-rendered summary of recent USER
   // feedback for this (strategy, regime, market) bucket. Strictly informational
   // priors; raw quorum + confidence gate retain full veto power.
@@ -96,7 +100,7 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // (sector peers, earnings track, valuation, macro, major events).
   // Informational; never overrides quorum/gate/sizing.
   const knowledgeBlock = knowledgeContext ? `\n${knowledgeContext}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${causalBlock}${cfBlock}${expBlock}${propBlock}${feedbackBlock}${knowledgeBlock}`;
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${causalBlock}${cfBlock}${expBlock}${propBlock}${marketPriorBlock}${feedbackBlock}${knowledgeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -350,7 +354,7 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, feedbackShrinkage }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, feedbackShrinkage, marketPriorContext }) {
   // ---------------------------------------------------------------------
   // STEP 1 — Resolve dynamic per-model weights for this (strategy, regime,
   // market) context. Cold-start safe (uniform 1.0). Failures degrade to
@@ -374,7 +378,7 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
   // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
   // ---------------------------------------------------------------------
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

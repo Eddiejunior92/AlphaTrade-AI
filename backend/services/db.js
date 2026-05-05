@@ -377,6 +377,44 @@ async function ensureSchema() {
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS active_overlays_ctx_uniq
                ON active_overlays (rule_key, strategy, regime, market)`);
 
+  // Self-Supervised Market Pre-Training Layer.
+  // `market_pretrain_codewords` — one row per discrete 5-bar context codeword
+  // (e.g. 'U_L_F' = up-trend × low-vol × flat-momentum). Each row stores
+  // the SSL-mined next-bar regime distribution as raw COUNTS (not pre-
+  // normalised, so fine-tune updates compose correctly with re-training).
+  // `pt_*` columns hold the pre-trained counts mined from years of historical
+  // bars; `ft_*` columns hold the cumulative fine-tune updates from Alpha's
+  // own closed trades (effective-sample-size 1 per trade so a single trade
+  // never drowns the prior). Re-training preserves the `ft_*` columns.
+  await query(`
+    CREATE TABLE IF NOT EXISTS market_pretrain_codewords (
+      codeword       VARCHAR(16) PRIMARY KEY,
+      n_pretrain     INTEGER NOT NULL DEFAULT 0,
+      pt_up_strong   INTEGER NOT NULL DEFAULT 0,
+      pt_up_weak     INTEGER NOT NULL DEFAULT 0,
+      pt_flat        INTEGER NOT NULL DEFAULT 0,
+      pt_down_weak   INTEGER NOT NULL DEFAULT 0,
+      pt_down_strong INTEGER NOT NULL DEFAULT 0,
+      n_finetune     NUMERIC(10,2) NOT NULL DEFAULT 0,
+      ft_up_strong   NUMERIC(10,2) NOT NULL DEFAULT 0,
+      ft_up_weak     NUMERIC(10,2) NOT NULL DEFAULT 0,
+      ft_flat        NUMERIC(10,2) NOT NULL DEFAULT 0,
+      ft_down_weak   NUMERIC(10,2) NOT NULL DEFAULT 0,
+      ft_down_strong NUMERIC(10,2) NOT NULL DEFAULT 0,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS market_pretrain_meta (
+      id                 INTEGER PRIMARY KEY,
+      last_pretrain_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      corpus_size        INTEGER NOT NULL DEFAULT 0,
+      year_span          INTEGER NOT NULL DEFAULT 0,
+      codewords_learned  INTEGER NOT NULL DEFAULT 0,
+      symbols_scanned    INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`
