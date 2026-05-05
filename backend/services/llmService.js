@@ -36,13 +36,14 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
   const flowLine = orderFlow?.description ? `\n${orderFlow.description}\n` : '';
   const optsLine = optionsActivity ? `\n${optionsActivity}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}`;
+  const earnLine = earningsSignal ? `\n${earningsSignal}\n` : '';
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${earnLine}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -86,8 +87,11 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
       const nr = patterns.nearestResistance ? `$${patterns.nearestResistance.price} (${patterns.nearestResistance.distPct}% above)` : 'n/a';
       const sup = (patterns.supports || []).slice(0, 2).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none';
       const res = (patterns.resistances || []).slice(0, 2).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none';
+      const vwapLine = patterns.vwap != null
+        ? `\n  VWAP: $${patterns.vwap} (${patterns.vwapState}, ${patterns.vwapDevPct >= 0 ? '+' : ''}${patterns.vwapDevPct}%)`
+        : '';
       dayPatternsBlock = `Intraday structure (last ~60 min, 1-min bars):
-  Trend: ${patterns.trend} (slope ${patterns.slopePctPerBar}%/bar) · Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'}
+  Trend: ${patterns.trend} (slope ${patterns.slopePctPerBar}%/bar) · Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'}${vwapLine}
   Structure: HH=${s.higherHighs} HL=${s.higherLows} LH=${s.lowerHighs} LL=${s.lowerLows}
   Recent swing highs: ${(s.recentHighs || []).map(p => '$' + p).join(' → ') || 'n/a'}
   Recent swing lows:  ${(s.recentLows || []).map(p => '$' + p).join(' → ') || 'n/a'}
@@ -153,9 +157,12 @@ RATIONALE: <one or two sentences citing the strongest setup or signal>`;
     const res = (patterns.resistances || []).map(x => `$${x.price}(×${x.touches})`).join(', ') || 'none identified';
     const ns = patterns.nearestSupport ? `$${patterns.nearestSupport.price} (${patterns.nearestSupport.distPct}% below)` : 'n/a';
     const nr = patterns.nearestResistance ? `$${patterns.nearestResistance.price} (${patterns.nearestResistance.distPct}% above)` : 'n/a';
+    const swingVwapLine = patterns.vwap != null
+      ? `\n  VWAP: $${patterns.vwap} (${patterns.vwapState}, ${patterns.vwapDevPct >= 0 ? '+' : ''}${patterns.vwapDevPct}%)`
+      : '';
     patternsBlock = `Pattern analysis (computed from 60×15-min bars):
   Trend: ${patterns.trend} (slope ${patterns.slopePctPerBar}%/bar)
-  Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'} ($${patterns.sma20}) · Above SMA50: ${patterns.aboveSma50 ? 'yes' : 'no'} ($${patterns.sma50})
+  Above SMA20: ${patterns.aboveSma20 ? 'yes' : 'no'} ($${patterns.sma20}) · Above SMA50: ${patterns.aboveSma50 ? 'yes' : 'no'} ($${patterns.sma50})${swingVwapLine}
   Structure: higherHighs=${s.higherHighs} higherLows=${s.higherLows} lowerHighs=${s.lowerHighs} lowerLows=${s.lowerLows}
   Recent swing highs: ${(s.recentHighs || []).map(p => '$' + p).join(' → ') || 'n/a'}
   Recent swing lows:  ${(s.recentLows || []).map(p => '$' + p).join(' → ') || 'n/a'}
@@ -290,9 +297,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

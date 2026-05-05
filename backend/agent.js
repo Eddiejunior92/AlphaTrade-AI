@@ -15,6 +15,7 @@ const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
 const optionsActivityService = require('./services/optionsActivityService');
+const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
 
@@ -356,11 +357,22 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     if (opt) optionsActivity = optionsActivityService.renderForPrompt(opt);
   } catch (_) {}
 
+  // Earnings signal — derived from cached fundamentals (no extra API). PEAD
+  // bias + pre-earnings blackout flag for both day and swing strategies.
+  let earningsSignal = null;
+  try {
+    const fund = fundamentals || fundamentalsService.getCached(symbol);
+    if (fund) {
+      const sig = earningsSignalService.analyzeEarningsSignal(fund);
+      earningsSignal = earningsSignalService.renderForPrompt(sig);
+    }
+  } catch (_) {}
+
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
-    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity,
+    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, earningsSignal,
   });
 
   await db.recordAudit({

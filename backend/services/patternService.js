@@ -140,6 +140,28 @@ function analyzePatterns(bars) {
   const resistanceDistPct = nearestResistance
     ? +(((nearestResistance.price - last) / last) * 100).toFixed(2) : null;
 
+  // VWAP — typical-price * volume, summed over the bar window. Useful as the
+  // intraday institutional reference; vwapState tells the LLM whether we're
+  // currently reclaiming or losing it.
+  let pv = 0, vv = 0;
+  for (const b of bars) {
+    const v = +b.v || 0;
+    if (v <= 0) continue;
+    const typical = ((+b.h || 0) + (+b.l || 0) + (+b.c || 0)) / 3;
+    pv += typical * v;
+    vv += v;
+  }
+  const vwap = vv > 0 ? pv / vv : null;
+  const vwapDevPct = vwap ? +(((last - vwap) / vwap) * 100).toFixed(2) : null;
+  let vwapState = 'n/a';
+  if (vwap != null && vwapDevPct != null) {
+    if (Math.abs(vwapDevPct) < 0.05) vwapState = 'at vwap';
+    else if (vwapDevPct > 0.5) vwapState = 'extended above vwap';
+    else if (vwapDevPct > 0) vwapState = 'above vwap';
+    else if (vwapDevPct < -0.5) vwapState = 'extended below vwap';
+    else vwapState = 'below vwap';
+  }
+
   return {
     ok: true,
     trend,
@@ -148,6 +170,9 @@ function analyzePatterns(bars) {
     sma50: sma50 ? +sma50.toFixed(2) : null,
     aboveSma20: above20,
     aboveSma50: above50,
+    vwap: vwap != null ? +vwap.toFixed(2) : null,
+    vwapDevPct,
+    vwapState,
     structure: {
       higherHighs, higherLows, lowerHighs, lowerLows,
       recentHighs: recentHighs.map(p => +p.price.toFixed(2)),
