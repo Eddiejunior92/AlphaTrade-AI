@@ -70,11 +70,60 @@ const perfMetrics = {
   lastCycleFinishedAt: null,
   strategyDurationsMs: {},  // { day:[…], swing:[…], asx_swing:[…] } — last 60 each
   ensembleCalls: 0,         // calls that actually went to llmService
-  ensembleSkipped: 0,       // reserved for future skip-cache layer (currently always 0)
+  ensembleSkipped: 0,       // skip-cache reuse count (HOLD passthroughs)
+  ensembleEscalated: 0,     // calls that included the premium tier
   watchdogResets: 0,
   startedAt: Date.now(),
 };
 function _pushBounded(arr, val, cap = 60) { arr.push(val); if (arr.length > cap) arr.shift(); }
+
+// =============================================================================
+// LLM cost-optimisation: tier routing + skip cache
+// =============================================================================
+// At 20s day cadence the ensemble would be called ~180×/hour/symbol. Two
+// guards keep cost flat:
+//
+// 1) TIER ROUTING (computeRoutingReasons) — most cycles run the cheap tier
+//    (Gemini Flash + Grok Fast, 2 voters). We escalate to the full 4-voter
+//    ensemble (adds Claude 3.7 + GPT-4o) ONLY when the decision is
+//    materially more important: held position, non-day strategy, vol/news
+//    regimes, strong tactical setup, strong news, or fresh breakout.
+//
+// 2) SKIP CACHE (_llmSkipCache) — when the previous decision was HOLD AND
+//    we hold no position AND price has barely drifted AND we're inside the
+//    skip window, we reuse the cached HOLD verbatim and don't call the LLM
+//    at all. NEVER applied to BUY/SELL signals (entries/exits must always
+//    re-evaluate fresh) and NEVER applied when a position is open.
+//
+// SAFETY: the quorum rule, the 75-85% confidence gate, the daily-loss
+// budget, the circuit breaker, the kill switch, and riskManager sizing are
+// ALL UNCHANGED. requiredValid scales proportionally with pool size inside
+// llmService so the gate never gets easier to clear.
+const LLM_SKIP_TTL_MS = parseInt(process.env.LLM_SKIP_TTL_SECONDS || '60') * 1000;
+const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '15');
+const _llmSkipCache = new Map(); // `${strategy}:${symbol}` → { signal, ts, price }
+
+function computeRoutingReasons({ holding, strategyName, regime, intraday, newsSentiment, patterns }) {
+  const reasons = [];
+  if (holding) reasons.push('holding');
+  // Swing + ASX swing run every 5 min — low frequency, so always escalate.
+  if (strategyName && strategyName !== 'day') reasons.push(`strategy:${strategyName}`);
+  // regime is an object {primary, tags, confidence, metrics} from
+  // regimeService.classifyRegime — pull the primary label string. Defensive
+  // handling: accept either a string (legacy) or an object.
+  const regimePrimary = typeof regime === 'string' ? regime : regime?.primary;
+  if (regimePrimary === 'high_vol' || regimePrimary === 'news_driven' || regimePrimary === 'low_liquidity') {
+    reasons.push(`regime:${regimePrimary}`);
+  }
+  if (intraday?.dipBuy?.score >= 4) reasons.push('strong_dip_buy');
+  if (intraday?.profitTake) reasons.push('profit_take_setup');
+  const newsScore = Number(newsSentiment?.score);
+  if (Number.isFinite(newsScore) && Math.abs(newsScore) >= 0.5) reasons.push('strong_news');
+  if (patterns?.breakout && patterns.breakout !== 'none' && patterns.breakout !== 'inside') {
+    reasons.push(`breakout:${patterns.breakout}`);
+  }
+  return reasons;
+}
 
 // [Upgrade #4 / Scale & Speed] Execution mutex.
 // -----------------------------------------------------------------------------
@@ -822,29 +871,77 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     if (liq) liquidityLine = liquidityService.renderForPrompt(liq);
   } catch (_) {}
 
-  perfMetrics.ensembleCalls++;
-  const signal = await llmService.getEnsembleDecision({
-    symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-    patterns, fundamentals, indicators, intraday, historical,
-    strategyName: sc.name, premarket,
-    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
-    earningsTranscript,
-    // [Capital & Risk Capacity] new prompt-context blocks
-    varStress: varBlock, dynamicHedging: hedgeBlock, liquidityProfile: liquidityLine,
-    regimeContext, knowledgeContext, macroForecast, scenarioSim,
-    // Dynamic-weighting + meta-reasoner context. Both are strictly
-    // informational; raw quorum + confidence gate retain full veto.
-    regime, market: info.market,
-    // Causal + counterfactual + experience-replay + cross-market propagation
-    // prompt blocks. Pre-rendered text or null — all strictly informational,
-    // never gating.
-    causalContext, counterfactualContext, experienceContext, propagationContext,
-    // Human-in-the-Loop layer: prompt summary + bounded shrinkage factor.
-    // Both can ONLY tighten the existing gate, never relax it.
-    feedbackContext, feedbackShrinkage,
-    // Self-Supervised Market Pre-Training prior. Strictly informational.
-    marketPriorContext,
-  });
+  // ---- LLM routing + skip cache (cost optimisation) -------------------
+  // Decide tier (cheap vs escalated) and whether the previous HOLD can be
+  // reused. See the comment block on _llmSkipCache for the safety contract.
+  const escalateReasons = computeRoutingReasons({ holding, strategyName: sc.name, regime, intraday, newsSentiment, patterns });
+  const escalate = escalateReasons.length > 0;
+  const routingReason = escalate ? escalateReasons.join(',') : 'cheap_tier';
+
+  const skipKey = `${sc.name}:${symbol}`;
+  let signal;
+  const skipCached = _llmSkipCache.get(skipKey);
+  const priceDriftBps = skipCached
+    ? Math.abs((latest - skipCached.price) / skipCached.price) * 10000
+    : Infinity;
+  const canSkip = (
+    sc.name === 'day' &&
+    !holding &&
+    !escalate &&
+    skipCached &&
+    skipCached.signal.consensus === 'HOLD' &&
+    Date.now() - skipCached.ts < LLM_SKIP_TTL_MS &&
+    priceDriftBps < LLM_SKIP_PRICE_BPS
+  );
+
+  if (canSkip) {
+    perfMetrics.ensembleSkipped++;
+    signal = {
+      ...skipCached.signal,
+      _skippedFromCache: true,
+      _cacheAgeMs: Date.now() - skipCached.ts,
+      reason: `[skip-cache] ${skipCached.signal.reason} (age ${((Date.now() - skipCached.ts)/1000).toFixed(0)}s, drift ${priceDriftBps.toFixed(1)}bps)`,
+    };
+  } else {
+    perfMetrics.ensembleCalls++;
+    if (escalate) perfMetrics.ensembleEscalated++;
+    signal = await llmService.getEnsembleDecision({
+      symbol, priceData, sentiment, newsSentiment, holding, portfolio,
+      patterns, fundamentals, indicators, intraday, historical,
+      strategyName: sc.name, premarket,
+      adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
+      earningsTranscript,
+      // [Capital & Risk Capacity] new prompt-context blocks
+      varStress: varBlock, dynamicHedging: hedgeBlock, liquidityProfile: liquidityLine,
+      regimeContext, knowledgeContext, macroForecast, scenarioSim,
+      // Dynamic-weighting + meta-reasoner context. Both are strictly
+      // informational; raw quorum + confidence gate retain full veto.
+      regime, market: info.market,
+      // Causal + counterfactual + experience-replay + cross-market propagation
+      // prompt blocks. Pre-rendered text or null — all strictly informational,
+      // never gating.
+      causalContext, counterfactualContext, experienceContext, propagationContext,
+      // Human-in-the-Loop layer: prompt summary + bounded shrinkage factor.
+      // Both can ONLY tighten the existing gate, never relax it.
+      feedbackContext, feedbackShrinkage,
+      // Self-Supervised Market Pre-Training prior. Strictly informational.
+      marketPriorContext,
+      // Tier routing — cheap by default; agent decides when to escalate.
+      escalate, routingReason,
+    });
+    // Cache only flat HOLDs with no open position. BUY/SELL and held
+    // positions must always re-evaluate fresh on the next cycle.
+    if (signal.consensus === 'HOLD' && !holding) {
+      _llmSkipCache.set(skipKey, { signal, ts: Date.now(), price: latest });
+      // Bound cache size so a long-running process doesn't leak.
+      if (_llmSkipCache.size > 256) {
+        const oldest = _llmSkipCache.keys().next().value;
+        _llmSkipCache.delete(oldest);
+      }
+    } else {
+      _llmSkipCache.delete(skipKey);
+    }
+  }
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
   // (even for HOLD/SELL signals) — that lets close-time recordOutcome replay
@@ -878,7 +975,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // causal block" / "saw a counterfactual hint" without re-resolving
       // the whole context bucket.
       causal_seen: !!causalContext,
-      counterfactual_seen: !!counterfactualContext },
+      counterfactual_seen: !!counterfactualContext,
+      // Tier-routing audit — informational only, never gates trading.
+      llm_pool: signal.pool || null,
+      llm_escalated: !!signal.escalated,
+      llm_routing_reason: signal.routingReason || routingReason,
+      llm_skipped_from_cache: !!signal._skippedFromCache,
+      llm_cache_age_ms: signal._cacheAgeMs || null },
   });
 
   // Tag signal with market+currency so the dashboard can filter US vs ASX

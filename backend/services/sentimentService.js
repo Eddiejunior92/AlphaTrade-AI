@@ -15,7 +15,10 @@ const axios = require('axios');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '600') * 1000; // 10 min default
+// 15 min default (was 10) — cuts Grok sentiment refreshes by ~33% at 20s
+// day cadence. News doesn't move that fast; the cycle still gets a fresh
+// pull whenever the cached entry expires.
+const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '900') * 1000;
 const TIMEOUT_MS = 15000;
 // Cap is sized for the full US (30) + ASX (27) universe with headroom; bumped
 // from 64 → 128 when the watchlist expanded so no entry gets evicted under

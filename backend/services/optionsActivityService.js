@@ -5,7 +5,9 @@ const axios = require('axios');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_OPTIONS_MODEL || 'grok-4-fast-non-reasoning';
-const TTL_MS = 30 * 60 * 1000;
+// 60 min default (was 30) — Grok narrative on unusual options flow doesn't
+// change minute-to-minute; longer TTL halves Grok cost on this channel.
+const TTL_MS = parseInt(process.env.OPTIONS_ACTIVITY_TTL_MIN || '60') * 60 * 1000;
 const TIMEOUT_MS = 12000;
 
 const cache = new Map();    // symbol → { ts, data }

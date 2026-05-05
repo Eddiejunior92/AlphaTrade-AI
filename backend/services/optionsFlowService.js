@@ -34,7 +34,10 @@ const axios = require('axios');
 const db = require('./db');
 
 const ALPACA_DATA = 'https://data.alpaca.markets';
-const TTL_MS = 30 * 60 * 1000;
+// 60 min default (was 30). Options-chain snapshots from Alpaca are slow-
+// moving aggregate stats (P/C, IV avg/rank/skew). Doubling the TTL halves
+// the API cost without materially affecting signal quality.
+const TTL_MS = parseInt(process.env.OPTIONS_FLOW_TTL_MIN || '60') * 60 * 1000;
 const TIMEOUT_MS = 12000;
 const MAX_CONTRACTS = 200;          // hard cap on contracts kept per symbol
 const NEAR_MONEY_PCT = 0.15;        // keep strikes within ±15% of spot

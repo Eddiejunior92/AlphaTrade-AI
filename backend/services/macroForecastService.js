@@ -44,7 +44,9 @@
 
 const macroFactor = require('./macroFactorService');
 
-const TTL_MS = 30 * 60 * 1000;        // 30-min cache (factors refresh hourly)
+// 60-min cache (was 30). Macro factors update hourly upstream; matching the
+// TTL eliminates redundant Grok re-renders within an hour.
+const TTL_MS = parseInt(process.env.MACRO_TTL_MIN || '60') * 60 * 1000;
 const MAX_BOOST_PP = 0.05;            // hard cap on this layer's confidence tightening
 const MIN_SIZE_MULT = 0.70;           // floor on sizing nudge
 const MAX_SIZE_MULT = 1.00;           // CEILING — macro can never amplify

@@ -5,16 +5,44 @@ const metaReasoner = require('./metaReasonerService');
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 
+// =============================================================================
+// Model registry + tiered routing
+// =============================================================================
+// Each model carries a `tier`:
+//   • cheap   — Gemini Flash + Grok Fast. ~30-50× cheaper than the premium
+//               tier. Used as the default ensemble (2 voters) for every
+//               symbol/cycle when LLM_CHEAP_TIER_ONLY=true (default).
+//   • premium — Claude 3.7 Sonnet + GPT-4o. Added on top of the cheap tier
+//               (4 voters total) ONLY when the agent flags the call as
+//               high-stakes via `escalate=true` (held position, swing/ASX
+//               strategy, high-vol/news regime, strong tactical setup,
+//               strong news, breakout). Routing policy lives in agent.js.
+//
+// SAFETY: this is a routing/cost optimisation only. The quorum rule, the
+// confidence gate, the daily-loss budget, the circuit breaker, the kill
+// switch, and riskManager sizing math are ALL UNCHANGED. The required-
+// valid-responder count scales proportionally with pool size (see
+// getRequiredValid below) so the safety stance is preserved.
 const MODELS = [
   {
     id: 'gemini',
+    tier: 'cheap',
     label: 'Gemini 2.0 Flash',
     provider: 'openrouter',
     model: 'google/gemini-2.0-flash-001',
     role: 'Quantitative analyst — focus on price action and momentum.',
   },
   {
+    id: 'grok',
+    tier: 'cheap',
+    label: 'Grok 4 Fast',
+    provider: 'xai',
+    model: 'grok-4-fast-non-reasoning',
+    role: 'Truth & sentiment specialist — read social/news sentiment, flag red flags.',
+  },
+  {
     id: 'claude',
+    tier: 'premium',
     label: 'Claude 3.7 Sonnet',
     provider: 'openrouter',
     model: 'anthropic/claude-3.7-sonnet',
@@ -22,21 +50,33 @@ const MODELS = [
   },
   {
     id: 'gpt4o',
+    tier: 'premium',
     label: 'GPT-4o',
     provider: 'openrouter',
     model: 'openai/gpt-4o',
     role: 'Strategy generalist — synthesize technicals and fundamentals.',
   },
-  {
-    id: 'grok',
-    label: 'Grok 4 Fast',
-    provider: 'xai',
-    model: 'grok-4-fast-non-reasoning',
-    role: 'Truth & sentiment specialist — read social/news sentiment, flag red flags.',
-  },
 ];
 
-const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
+// Master switch. When false the legacy 4-model ensemble runs every call.
+const LLM_CHEAP_TIER_ONLY = String(process.env.LLM_CHEAP_TIER_ONLY || 'true').toLowerCase() !== 'false';
+
+function selectModelPool({ escalate } = {}) {
+  if (!LLM_CHEAP_TIER_ONLY) return MODELS;
+  if (escalate) return MODELS;
+  return MODELS.filter(m => m.tier === 'cheap');
+}
+
+// Required-valid count for the current pool. Honours an explicit
+// MIN_VALID_MODELS env override (capped at pool size), otherwise uses the
+// same 3/4 proportional safety the legacy ensemble used:
+//   pool=2 (cheap)     → require 2/2  (STRICTER than legacy 3/4)
+//   pool=4 (escalated) → require 3/4  (legacy behaviour, unchanged)
+function getRequiredValid(pool) {
+  const explicit = parseInt(process.env.MIN_VALID_MODELS || '');
+  if (Number.isFinite(explicit) && explicit > 0) return Math.min(explicit, pool.length);
+  return Math.max(2, Math.ceil(pool.length * 0.75));
+}
 
 function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
@@ -370,7 +410,11 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, feedbackShrinkage, marketPriorContext }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, feedbackShrinkage, marketPriorContext, escalate = false, routingReason = null }) {
+  // Resolve which models vote for THIS call. Defaults to the cheap tier;
+  // caller passes escalate=true to add the premium tier. See selectModelPool.
+  const pool = selectModelPool({ escalate });
+  const requiredValid = getRequiredValid(pool);
   // ---------------------------------------------------------------------
   // STEP 1 — Resolve dynamic per-model weights for this (strategy, regime,
   // market) context. Cold-start safe (uniform 1.0). Failures degrade to
@@ -393,7 +437,7 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
   // ---------------------------------------------------------------------
   // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
   // ---------------------------------------------------------------------
-  const calls = MODELS.map(m =>
+  const calls = pool.map(m =>
     queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }))
   );
   const settled = await Promise.allSettled(calls);
@@ -403,14 +447,17 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
 
   const valid = results.filter(r => !r.error);
 
-  if (valid.length < MIN_VALID_MODELS) {
+  if (valid.length < requiredValid) {
     return {
       consensus: 'HOLD',
       confidence: 0,
-      votes: { BUY: 0, SELL: 0, HOLD: MODELS.length },
+      votes: { BUY: 0, SELL: 0, HOLD: pool.length },
       models: results,
-      reason: `Only ${valid.length}/${MODELS.length} models returned (need ${MIN_VALID_MODELS}). Forcing HOLD for safety.`,
+      reason: `Only ${valid.length}/${pool.length} models returned (need ${requiredValid}). Forcing HOLD for safety.`,
       weights: weightSnap?.weights || null,
+      pool: pool.map(m => m.id),
+      escalated: pool.length > 2,
+      routingReason,
     };
   }
 
@@ -484,10 +531,14 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
     agreement: agreementRatio,
     agreementCount,
     validCount: valid.length,
-    totalModels: MODELS.length,
+    totalModels: pool.length,
     votes,
     models: results,
     reason: `${agreementCount}/${valid.length} models agree on ${rawConsensus} (raw avg conf ${(rawAvgConfidence * 100).toFixed(0)}%, gate conf ${(gateConfidence * 100).toFixed(0)}%)`,
+    // Routing audit fields — which tier ran for this call, and why.
+    pool: pool.map(m => m.id),
+    escalated: pool.length > 2,
+    routingReason,
     // NEW informational fields — surfaced in audit + dashboard. Do NOT
     // gate trading; risk manager continues to read consensus + confidence.
     rawConfidence: rawAvgConfidence,
@@ -505,8 +556,9 @@ function getProviderStatus() {
   return {
     openrouter: Boolean(process.env.OPENROUTER_API_KEY),
     xai: Boolean(process.env.XAI_API_KEY || process.env.GROK_API_KEY),
-    models: MODELS.map(m => ({ id: m.id, label: m.label, role: m.role, provider: m.provider })),
+    cheapTierOnly: LLM_CHEAP_TIER_ONLY,
+    models: MODELS.map(m => ({ id: m.id, label: m.label, role: m.role, provider: m.provider, tier: m.tier })),
   };
 }
 
-module.exports = { getEnsembleDecision, getProviderStatus, MODELS };
+module.exports = { getEnsembleDecision, getProviderStatus, MODELS, selectModelPool };
