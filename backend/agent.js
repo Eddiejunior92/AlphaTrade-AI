@@ -1272,10 +1272,13 @@ function minutesUntilClose(clock) {
   return Math.max(0, (close - now) / 60000);
 }
 
-async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
+async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic, opts = {}) {
   // Auto-flatten only applies to strategies with a defined "next close"
   // (US day strategy via Alpaca clock). ASX swing holds overnight and
   // never auto-flattens, so we just skip the check when clock is null.
+  // SAFETY: forceFlatten ALWAYS runs — even when noNewEntries is set
+  // (market disabled by operator). Risk management on existing positions
+  // is never gated by the per-market master switch.
   if (clock) {
     const minsLeft = minutesUntilClose(clock);
     if (sc.forceFlattenBeforeClose && minsLeft <= FORCE_FLATTEN_MINUTES_BEFORE_CLOSE) {
@@ -1288,8 +1291,19 @@ async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
   // Use the strategy's own watchlist (US for day/swing; ASX for asx_swing).
   const stratWatchlist = getWatchlistForStrategy(sc.name);
 
+  // Stop-loss / take-profit / trailing-stop evaluation ALWAYS runs.
   const stratHoldings = await db.getHoldings(sc.name);
   await evaluateExistingPositions(stratHoldings, fullPriceLookup, {}, sc);
+
+  // New-entry signal generation is gated by the per-market master switch.
+  // When the operator disables a market, we still manage existing positions
+  // (above) but skip looking for new ones (below).
+  if (opts.noNewEntries) {
+    console.log(`[${sc.name}] market disabled — managing existing positions only, no new entries`);
+    memoryState.strategyLastRun[sc.name] = new Date().toISOString();
+    memoryState.strategyCycles[sc.name] = (memoryState.strategyCycles[sc.name] || 0) + 1;
+    return;
+  }
 
   for (const symbol of stratWatchlist) {
     try {
@@ -1420,15 +1434,27 @@ async function runCycle() {
     const dayCadenceLive = Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
       ? parseInt(portfolio.day_trading_cadence_seconds)
       : DAY_CADENCE_DEFAULT;
+    // Per-market operator master switches. Default TRUE (legacy rows). When
+    // OFF, every strategy targeting that market is force-disabled regardless
+    // of its individual day/swing/asx_swing toggle.
+    const usMarketOn  = portfolio.us_market_enabled  !== false;
+    const asxMarketOn = portfolio.asx_market_enabled !== false;
     const dayScaled = applyRiskScale(STRATEGIES.day, scaleName);
+    // CRITICAL: per-market master switches gate NEW ENTRIES ONLY. Existing
+    // positions still run through evaluateExistingPositions (stop-loss,
+    // take-profit, trailing stops) and forceFlatten-before-close — turning
+    // a market off must never abandon open positions on the broker. The
+    // per-strategy day/swing/asx_swing toggles retain their original
+    // behavior (full skip) since those represent operator intent to halt
+    // a strategy entirely.
     const strategies = [
-      { sc: { ...dayScaled, intervalSeconds: dayCadenceLive }, enabled: portfolio.day_enabled,      marketOpen: clock.is_open, clock },
-      { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock },
+      { sc: { ...dayScaled, intervalSeconds: dayCadenceLive }, enabled: portfolio.day_enabled,      marketOpen: clock.is_open, clock, noNewEntries: !usMarketOn },
+      { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock, noNewEntries: !usMarketOn },
       // ASX gated by env-var master switch (ASX_ENABLED). When disabled,
       // marketRegistry.isAsxOpen() returns false anyway → strategy is never
-      // eligible. Belt-and-braces: also clamp `enabled` so the audit row
-      // makes the disablement obvious in /api/state.
-      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null },
+      // eligible. The asxMarketOn switch only blocks new entries; exits
+      // continue so any existing ASX position can still be managed.
+      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
     ];
     // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
     // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
@@ -1448,9 +1474,9 @@ async function runCycle() {
     const asxBucket = eligibleStrategies.filter(s => s.sc.name === 'asx_swing');
 
     const runBucketSequential = async (bucket) => {
-      for (const { sc, clock: stratClock } of bucket) {
+      for (const { sc, clock: stratClock, noNewEntries } of bucket) {
         const t0 = Date.now();
-        await runStrategy(sc, portfolio, stratClock, usdFullLookup, dynamic);
+        await runStrategy(sc, portfolio, stratClock, usdFullLookup, dynamic, { noNewEntries });
         const dt = Date.now() - t0;
         if (!perfMetrics.strategyDurationsMs[sc.name]) perfMetrics.strategyDurationsMs[sc.name] = [];
         _pushBounded(perfMetrics.strategyDurationsMs[sc.name], dt);
@@ -1838,19 +1864,71 @@ async function setStrategyEnabled(strategyName, enabled) {
 }
 
 async function setTradingMode(mode) {
+  // Backwards-compat shim. The legacy single-mode endpoint (and any external
+  // tooling that still posts to /api/agent/trading-mode) routes through
+  // setMarketMode('US', mode) so US Alpaca + the new us_trading_mode column
+  // stay in lockstep.
+  return setMarketMode('US', mode);
+}
+
+// Per-market operator toggle: enables/disables an entire market (US or ASX)
+// at the strategy-eligibility level. When OFF, every strategy that targets
+// that market is short-circuited *before* signal generation, but the cycle
+// still runs (equity must be marked-to-market for the circuit breaker).
+// Operator-gated; audit-logged. Safety rails (quorum, confidence, kill
+// switch, breaker, sizing) are completely untouched.
+async function setMarketEnabled(market, enabled) {
+  const m = String(market || '').toUpperCase();
+  if (m !== 'US' && m !== 'ASX') throw new Error("market must be 'US' or 'ASX'");
+  const field = m === 'US' ? 'us_market_enabled' : 'asx_market_enabled';
+  const prev = await db.getPortfolio();
+  const prevVal = !!prev?.[field];
+  const next = !!enabled;
+  await db.updatePortfolio({ [field]: next });
+  await db.recordAudit({
+    event_type: 'MARKET_ENABLED_CHANGED',
+    payload: { market: m, from: prevVal, to: next },
+  });
+  console.log(`[Agent] Market ${m}: ${prevVal ? 'ON' : 'OFF'} → ${next ? 'ON' : 'OFF'}`);
+  return { market: m, prev: prevVal, current: next };
+}
+
+// Per-market paper/live mode. US side syncs alpacaService + the legacy
+// `trading_mode` column (so dailyReset, compliance, daily-perf and every
+// other reader of `trading_mode` keep working unchanged). ASX side persists
+// `asx_trading_mode` only — IBKR execution is not yet wired, so the value
+// is preference storage for when it is. Live requires the explicit
+// 'I_UNDERSTAND_LIVE' confirm at the endpoint layer (server.js); this
+// setter assumes that gate has already been passed.
+async function setMarketMode(market, mode) {
+  const m = String(market || '').toUpperCase();
+  if (m !== 'US' && m !== 'ASX') throw new Error("market must be 'US' or 'ASX'");
   if (mode !== 'paper' && mode !== 'live') throw new Error('mode must be paper or live');
-  if (mode === 'live' && !alpacaService.hasLiveCredentials()) {
-    throw new Error('Live mode requires ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY in secrets');
+  if (m === 'US' && mode === 'live' && !alpacaService.hasLiveCredentials()) {
+    throw new Error('US live mode requires ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY in secrets');
   }
-  // Wait for any in-flight cycle so we never partial-execute orders across modes
+  // Wait for any in-flight cycle so we never partial-execute orders across modes.
+  // We also wait for tradingLock — the cycle-level boolean held while a strategy
+  // is mid-execution — to close the small race where a fresh cycle starts
+  // between us seeing cycleInProgress=false and writing the new mode.
   const waitStart = Date.now();
-  while ((cycleInProgress || flattenInProgress) && Date.now() - waitStart < 30000) {
+  while ((cycleInProgress || flattenInProgress || tradingLock) && Date.now() - waitStart < 30000) {
     await new Promise(r => setTimeout(r, 200));
   }
-  await db.updatePortfolio({ trading_mode: mode });
-  alpacaService.setMode(mode);
-  await db.recordAudit({ event_type: 'TRADING_MODE_CHANGED', payload: { mode } });
-  await discordService.sendCircuitBreakerAlert(`Trading mode switched to ${mode.toUpperCase()}`);
+  if (m === 'US') {
+    await db.updatePortfolio({ trading_mode: mode });
+    alpacaService.setMode(mode);
+  } else {
+    await db.updatePortfolio({ asx_trading_mode: mode });
+    // IBKR execution path is not yet wired. Preference is persisted; when
+    // ibkrService gains a setMode() it'll be invoked here in the same shape.
+  }
+  await db.recordAudit({
+    event_type: 'MARKET_MODE_CHANGED',
+    payload: { market: m, mode, broker: m === 'US' ? 'alpaca' : 'ibkr' },
+  });
+  await discordService.sendCircuitBreakerAlert(`${m} trading mode → ${mode.toUpperCase()}`);
+  return { market: m, mode };
 }
 
 async function dailyReset() {
@@ -2172,13 +2250,65 @@ async function getAgentSnapshot() {
     dailyPnLPct: dayStart ? (dailyPnL / dayStart * 100) : 0,
     dailyLossUSD,
     market: { open: memoryState.marketOpen, nextOpen: memoryState.nextOpen, nextClose: memoryState.nextClose },
-    markets: {
-      US:  { open: !!memoryState.usMarketOpen,  nextOpen: memoryState.nextOpen || null, nextClose: memoryState.nextClose || null },
-      ASX: { open: !!memoryState.asxMarketOpen, nextOpen: memoryState.asxNextOpen || null, nextClose: null },
-    },
     fx: fxService.getStatus(),
     asxWatchlist: marketRegistry.getAsxWatchlist(),
     asxEnabled: marketRegistry.isAsxEnabled(),
+    // Dual-broker dashboard block. `executionWired` tells the UI whether
+    // orders for this market actually route to a live broker (US: Alpaca,
+    // wired) or are preference-only (ASX: IBKR not yet integrated). The
+    // `enabled` flag is the operator master switch; the `mode` is paper/live.
+    // Merged with the legacy clock fields (open/nextOpen/nextClose) so
+    // existing readers (MarketClocks, header badges) keep working.
+    markets: {
+      US: {
+        enabled: portfolio.us_market_enabled !== false,
+        mode: portfolio.trading_mode || 'paper',
+        broker: 'Alpaca', currency: 'USD', flag: '🇺🇸',
+        executionWired: true,
+        liveAvailable: alpacaService.hasLiveCredentials(),
+        open: !!memoryState.usMarketOpen,
+        nextOpen: memoryState.nextOpen || null,
+        nextClose: memoryState.nextClose || null,
+      },
+      ASX: {
+        enabled: (portfolio.asx_market_enabled !== false) && marketRegistry.isAsxEnabled(),
+        mode: portfolio.asx_trading_mode || 'paper',
+        broker: 'IBKR', currency: 'AUD', flag: '🇦🇺',
+        executionWired: false,
+        liveAvailable: false,
+        open: !!memoryState.asxMarketOpen,
+        nextOpen: memoryState.asxNextOpen || null,
+        nextClose: null,
+        envDisabled: !marketRegistry.isAsxEnabled(),
+      },
+    },
+    // Equity breakdown by market — both native (per-currency) and USD-equiv
+    // so the unified equity number always equals usUSD + asxUSD + 0 (cash is
+    // USD). audUsdRate exposed so the UI can show "≈ $Z USD" deterministically.
+    equityBreakdown: (() => {
+      // fxService.getStatus() exposes `audusd` (lowercase) — there's no
+      // .rates wrapper. The earlier path used a non-existent key and silently
+      // dropped ASX USD value, leaving asxHoldingsUSD=0 even with positions.
+      const audUsd = Number(fxService.getStatus()?.audusd) || 0;
+      let usMV = 0, asxAUD = 0;
+      for (const h of holdings) {
+        const native = lookup[h.symbol] || parseFloat(h.avg_cost);
+        const mv = parseFloat(h.qty) * native;
+        if ((h.market || 'US') === 'ASX') asxAUD += mv; else usMV += mv;
+      }
+      const asxUSD = audUsd > 0 ? asxAUD * audUsd : 0;
+      const cashUSD = parseFloat(portfolio.cash_balance) || 0;
+      return {
+        usHoldingsUSD: +usMV.toFixed(2),
+        usCashUSD:     +cashUSD.toFixed(2),
+        usTotalUSD:    +(usMV + cashUSD).toFixed(2),
+        asxHoldingsAUD: +asxAUD.toFixed(2),
+        asxHoldingsUSD: +asxUSD.toFixed(2),
+        asxCashAUD: 0,
+        audUsdRate: audUsd || null,
+        totalUSD: +equity.toFixed(2),
+      };
+    })(),
     holdings: holdings.map(h => {
       // Per-holding values are reported in the symbol's NATIVE currency
       // (USD for US, AUD for ASX). The UI shows `currency` so users can
@@ -2532,7 +2662,9 @@ module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence, WATCHLIST,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
+  setMarketEnabled, setMarketMode,
+  WATCHLIST,
   // Exposed for the /api/risk-capacity endpoint so it can compute on-demand
   // pre-warmup. Read-only USD price-lookup builder; identical logic to the
   // per-cycle path. Does NOT touch trading state.

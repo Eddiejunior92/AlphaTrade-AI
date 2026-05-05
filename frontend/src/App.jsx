@@ -65,7 +65,8 @@ function LiveBadge({ connected, pulseAt }) {
 export default function App() {
   const [tab, setTab] = useState('home');
   const [chatOpen, setChatOpen] = useState(false);
-  const [modeModal, setModeModal] = useState(null); // 'paper' | 'live' | null
+  // Per-market mode-switch modal. Shape: null | { market: 'US'|'ASX', target: 'paper'|'live' }
+  const [modeModal, setModeModal] = useState(null);
   const [modeError, setModeError] = useState('');
   const [modeConfirmText, setModeConfirmText] = useState('');
   // Per-tab market filters — separate state so a user filtering Trades to ASX
@@ -100,6 +101,7 @@ export default function App() {
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
     toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
+    setMarketEnabled, setMarketMode,
     authStatus, setOperatorToken, getStoredOperatorToken,
     setBreakerAutoReset,
   } = useAgent();
@@ -217,15 +219,25 @@ export default function App() {
   const swingStrat = strategies.find(s => s.name === 'swing');
   const enabledStrategies = strategies.filter(s => s.enabled);
 
+  // Per-market mode switch. modeModal carries {market, target}; the legacy
+  // single-market handler now routes through setMarketMode so US Alpaca and
+  // the new asx_trading_mode column both work through one code path.
   const handleModeSwitch = async () => {
     setModeError('');
-    const target = modeModal;
-    const r = await setTradingMode(target, target === 'live' ? 'I_UNDERSTAND_LIVE' : undefined);
+    if (!modeModal) return;
+    const { market, target } = modeModal;
+    const r = await setMarketMode(market, target, target === 'live' ? 'I_UNDERSTAND_LIVE' : undefined);
     if (r?.success) { setModeModal(null); setModeConfirmText(''); }
     else setModeError(r?.error || 'Switch failed');
   };
   const closeModeModal = () => { setModeModal(null); setModeConfirmText(''); setModeError(''); };
   const liveConfirmOk = modeConfirmText.trim().toUpperCase() === 'LIVE';
+  const markets = state?.markets || {};
+  const usMode = markets.US?.mode || mode;
+  const asxMode = markets.ASX?.mode || 'paper';
+  const usMarketEnabled  = markets.US?.enabled !== false;
+  const asxMarketEnabled = markets.ASX?.enabled !== false;
+  const equityBreakdown = state?.equityBreakdown;
 
   return (
     <div className="min-h-screen pb-28 sm:pb-24">
@@ -253,17 +265,18 @@ export default function App() {
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Tooltip text={`Tap to switch to ${mode === 'paper' ? 'LIVE (real money)' : 'paper (simulated)'} mode`}>
-              <button
-                onClick={() => { setModeError(''); setModeModal(mode === 'paper' ? 'live' : 'paper'); }}
-                className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition-colors ${
-                  mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)] hover:bg-[var(--yellow)]/25'
-                                   : 'bg-[var(--red)]/15 text-[var(--red)] hover:bg-[var(--red)]/25'
-                }`}>
-                {mode.toUpperCase()}
-              </button>
-            </Tooltip>
+          <div className="flex items-center gap-1.5">
+            {/* Per-market mode badges. Click → opens the LIVE/PAPER confirm
+                modal for that market. ASX badge is always clickable (mode
+                preference saved even when IBKR execution isn't wired). */}
+            <MarketModeBadge
+              market={state?.markets?.US || { enabled: usMarketEnabled, mode: usMode, broker:'Alpaca', currency:'USD', flag:'🇺🇸', executionWired:true, liveAvailable }}
+              onClick={(target) => { setModeError(''); setModeModal({ market:'US', target }); }}
+            />
+            <MarketModeBadge
+              market={state?.markets?.ASX || { enabled: asxMarketEnabled, mode: asxMode, broker:'IBKR', currency:'AUD', flag:'🇦🇺', executionWired:false }}
+              onClick={(target) => { setModeError(''); setModeModal({ market:'ASX', target }); }}
+            />
             <Tooltip text="Talk to Alpha — your AI broker">
               <button onClick={() => setChatOpen(true)}
                 className="w-9 h-9 rounded-full bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center text-sm">💬</button>
@@ -377,7 +390,45 @@ export default function App() {
                   <div className="text-base font-semibold">{activeModels} <span className="text-[var(--text-dim)] text-[11px] font-normal">/ 4</span></div>
                 </div>
               </div>
+
+              {/* Dual-broker equity breakdown — splits the unified USD total
+                  into US (Alpaca, USD) + ASX (IBKR, AUD ≈ USD) so it's clear
+                  where the money actually lives. */}
+              {equityBreakdown && (
+                <div className="mt-5 pt-5 border-t border-white/5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="rounded-xl bg-white/3 p-3 border border-white/5">
+                    <div className="text-[10px] text-[var(--text-dim)] uppercase tracking-wider flex items-center gap-1.5">
+                      <span aria-hidden>🇺🇸</span> US Holdings <span className="text-[var(--text-dim)] font-normal normal-case">(Alpaca · USD)</span>
+                    </div>
+                    <div className="text-lg font-semibold mt-1">${fmt(equityBreakdown.usHoldingsUSD)}</div>
+                    <div className="text-[10px] text-[var(--text-dim)] mt-0.5">+ ${fmt(equityBreakdown.usCashUSD)} cash</div>
+                  </div>
+                  <div className="rounded-xl bg-white/3 p-3 border border-white/5">
+                    <div className="text-[10px] text-[var(--text-dim)] uppercase tracking-wider flex items-center gap-1.5">
+                      <span aria-hidden>🇦🇺</span> ASX Holdings <span className="text-[var(--text-dim)] font-normal normal-case">(IBKR · AUD)</span>
+                    </div>
+                    <div className="text-lg font-semibold mt-1">A${fmt(equityBreakdown.asxHoldingsAUD)}</div>
+                    <div className="text-[10px] text-[var(--text-dim)] mt-0.5">
+                      ≈ {equityBreakdown.audUsdRate
+                        ? `$${fmt(equityBreakdown.asxHoldingsUSD)} USD @ ${equityBreakdown.audUsdRate.toFixed(4)}`
+                        : 'FX unavailable'}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
+
+            {/* Markets & Modes — operator master switches per broker. ON/OFF
+                gates strategy execution; PAPER/LIVE switches the broker
+                client (US wired to Alpaca; ASX preference-only until IBKR
+                is integrated). */}
+            <MarketsAndModesPanel
+              markets={state?.markets}
+              loading={loading}
+              tokenMissing={tokenMissing}
+              onToggleEnabled={async (m, en) => setMarketEnabled(m, en)}
+              onOpenModeModal={(market, target) => { setModeError(''); setModeModal({ market, target }); }}
+            />
 
             {/* Live market clocks. ASX panel renders only when master switch
                 (ASX_ENABLED env) is on — otherwise solo full-width US clock. */}
@@ -649,16 +700,44 @@ export default function App() {
               </div>
             )}
 
-            {strategies.map(s => {
-              const sh = filteredHoldings.filter(h => h.strategy === s.name);
-              if (!sh.length) return null;
+            {/* Two clearly-separated sections, one per market. Each section
+                gets a broker + mode badge so the operator always knows which
+                account the listed positions actually live on. Hidden when
+                the market filter excludes that side. */}
+            {['US', 'ASX'].map(m => {
+              const mHoldings = filteredHoldings.filter(h => (h.market || 'US') === m);
+              if (posMarket !== 'ALL' && posMarket !== m) return null;
+              if (!mHoldings.length && posMarket === 'ALL' && holdingCounts[m] === 0 && m === 'ASX') {
+                return null;
+              }
+              const mInfo = state?.markets?.[m];
               return (
-                <div key={s.name} className="space-y-2">
-                  <div className="text-[12px] font-semibold text-[var(--text-dim)] uppercase tracking-wider px-1">
-                    {s.label} <span className="font-normal">({sh.length})</span>
-                  </div>
-                  <HoldingsTable holdings={sh} />
-                </div>
+                <section key={m} className="space-y-3">
+                  <MarketSectionHeader
+                    market={m} info={mInfo}
+                    title={`${m} Holdings`}
+                    sub={m === 'US' ? 'Alpaca · USD' : 'IBKR · AUD'}
+                    count={mHoldings.length}
+                  />
+                  {mHoldings.length === 0 ? (
+                    <div className="glass p-4 text-center text-[var(--text-dim)] text-[12px]">
+                      No open positions in {m}.
+                    </div>
+                  ) : (
+                    strategies.map(s => {
+                      const sh = mHoldings.filter(h => h.strategy === s.name);
+                      if (!sh.length) return null;
+                      return (
+                        <div key={s.name} className="space-y-2">
+                          <div className="text-[11px] font-semibold text-[var(--text-dim)] uppercase tracking-wider px-1">
+                            {s.label} <span className="font-normal">({sh.length})</span>
+                          </div>
+                          <HoldingsTable holdings={sh} />
+                        </div>
+                      );
+                    })
+                  )}
+                </section>
               );
             })}
             {!filteredHoldings.length && (
@@ -684,7 +763,28 @@ export default function App() {
               </h2>
               <MarketFilter value={tradesMarket} onChange={setTradesMarket} counts={tradeCounts} asxEnabled={!!state?.asxEnabled} />
             </div>
-            <TradeLog trades={filteredTrades} marketOf={marketOf} />
+            {/* Group trades by market with a broker/mode header per section.
+                Same filter chip behavior as before — selecting a single
+                market hides the other section entirely. */}
+            {['US', 'ASX'].map(m => {
+              if (tradesMarket !== 'ALL' && tradesMarket !== m) return null;
+              const mTrades = filteredTrades.filter(t => (t.market || marketOf(t.symbol)) === m);
+              if (!mTrades.length && (tradesMarket === 'ALL' && tradeCounts[m] === 0 && m === 'ASX')) return null;
+              const mInfo = state?.markets?.[m];
+              return (
+                <section key={m} className="space-y-2">
+                  <MarketSectionHeader
+                    market={m} info={mInfo}
+                    title={`${m} Trades`}
+                    sub={m === 'US' ? 'Alpaca · USD' : 'IBKR · AUD'}
+                    count={mTrades.length}
+                  />
+                  {mTrades.length
+                    ? <TradeLog trades={mTrades} marketOf={marketOf} />
+                    : <div className="glass p-4 text-center text-[var(--text-dim)] text-[12px]">No {m} trades yet.</div>}
+                </section>
+              );
+            })}
           </div>
         )}
 
@@ -715,14 +815,14 @@ export default function App() {
                   : '⚠ Real capital is at risk. All risk gates and circuit breakers still apply, but losses are real.'}
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <Tooltip text="Switch to paper trading (safe, simulated)">
-                  <button onClick={() => { setModeError(''); setModeModal('paper'); }} disabled={mode === 'paper' || loading.mode}
+                <Tooltip text="Switch US to paper trading (safe, simulated)">
+                  <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'paper' }); }} disabled={mode === 'paper' || loading.mode}
                     className={`ios-btn w-full ${mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'}`}>
                     🟡 Paper
                   </button>
                 </Tooltip>
-                <Tooltip text={liveAvailable ? 'Switch to LIVE — requires confirmation' : 'Add ALPACA_LIVE_API_KEY + SECRET to enable'}>
-                  <button onClick={() => { setModeError(''); setModeModal('live'); }}
+                <Tooltip text={liveAvailable ? 'Switch US to LIVE — requires confirmation' : 'Add ALPACA_LIVE_API_KEY + SECRET to enable'}>
+                  <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'live' }); }}
                     disabled={mode === 'live' || !liveAvailable || loading.mode}
                     className={`ios-btn w-full ${mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'}`}>
                     🔴 Live
@@ -982,58 +1082,81 @@ export default function App() {
         </div>
       )}
 
-      {/* Mode-switch confirmation modal */}
-      {modeModal && (
-        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 anim-fade">
-          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={closeModeModal} />
-          <div className="relative glass-strong w-full max-w-md p-6 anim-slide-up">
-            <div className="text-3xl mb-2">{modeModal === 'live' ? '🔴' : '🟡'}</div>
-            <h3 className="text-xl font-semibold tracking-tight mb-2">
-              Switch to {modeModal === 'live' ? 'LIVE Trading' : 'Paper Trading'}?
-            </h3>
-            {modeModal === 'live' ? (
-              <div className="text-[13px] text-[var(--text-dim)] space-y-2">
-                <p><strong className="text-[var(--red)]">This uses REAL money.</strong> Every trade executes on your live Alpaca brokerage account immediately and losses are permanent.</p>
-                <p>All safety gates stay active — 85% confidence, 3-of-4 model quorum, $100/day loss budget, circuit breaker, dynamic sizing, force-flatten before close — but actual losses will be real.</p>
-                <div className={`mt-2 rounded-xl p-2.5 text-[12px] ${liveAvailable ? 'bg-[var(--green)]/10 text-[var(--green)]' : 'bg-[var(--red)]/10 text-[var(--red)]'}`}>
-                  {liveAvailable
-                    ? '✓ Live API keys detected on the server.'
-                    : '✗ Live API keys NOT detected. Add ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY in Secrets first.'}
+      {/* Per-market mode-switch confirmation modal. Reads {market, target}
+          off modeModal; LIVE always requires the operator to type "LIVE" to
+          confirm. ASX live note explains IBKR execution isn't wired yet. */}
+      {modeModal && (() => {
+        const mm = modeModal;
+        const mInfo = state?.markets?.[mm.market];
+        const isUS = mm.market === 'US';
+        const broker = isUS ? 'Alpaca' : 'IBKR';
+        const flag = isUS ? '🇺🇸' : '🇦🇺';
+        const liveOk = isUS ? liveAvailable : true; // ASX has no live-creds gate (preference-only)
+        const switchKey = `marketMode:${mm.market}`;
+        const busy = !!loading[switchKey];
+        return (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 anim-fade">
+            <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={closeModeModal} />
+            <div className="relative glass-strong w-full max-w-md p-6 anim-slide-up">
+              <div className="text-3xl mb-2">{mm.target === 'live' ? '🔴' : '🟡'}</div>
+              <h3 className="text-xl font-semibold tracking-tight mb-2">
+                {flag} Switch {mm.market} to {mm.target === 'live' ? 'LIVE' : 'Paper'} Trading?
+              </h3>
+              <div className="text-[11px] text-[var(--text-dim)] mb-2">Broker: {broker} · Currency: {isUS ? 'USD' : 'AUD'}</div>
+              {mm.target === 'live' ? (
+                <div className="text-[13px] text-[var(--text-dim)] space-y-2">
+                  {isUS ? (
+                    <>
+                      <p><strong className="text-[var(--red)]">This uses REAL money.</strong> Every trade executes on your live Alpaca brokerage account immediately and losses are permanent.</p>
+                      <p>All safety gates stay active — 85% confidence, 3-of-4 model quorum, $100/day loss budget, circuit breaker, dynamic sizing, force-flatten before close — but actual losses will be real.</p>
+                      <div className={`mt-2 rounded-xl p-2.5 text-[12px] ${liveAvailable ? 'bg-[var(--green)]/10 text-[var(--green)]' : 'bg-[var(--red)]/10 text-[var(--red)]'}`}>
+                        {liveAvailable
+                          ? '✓ Live API keys detected on the server.'
+                          : '✗ Live API keys NOT detected. Add ALPACA_LIVE_API_KEY and ALPACA_LIVE_SECRET_KEY in Secrets first.'}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p><strong className="text-[var(--yellow)]">ASX live preference saved.</strong> IBKR execution is not yet wired — your ASX trades will not place real orders until IBKR credentials and the IBKR client are connected.</p>
+                      <p>The mode is persisted so your preference is ready as soon as IBKR support ships. All ASX safety rails (quorum, confidence, sizing) remain in force the moment execution goes live.</p>
+                    </>
+                  )}
+                  <p className="text-[var(--yellow)] pt-1">To confirm, type <span className="font-mono font-bold text-white">LIVE</span> below.</p>
+                  <input
+                    type="text"
+                    autoFocus
+                    value={modeConfirmText}
+                    onChange={e => setModeConfirmText(e.target.value)}
+                    placeholder="Type LIVE to confirm"
+                    className="w-full mt-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder:text-[var(--text-dim)] focus:outline-none focus:border-[var(--red)]/50"
+                  />
                 </div>
-                <p className="text-[var(--yellow)] pt-1">To confirm, type <span className="font-mono font-bold text-white">LIVE</span> below.</p>
-                <input
-                  type="text"
-                  autoFocus
-                  value={modeConfirmText}
-                  onChange={e => setModeConfirmText(e.target.value)}
-                  placeholder="Type LIVE to confirm"
-                  className="w-full mt-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder:text-[var(--text-dim)] focus:outline-none focus:border-[var(--red)]/50"
-                />
+              ) : (
+                <div className="text-[13px] text-[var(--text-dim)]">
+                  Switching {mm.market} back to paper mode. All future trades will be simulated through your {broker} paper account. Any open live positions stay on the broker — they will not be touched by this switch.
+                </div>
+              )}
+              {modeError && (
+                <div className="mt-3 text-[12px] text-[var(--red)] bg-[var(--red)]/10 rounded-xl p-3">{modeError}</div>
+              )}
+              {mInfo && !mInfo.executionWired && mm.target === 'live' && (
+                <div className="mt-3 text-[11px] text-[var(--text-dim)] bg-white/3 rounded-xl p-2.5">
+                  ℹ {broker} execution requires {broker} credentials. Mode preference will be saved.
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2 mt-5">
+                <button onClick={closeModeModal} disabled={busy} className="ios-btn ios-btn-ghost">Cancel</button>
+                <button
+                  onClick={handleModeSwitch}
+                  disabled={busy || (mm.target === 'live' && (!liveConfirmOk || !liveOk))}
+                  className={`ios-btn ${mm.target === 'live' ? 'ios-btn-danger' : 'ios-btn-success'}`}>
+                  {busy ? '…' : mm.target === 'live' ? `Yes, Go ${mm.market} LIVE` : `Switch ${mm.market} to Paper`}
+                </button>
               </div>
-            ) : (
-              <div className="text-[13px] text-[var(--text-dim)]">
-                Switching back to paper mode. All future trades will be simulated through your Alpaca paper account. Any open live positions stay on the broker — they will not be touched by this switch.
-              </div>
-            )}
-            {modeError && (
-              <div className="mt-3 text-[12px] text-[var(--red)] bg-[var(--red)]/10 rounded-xl p-3">
-                {modeError}
-              </div>
-            )}
-            <div className="grid grid-cols-2 gap-2 mt-5">
-              <button onClick={closeModeModal} disabled={loading.mode} className="ios-btn ios-btn-ghost">
-                Cancel
-              </button>
-              <button
-                onClick={handleModeSwitch}
-                disabled={loading.mode || (modeModal === 'live' && (!liveConfirmOk || !liveAvailable))}
-                className={`ios-btn ${modeModal === 'live' ? 'ios-btn-danger' : 'ios-btn-success'}`}>
-                {loading.mode ? '…' : modeModal === 'live' ? 'Yes, Go Live' : 'Switch to Paper'}
-              </button>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }
@@ -1331,6 +1454,164 @@ function DayCadenceControl({ dayCadence, onChange, loading }) {
         {err && <div className="text-[10px] text-[var(--red)] mt-1">{err}</div>}
       </div>
     </section>
+  );
+}
+
+// Compact mode badge shown in the header for each market. Single-tap opens
+// the per-market confirm modal. Visual states encode three things at once:
+//   • Border colour    — market enabled (full) vs disabled (dim).
+//   • Background tint  — paper (yellow) vs live (red).
+//   • "preview" suffix — execution wired? (US:Alpaca yes / ASX:IBKR no).
+function MarketModeBadge({ market, onClick }) {
+  if (!market) return null;
+  const m = market;
+  const isLive = m.mode === 'live';
+  const enabled = m.enabled !== false;
+  const otherTarget = isLive ? 'paper' : 'live';
+  const dot = enabled ? (isLive ? 'bg-[var(--red)]' : 'bg-[var(--yellow)]') : 'bg-[var(--text-dim)]';
+  const tone = enabled
+    ? (isLive ? 'bg-[var(--red)]/15 text-[var(--red)] hover:bg-[var(--red)]/25'
+              : 'bg-[var(--yellow)]/15 text-[var(--yellow)] hover:bg-[var(--yellow)]/25')
+    : 'bg-white/5 text-[var(--text-dim)] hover:bg-white/10';
+  const tip = `${m.broker} · ${m.currency}${enabled ? '' : ' · OFF'} — tap to switch to ${otherTarget.toUpperCase()}`;
+  return (
+    <Tooltip text={tip}>
+      <button
+        onClick={() => onClick?.(otherTarget)}
+        className={`text-[10px] font-bold px-2 py-1 rounded-full transition-colors flex items-center gap-1 ${tone}`}>
+        <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden />
+        <span aria-hidden>{m.flag}</span>
+        <span>{m.mode?.toUpperCase() || 'PAPER'}</span>
+        {!m.executionWired && <span className="opacity-60 font-normal">·preview</span>}
+      </button>
+    </Tooltip>
+  );
+}
+
+// Section header used by Holdings + Trades to introduce each market group.
+// Mirrors the dashboard hero language so operators always see broker +
+// mode + open/closed status next to the symbols below.
+function MarketSectionHeader({ market, info, title, sub, count }) {
+  const enabled = info?.enabled !== false;
+  const isLive = info?.mode === 'live';
+  return (
+    <div className="flex items-center justify-between gap-3 px-1">
+      <div className="flex items-center gap-2 min-w-0">
+        <span aria-hidden className="text-base">{market === 'US' ? '🇺🇸' : '🇦🇺'}</span>
+        <div className="min-w-0">
+          <div className="text-[13px] font-semibold tracking-tight truncate">
+            {title} <span className="text-[var(--text-dim)] font-normal">({count})</span>
+          </div>
+          <div className="text-[10px] text-[var(--text-dim)] truncate">
+            {sub}
+            {info && (
+              <>
+                {' · '}<span className={isLive ? 'text-[var(--red)]' : 'text-[var(--yellow)]'}>
+                  {(info.mode || 'paper').toUpperCase()}
+                </span>
+                {' · '}<span className={info.open ? 'text-[var(--green)]' : 'text-[var(--text-dim)]'}>
+                  {info.open ? 'open' : 'closed'}
+                </span>
+                {!enabled && <span className="text-[var(--text-dim)]"> · OFF</span>}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+      {info && !info.executionWired && (
+        <span className="text-[9px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-white/5 text-[var(--text-dim)] whitespace-nowrap">
+          preview
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Operator master switches per market (ON/OFF + paper/live mode). LIVE
+// transitions always go through the confirm modal — this panel just opens
+// it. Disabled-while-busy/disabled-without-token enforced inline so a
+// missing operator token surfaces an obvious tooltip rather than a silent
+// 401 from the endpoint.
+function MarketsAndModesPanel({ markets, loading, tokenMissing, onToggleEnabled, onOpenModeModal }) {
+  if (!markets) return null;
+  const Card = ({ market }) => {
+    const m = markets[market];
+    if (!m) return null;
+    const enabled = m.enabled !== false;
+    const isLive = m.mode === 'live';
+    const enKey = `marketEnabled:${market}`;
+    const enBusy = !!loading?.[enKey];
+    const liveBlocked = market === 'US' && !m.liveAvailable;
+    return (
+      <div className={`rounded-2xl p-4 border ${enabled ? 'border-white/10 bg-white/3' : 'border-white/5 bg-white/2 opacity-80'}`}>
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span aria-hidden className="text-lg">{m.flag}</span>
+            <div className="min-w-0">
+              <div className="text-[13px] font-semibold tracking-tight truncate">
+                {market} <span className="text-[var(--text-dim)] font-normal">· {m.broker}</span>
+              </div>
+              <div className="text-[10px] text-[var(--text-dim)]">
+                {m.currency} · <span className={m.open ? 'text-[var(--green)]' : 'text-[var(--text-dim)]'}>{m.open ? 'market open' : 'market closed'}</span>
+              </div>
+            </div>
+          </div>
+          <Tooltip text={tokenMissing ? 'Operator token required' : `${enabled ? 'Disable' : 'Enable'} ${market} strategies`}>
+            <button
+              disabled={tokenMissing || enBusy || m.envDisabled}
+              onClick={() => onToggleEnabled?.(market, !enabled)}
+              className={`relative w-11 h-6 rounded-full transition-colors ${enabled ? 'bg-[var(--green)]/70' : 'bg-white/10'} disabled:opacity-50 disabled:cursor-not-allowed`}>
+              <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
+            </button>
+          </Tooltip>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            disabled={tokenMissing || !enabled || m.mode === 'paper'}
+            onClick={() => onOpenModeModal?.(market, 'paper')}
+            className={`ios-btn ${m.mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'} text-[11px]`}>
+            🟡 Paper
+          </button>
+          <Tooltip text={liveBlocked ? 'Add ALPACA_LIVE_API_KEY + SECRET to enable' : `Switch ${market} to LIVE — requires confirmation`}>
+            <button
+              disabled={tokenMissing || !enabled || m.mode === 'live' || liveBlocked}
+              onClick={() => onOpenModeModal?.(market, 'live')}
+              className={`ios-btn w-full ${m.mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'} text-[11px]`}>
+              🔴 Live
+            </button>
+          </Tooltip>
+        </div>
+        {!m.executionWired && (
+          <div className="mt-3 text-[10px] text-[var(--text-dim)] bg-white/3 rounded-lg p-2 leading-snug">
+            ⓘ {m.broker} execution requires {m.broker} credentials. Mode + on/off are stored as preferences — strategies will tick {isLive ? 'in LIVE mode' : 'in PAPER mode'} but won't place real orders until {m.broker} is wired.
+          </div>
+        )}
+        {m.envDisabled && (
+          <div className="mt-2 text-[10px] text-[var(--red)]">
+            Hard-disabled by <span className="font-mono">ASX_ENABLED=false</span> in env.
+          </div>
+        )}
+      </div>
+    );
+  };
+  return (
+    <div className="glass p-5 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="font-semibold text-[14px]">Markets &amp; Modes</div>
+          <div className="text-[11px] text-[var(--text-dim)]">Per-market master switch · paper vs live trading mode</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <Card market="US" />
+        <Card market="ASX" />
+      </div>
+      {tokenMissing && (
+        <div className="text-[10px] text-[var(--text-dim)] bg-white/3 rounded-lg p-2">
+          🔒 Operator token required to change market state. Enter it in Settings.
+        </div>
+      )}
+    </div>
   );
 }
 

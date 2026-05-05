@@ -243,5 +243,25 @@ export function useAgent() {
         return r;
       } finally { setLoad('dayCadence', false); }
     },
+    setMarketEnabled: async (market, enabled) => {
+      const k = `marketEnabled:${market}`;
+      setLoad(k, true);
+      try {
+        const r = await apiPost('/agent/market-enabled', { market, enabled: !!enabled });
+        await refreshLogs();
+        return r;
+      } finally { setLoad(k, false); }
+    },
+    setMarketMode: async (market, mode, confirm) => {
+      const k = `marketMode:${market}`;
+      setLoad(k, true);
+      try {
+        const body = { market, mode };
+        if (confirm) body.confirm = confirm;
+        const r = await apiPost('/agent/market-mode', body);
+        await refreshLogs();
+        return r;
+      } finally { setLoad(k, false); }
+    },
   };
 }

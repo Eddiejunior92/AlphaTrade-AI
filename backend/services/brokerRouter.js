@@ -14,9 +14,31 @@ function getBroker(symbol) {
   return brokerFor(symbol) === 'ibkr' ? ibkrService : alpacaService;
 }
 
+// Hard guard: ASX execution is NOT wired in this build of the dashboard.
+// The dual-broker UI surfaces ASX as an operator preference (paper/live
+// can be selected, master switch can be toggled) but actual order routing
+// to IBKR is opt-in via the `ASX_EXECUTION_WIRED=true` env. This matches
+// the documented dashboard contract (executionWired:false in /api/state)
+// so the UI cannot accidentally cause real ASX orders. To enable real
+// IBKR routing in the future, set ASX_EXECUTION_WIRED=true *and* provide
+// IBKR_BASE_URL + IBKR_ACCOUNT_ID.
+function isAsxExecutionWired() {
+  const raw = (process.env.ASX_EXECUTION_WIRED || '').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes' || raw === 'on';
+}
+
 async function placeOrder({ symbol, qty, side, type, time_in_force }) {
   const broker = getBroker(symbol);
   if (broker === ibkrService) {
+    if (!isAsxExecutionWired()) {
+      // Refuse loudly. Callers (agent.executeTrade) treat this as a
+      // non-fatal per-symbol failure: position state is not mutated, and
+      // an audit row is written upstream. The audit trail makes it
+      // obvious if any code path tries to send real ASX orders.
+      const err = new Error('ASX execution not wired (set ASX_EXECUTION_WIRED=true to enable IBKR routing)');
+      err.code = 'ASX_EXECUTION_DISABLED';
+      throw err;
+    }
     return broker.placeOrder({ symbol, qty, side, type: type || 'MKT', tif: time_in_force || 'DAY' });
   }
   return broker.placeOrder({ symbol, qty, side: side.toLowerCase(), type, time_in_force });

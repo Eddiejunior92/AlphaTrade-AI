@@ -54,9 +54,16 @@ const ASX_WATCHLIST_DEFAULT = [
 //   • nextAsxOpen() returns null (frontend hides the "opens in" countdown)
 //   • getSymbolInfo() falls through to the US default for everything
 // ============================================================================
+// Default flipped to ON (May 2026, dual-broker dashboard rollout). The env
+// remains a hard kill-switch — set ASX_ENABLED=false/0/no to force-disable
+// regardless of operator UI state. Anything else (unset, true, anything
+// else) leaves ASX visible. Per-market operator toggle lives on the
+// portfolio row (`asx_market_enabled`) and gates execution; the env gate
+// only hides ASX entirely if explicitly killed.
 function isAsxEnabled() {
   const raw = (process.env.ASX_ENABLED || '').trim().toLowerCase();
-  return raw === 'true' || raw === '1' || raw === 'yes';
+  if (raw === 'false' || raw === '0' || raw === 'no' || raw === 'off') return false;
+  return true;
 }
 
 function getAsxWatchlist() {

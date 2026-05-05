@@ -10,6 +10,7 @@ const {
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
+  setMarketEnabled, setMarketMode,
 } = require('./agent');
 const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
@@ -325,6 +326,37 @@ app.post('/api/agent/day-cadence', requireOperator, async (req, res) => {
   try {
     const { seconds } = req.body || {};
     const r = await setDayCadence(seconds);
+    broadcastState();
+    res.json({ success: true, ...r });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Per-market master switch (US/ASX ON/OFF). Operator-gated. Audit-logged.
+// Strategies for the disabled market are short-circuited at the cycle
+// eligibility step — quorum/confidence/breaker/kill-switch all unchanged.
+app.post('/api/agent/market-enabled', requireOperator, async (req, res) => {
+  try {
+    const { market, enabled } = req.body || {};
+    const r = await setMarketEnabled(market, enabled);
+    broadcastState();
+    res.json({ success: true, ...r });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Per-market paper/live mode. Operator-gated. Live requires the explicit
+// 'I_UNDERSTAND_LIVE' confirm token (mirrors the legacy /trading-mode
+// endpoint). For ASX, mode is preference-only until IBKR execution is wired.
+// requireOperatorStrict matches the legacy /trading-mode policy: LIVE
+// switches are refused unless OPERATOR_TOKEN is configured AND provided
+// (closes the auth regression the architect flagged). PAPER switches still
+// pass through requireOperator.
+app.post('/api/agent/market-mode', requireOperator, requireOperatorStrict, async (req, res) => {
+  try {
+    const { market, mode, confirm } = req.body || {};
+    if (mode === 'live' && confirm !== 'I_UNDERSTAND_LIVE') {
+      return res.status(400).json({ success: false, error: 'Switching to LIVE requires confirm: "I_UNDERSTAND_LIVE"' });
+    }
+    const r = await setMarketMode(market, mode);
     broadcastState();
     res.json({ success: true, ...r });
   } catch (e) { res.status(400).json({ success: false, error: e.message }); }

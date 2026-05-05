@@ -44,6 +44,19 @@ async function ensureSchema() {
   // ([5, 600]) — fast enough to catch micro-setups, slow enough to avoid
   // rate-limiting Alpaca's bar API. NEVER affects swing/asx_swing.
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_trading_cadence_seconds INTEGER NOT NULL DEFAULT 60`);
+  // Per-market operator toggles. The agent has always supported a single
+  // top-level `trading_mode` (paper/live) which controlled Alpaca only.
+  // With the dual-broker dashboard (Alpaca US + IBKR ASX), each market gets
+  // its own ON/OFF master switch and its own paper/live mode so the operator
+  // can run e.g. US-LIVE while keeping ASX in PAPER. Defaults are SAFE:
+  //   • us_market_enabled / asx_market_enabled: TRUE — markets visible.
+  //   • us_trading_mode / asx_trading_mode:    'paper' — never auto-go-live.
+  // The legacy `trading_mode` column stays as the source of truth for the
+  // US-side Alpaca client (it's what alpacaService.setMode reads); the new
+  // `us_trading_mode` mirrors it 1:1 and is kept in lockstep by setMarketMode.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS us_market_enabled  BOOLEAN NOT NULL DEFAULT TRUE`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_market_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_trading_mode   TEXT    NOT NULL DEFAULT 'paper'`);
   // Trailing-stop tracking: highest price seen since entry, used to ratchet stop_loss UP.
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS highest_price NUMERIC(12,4)`);
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS trailing_armed BOOLEAN NOT NULL DEFAULT FALSE`);
@@ -492,6 +505,7 @@ const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'auto_breaker_reset',
   'day_trading_recovery_buffer_seconds',
   'day_trading_cadence_seconds',
+  'us_market_enabled', 'asx_market_enabled', 'asx_trading_mode',
 ]);
 
 async function updatePortfolio(updates) {
