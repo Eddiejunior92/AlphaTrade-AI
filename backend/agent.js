@@ -25,6 +25,7 @@ const continuousLearning = require('./services/continuousLearningService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
+const dipBuyService = require('./services/dipBuyService');
 const optionsActivityService = require('./services/optionsActivityService');
 const optionsFlowService = require('./services/optionsFlowService');
 const macroFactorService = require('./services/macroFactorService');
@@ -375,12 +376,18 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
         : RECOVERY_BUFFER_DEFAULT;
     } catch (_) { /* swallow — never block execution */ }
   }
+  // Stamp the active dip-buy strictness on every BUY audit (read from env
+  // each time so an operator change takes effect on the next BUY without
+  // restart). Like recovery_buffer_seconds, only meaningful on day BUYs but
+  // written for all sides so the audit shape stays uniform.
+  const _activeDipStrictness = side === 'BUY' ? dipBuyService.getStrictness() : null;
   await db.recordAudit({
     event_type: 'TRADE_EXECUTED', symbol, decision: side,
     confidence: signal?.confidence, models: signal?.models,
     payload: { qty, price, stop_loss, take_profit, pnl: usdPnl, native_pnl: nativePnl,
                reason, strategy, market, currency, fx_rate: fxToUsd,
                ...(side === 'BUY' && _activeBuffer != null ? { recovery_buffer_seconds: _activeBuffer } : {}),
+               ...(side === 'BUY' && _activeDipStrictness != null ? { dip_strictness: _activeDipStrictness } : {}),
                // Persist ML + regime metadata on BUY so the SELL path can
                // train both the mlAdaptive and metaLearning layers on
                // the exact decision-time context.
@@ -1120,6 +1127,34 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
           });
           return;
         }
+      }
+
+      // ---------------------------------------------------------------------
+      // Dip-buy priority filter — day strategy only. Demands the BUY occur
+      // at a low-point / dip / support condition rather than buying into
+      // strength. Strictness configured via DAY_TRADING_DIP_REQUIREMENT_STRICTNESS
+      // (0=disabled, 1=loose, 2=medium DEFAULT, 3=strict). STRICTLY ADDITIVE:
+      // can only downgrade BUY→HOLD via TRADE_REJECTED, never upgrades or
+      // relaxes any safety rail. Fails OPEN on missing indicators/orderFlow
+      // so a data hiccup cannot wedge entries.
+      const dipVerdict = dipBuyService.checkDipConditions({
+        bars, indicators, orderFlow,
+      });
+      if (!dipVerdict.allow) {
+        await db.recordAudit({
+          event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+          confidence: signal.confidence,
+          payload: {
+            reason: 'dip_required',
+            strategy: sc.name, market: info.market,
+            dip_strictness: dipVerdict.strictness,
+            dip_conditions_met: dipVerdict.conditionsMet,
+            dip_conditions_required: dipVerdict.requiredConditions,
+            dip_conditions: dipVerdict.conditions,
+            dip_metrics: dipVerdict.metrics,
+          },
+        });
+        return;
       }
     }
 
@@ -2123,6 +2158,12 @@ async function getAgentSnapshot() {
       effectiveBand,
     },
     riskScales: listRiskScales(),
+    dipBuy: {
+      strictness: dipBuyService.getStrictness(),
+      labels: { 0: 'disabled', 1: 'loose', 2: 'medium', 3: 'strict' },
+      envVar: 'DAY_TRADING_DIP_REQUIREMENT_STRICTNESS',
+      appliesTo: 'day',
+    },
     recoveryBuffer: {
       seconds: Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
         ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
