@@ -85,23 +85,51 @@ async function start({ getSnapshot, getRecentTrades }) {
     partials: [Partials.Channel, Partials.Message],
   });
 
-  _client.once(Events.ClientReady, (c) => {
+  _client.once(Events.ClientReady, async (c) => {
     console.log(`[DiscordChat] Logged in as ${c.user.tag}. Listening on ${channelId ? `channel ${channelId} + DMs` : 'DMs only (set DISCORD_CHAT_CHANNEL_ID for a server channel)'}`);
+    // Diagnostic heartbeat: try to fetch the configured channel and post a
+    // boot message. This proves (a) the bot is in the server, (b) it can see
+    // the channel, and (c) it has Send Messages permission. If any of those
+    // fail, the error tells us exactly which one.
+    if (channelId) {
+      try {
+        const ch = await c.channels.fetch(channelId);
+        if (!ch) console.error(`[DiscordChat] channel ${channelId} not found — is the bot invited to that server and can it see this channel?`);
+        else if (typeof ch.send !== 'function') console.error(`[DiscordChat] channel ${channelId} is type ${ch.type} — not a text channel.`);
+        else {
+          await ch.send('🤖 Alpha online — try saying hi.');
+          console.log(`[DiscordChat] Heartbeat posted to channel ${channelId}.`);
+        }
+      } catch (e) {
+        console.error(`[DiscordChat] could not access channel ${channelId}: ${e.message}. Check: (1) bot is in the server, (2) bot has View Channel + Send Messages perms here, (3) channel id is correct.`);
+      }
+    }
   });
 
   _client.on(Events.MessageCreate, async (msg) => {
     try {
+      // Diagnostic: log EVERY incoming message before any filter so we can
+      // tell the difference between "Discord isn't sending events" (no log
+      // line at all → Message Content Intent likely off, or bot lacks
+      // channel access) and "events arrive but get filtered" (line appears).
+      const chType = msg.channel?.type;
+      const chId = msg.channel?.id;
+      const author = msg.author?.tag || msg.author?.id || 'unknown';
+      const contentPreview = (msg.content || '').slice(0, 60);
+      console.log(`[DiscordChat] msg received: author=${author} chType=${chType} chId=${chId} contentLen=${(msg.content || '').length} preview="${contentPreview}"`);
+
       // Ignore bot messages (incl. self) AND webhook messages — prevents
       // echo loops with the outbound webhook used for daily P&L / trade
       // alerts. Belt-and-suspenders: webhook posts have webhookId set even
       // when their author isn't flagged as a bot.
-      if (msg.author?.bot) return;
-      if (msg.webhookId) return;
+      if (msg.author?.bot) { console.log('[DiscordChat] skip: bot author'); return; }
+      if (msg.webhookId)   { console.log('[DiscordChat] skip: webhook'); return; }
       const isDM = msg.channel?.type === ChannelType.DM;
       const isTargetChannel = channelId && msg.channel?.id === channelId;
-      if (!isDM && !isTargetChannel) return;
+      if (!isDM && !isTargetChannel) { console.log(`[DiscordChat] skip: wrong channel (got ${msg.channel?.id}, want ${channelId} or DM)`); return; }
       const text = String(msg.content || '').trim();
-      if (!text) return;
+      if (!text) { console.log('[DiscordChat] skip: empty content (Message Content Intent may be OFF in Developer Portal)'); return; }
+      console.log(`[DiscordChat] handling: routing to brokerService.chat()`);
 
       // Show "typing…" while Grok thinks. Best-effort — ignore failures.
       try { await msg.channel.sendTyping(); } catch {}
