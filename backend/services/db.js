@@ -228,6 +228,49 @@ async function ensureSchema() {
   await query(`CREATE UNIQUE INDEX IF NOT EXISTS safety_suggestions_pending_uniq
                ON safety_suggestions (kind, target, suggested_value) WHERE status = 'pending'`);
 
+  // Long-Term Memory & Experience Replay (memoryService). One row per closed
+  // trade — the structured "what happened, in what context, with what
+  // outcome" so the agent can retrieve similar past situations on every
+  // cycle and inject the lessons into LLM prompts. feature_vec is a fixed-
+  // length normalized JSONB float array (~28 dims) used for cosine-sim
+  // retrieval — pgvector is intentionally NOT required (cleaner deployment
+  // story, and the dims/cardinality are tiny enough that in-memory cosine
+  // is faster than a vector index round-trip).
+  //
+  // Strictly read-only feedback into prompts — this layer never gates
+  // trades, never alters risk parameters, and never bypasses quorum or any
+  // hard safety rail. Failures degrade silently to a null prompt block.
+  await query(`
+    CREATE TABLE IF NOT EXISTS trade_memory (
+      id              SERIAL PRIMARY KEY,
+      trade_id        INTEGER UNIQUE,            -- the SELL trades.id this memory closed; UNIQUE so we never double-index
+      symbol          VARCHAR(16) NOT NULL,
+      strategy        VARCHAR(32) NOT NULL,
+      regime          VARCHAR(32) NOT NULL DEFAULT 'unknown',
+      market          VARCHAR(8)  NOT NULL DEFAULT 'US',
+      direction       VARCHAR(8)  NOT NULL,      -- 'BUY' (we open longs only)
+      entry_price     NUMERIC(18,6),
+      exit_price      NUMERIC(18,6),
+      qty             NUMERIC(18,6),
+      pnl_usd         NUMERIC(14,4) NOT NULL,
+      won             BOOLEAN NOT NULL,
+      hold_seconds    INTEGER,
+      entry_confidence NUMERIC(6,4),
+      entry_quorum    INTEGER,                   -- 0-4, count of agreeing voters at entry
+      lesson          TEXT NOT NULL,
+      feature_vec     JSONB NOT NULL,            -- fixed-length normalized float array
+      feature_schema_version INTEGER NOT NULL DEFAULT 1,  -- bump when featurize() layout changes; retrieval filters on this
+      context_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,  -- raw snapshot for forensic inspection
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  // Forward-compat ALTER for environments that already created the table
+  // before the version column was introduced.
+  await query(`ALTER TABLE trade_memory ADD COLUMN IF NOT EXISTS feature_schema_version INTEGER NOT NULL DEFAULT 1`);
+  await query(`CREATE INDEX IF NOT EXISTS trade_memory_strategy_regime_idx ON trade_memory (strategy, regime, market)`);
+  await query(`CREATE INDEX IF NOT EXISTS trade_memory_symbol_idx ON trade_memory (symbol)`);
+  await query(`CREATE INDEX IF NOT EXISTS trade_memory_created_idx ON trade_memory (created_at DESC)`);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

@@ -31,6 +31,7 @@ const scenarioSimService = require('./services/scenarioSimService');
 const causalInference = require('./services/causalInferenceService');
 const counterfactual = require('./services/counterfactualService');
 const safetySuggestion = require('./services/safetySuggestionService');
+const memoryService = require('./services/memoryService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -650,7 +651,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   // the boot-time scheduler below. Strictly informational — neither layer
   // can change the consensus, the gate, the size, or the breaker. Failures
   // here degrade silently to null blocks (LLMs simply don't see them).
-  let causalContext = null, counterfactualContext = null;
+  let causalContext = null, counterfactualContext = null, experienceContext = null;
   try {
     const g = await causalInference.getGraph({ strategy: sc.name, regime, market: info.market });
     causalContext = causalInference.renderForPrompt(g);
@@ -658,6 +659,34 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   try {
     const r = await counterfactual.getResults({ strategy: sc.name, regime, market: info.market });
     counterfactualContext = counterfactual.renderForPrompt(r);
+  } catch (_) {}
+  // Long-term memory / experience replay — top-K most similar past closed
+  // trades for this (strategy, regime, indicator buckets) context. Featurises
+  // the CURRENT decision context, runs cosine sim against the in-memory
+  // cache, takes the top-5 with sim ≥ 0.6, and renders a balanced wins/
+  // losses prompt block. Pure prior — never gates trades.
+  try {
+    const ind = indicators || {};
+    const pat = patterns || {};
+    const ns = newsSentiment;
+    const matches = await memoryService.retrieveSimilar({
+      strategy: sc.name,
+      market: info.market,
+      regime,
+      direction: 'BUY',
+      // Confidence/quorum aren't known yet (we're building the prompt, not
+      // closing the loop) — leave at neutral defaults so retrieval keys
+      // primarily off regime + indicators + market.
+      confidence: 0.85,
+      unanimousQuorum: false,
+      rsi: ind.rsi,
+      macdHistogram: ind.macd?.histogram,
+      volRatio: ind.volume?.ratio,
+      newsPolarity: typeof ns?.polarity === 'number' ? ns.polarity : (typeof ns === 'number' ? ns : null),
+      breakout: pat.breakout,
+      trend: pat.trend,
+    }, { k: 5, minSim: 0.6 });
+    experienceContext = memoryService.renderForPrompt(matches);
   } catch (_) {}
 
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
@@ -680,8 +709,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // Dynamic-weighting + meta-reasoner context. Both are strictly
     // informational; raw quorum + confidence gate retain full veto.
     regime, market: info.market,
-    // Causal + counterfactual prompt blocks. Pre-rendered text or null.
-    causalContext, counterfactualContext,
+    // Causal + counterfactual + experience-replay prompt blocks. Pre-rendered
+    // text or null — all strictly informational, never gating.
+    causalContext, counterfactualContext, experienceContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -1542,6 +1572,20 @@ setInterval(async () => {
     const ctx = await _resolveSafetyContext();
     await safetySuggestion.refresh(ctx).catch(() => {});
   } catch (_) {}
+}, 30 * 60 * 1000);
+
+// Long-Term Memory & Experience Replay warm-up — backfill memory rows for
+// every closed trade not yet indexed, then refresh every 30 min so newly
+// closed trades show up in retrieval. Strictly informational; cannot affect
+// the trading loop. Failures are logged and swallowed.
+setTimeout(async () => {
+  try {
+    const r = await memoryService.backfill({ force: true });
+    console.log(`[Memory] Startup backfill: indexed ${r.indexed} of ${r.totalCandidates ?? 0} candidate trades`);
+  } catch (e) { console.error('[Memory] Startup backfill failed:', e.message); }
+}, 150_000);
+setInterval(() => {
+  memoryService.backfill().catch(() => {});
 }, 30 * 60 * 1000);
 
 (async () => {

@@ -337,6 +337,7 @@ const llmWeightingService = require('./services/llmWeightingService');
 const causalInferenceService = require('./services/causalInferenceService');
 const counterfactualService = require('./services/counterfactualService');
 const safetySuggestionService = require('./services/safetySuggestionService');
+const memoryService = require('./services/memoryService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -575,6 +576,29 @@ app.post('/api/safety-suggestions/:id/reject', requireOperator, async (req, res)
     const rejected = await safetySuggestionService.rejectSuggestion(req.params.id, { decided_by, reason });
     res.json({ success: true, rejected });
   } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Long-Term Memory & Experience Replay introspection. Read-only summary of
+// the in-memory cache plus an optional filtered slice (by strategy/regime/
+// market). Operator-gated POST /refresh forces a backfill scan for any
+// closed trades not yet indexed. Strictly informational endpoint — no way
+// to mutate trade_memory rows from the API surface.
+app.get('/api/memory', async (req, res) => {
+  try {
+    const summary = await memoryService.getDashboardSummary({
+      strategy: req.query.strategy || null,
+      regime: req.query.regime || null,
+      market: req.query.market || null,
+      limit: Math.min(parseInt(req.query.limit) || 50, 200),
+    });
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/memory/refresh', requireOperator, async (_req, res) => {
+  try {
+    const r = await memoryService.backfill({ force: true });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Self-play scenario simulation introspection — per-symbol probabilistic
