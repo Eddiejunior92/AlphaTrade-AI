@@ -139,6 +139,17 @@ function computeTargetRisk({ scale, signal, dynamic }) {
   };
 }
 
+// Lazy require to keep the dependency tree clean — strategyDiscoveryService
+// is an optional layer; if it ever fails to load, the gate continues to work.
+let _discoverySvc = null;
+function _discovery() {
+  if (_discoverySvc === null) {
+    try { _discoverySvc = require('./strategyDiscoveryService'); }
+    catch (_) { _discoverySvc = false; }
+  }
+  return _discoverySvc || null;
+}
+
 async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, strategyConfig, dynamic }) {
   const sc = strategyConfig;
   if (signal.consensus !== 'BUY') return { allow: false, reason: 'Not a BUY signal' };
@@ -152,6 +163,21 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   const macroBoost = Math.max(0, Number(dynForGate.macroAdjust?.confidenceBoost) || 0);
   const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost + macroBoost });
   if (!q.ok) return { allow: false, reason: q.reason };
+  // Automated Strategy Discovery overlays — operator-applied additive filters.
+  // Strictly TIGHTENING: can only return allow:false (downgrade BUY→HOLD),
+  // never allow:true. Failures inside the discovery layer fail-safe to allow
+  // (existing quorum/conf gate above already passed; we don't add risk by
+  // failing open here, and we don't silently bypass an overlay either —
+  // the layer's own swallow-and-allow path is documented in its source).
+  const disc = _discovery();
+  if (disc) {
+    try {
+      const reg = signal.weightContext?.regime || dynForGate.regimeAdjust?.regime || 'unknown';
+      const mkt = signal.weightContext?.market || dynForGate.market || 'US';
+      const ov = await disc.checkOverlays({ signal, strategy: sc.name, regime: reg, market: mkt });
+      if (ov && ov.allow === false) return { allow: false, reason: ov.reason };
+    } catch (_) { /* fail-safe to allow */ }
+  }
   // Reject averaging-in: if symbol already held in this strategy, force a new
   // sell-or-hold cycle before re-entering. Avoids local-state corruption from
   // upsertHolding (which replaces qty rather than accumulating).

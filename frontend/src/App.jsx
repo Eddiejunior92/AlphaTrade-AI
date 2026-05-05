@@ -13,6 +13,7 @@ import MarketClocks from './components/MarketClocks';
 import PreMarketBriefing from './components/PreMarketBriefing';
 import BacktestPanel from './components/BacktestPanel';
 import SafetySuggestionsPanel from './components/SafetySuggestionsPanel';
+import StrategyProposalsPanel from './components/StrategyProposalsPanel';
 import MarketFilter from './components/MarketFilter';
 import SectorFilter, { buildSectorCounts } from './components/SectorFilter';
 import CompaniesTab from './components/CompaniesTab';
@@ -365,6 +366,11 @@ export default function App() {
             {/* Intelligent Safety Suggestions — pending recommendations the
                 user can apply or dismiss. Bounded; never auto-applied. */}
             <SafetySuggestionsPanel />
+
+            {/* Automated Strategy Discovery — pending rule variations the
+                backtest engine surfaced. Apply / Dismiss are operator-only;
+                nothing is ever auto-applied. */}
+            <StrategyProposalsPanel />
 
             {/* Strategy mini-toggles */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

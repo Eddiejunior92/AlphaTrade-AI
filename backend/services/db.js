@@ -323,6 +323,60 @@ async function ensureSchema() {
   await query(`CREATE INDEX IF NOT EXISTS trade_feedback_created_idx ON trade_feedback (created_at DESC)`);
   await query(`CREATE INDEX IF NOT EXISTS trade_feedback_sentiment_idx ON trade_feedback (sentiment)`);
 
+  // Automated Strategy Discovery — proposals + active overlays.
+  // `strategy_proposals` holds every backtested rule variation that beat the
+  // delta threshold; status starts at 'pending' and moves to 'applied' or
+  // 'dismissed' when the operator decides. Discovery NEVER auto-applies.
+  // `active_overlays` is the live filter set: each row is a strictly
+  // additive decision-rule predicate that downgrades a candidate BUY to
+  // HOLD if the predicate fails. Predicates are pure functions of decision-
+  // time signal/audit metadata; rule_def is rehydrated into a runnable
+  // predicate by strategyDiscoveryService at gate-check time.
+  await query(`
+    CREATE TABLE IF NOT EXISTS strategy_proposals (
+      id            SERIAL PRIMARY KEY,
+      rule_key      VARCHAR(128) NOT NULL,
+      rule_label    TEXT NOT NULL,
+      rule_def      JSONB NOT NULL,
+      strategy      VARCHAR(64) NOT NULL,
+      regime        VARCHAR(64) NOT NULL,
+      market        VARCHAR(16) NOT NULL,
+      baseline_n    INTEGER NOT NULL,
+      baseline_pnl  NUMERIC(14,2) NOT NULL,
+      baseline_wr   NUMERIC(6,3) NOT NULL,
+      kept_n        INTEGER NOT NULL,
+      dropped_n     INTEGER NOT NULL,
+      kept_pnl      NUMERIC(14,2) NOT NULL,
+      kept_wr       NUMERIC(6,3) NOT NULL,
+      delta_pnl     NUMERIC(14,2) NOT NULL,
+      status        VARCHAR(16) NOT NULL DEFAULT 'pending',
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      decided_at    TIMESTAMPTZ,
+      dismissed_by  VARCHAR(64)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS strategy_proposals_status_idx
+               ON strategy_proposals (status, delta_pnl DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS strategy_proposals_ctx_idx
+               ON strategy_proposals (rule_key, strategy, regime, market, status)`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS active_overlays (
+      id                 SERIAL PRIMARY KEY,
+      rule_key           VARCHAR(128) NOT NULL,
+      rule_label         TEXT NOT NULL,
+      rule_def           JSONB NOT NULL,
+      strategy           VARCHAR(64) NOT NULL,
+      regime             VARCHAR(64) NOT NULL,
+      market             VARCHAR(16) NOT NULL,
+      source_proposal_id INTEGER REFERENCES strategy_proposals(id) ON DELETE SET NULL,
+      applied_by         VARCHAR(64) NOT NULL DEFAULT 'operator',
+      applied_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS active_overlays_ctx_uniq
+               ON active_overlays (rule_key, strategy, regime, market)`);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

@@ -340,6 +340,7 @@ const safetySuggestionService = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
 const feedbackService = require('./services/feedbackService');
+const strategyDiscoveryService = require('./services/strategyDiscoveryService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -656,6 +657,37 @@ app.get('/api/feedback/recent', async (req, res) => {
 app.get('/api/feedback/calibration', async (_req, res) => {
   try { res.json(await feedbackService.getDashboardSummary()); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Automated Strategy Discovery endpoints. Read endpoints are public; mutate
+// endpoints (apply / dismiss / revert / force-refresh) are operator-gated
+// because they CHANGE live trading behaviour (overlay-applied trades will
+// be downgraded BUY→HOLD).
+app.get('/api/strategy-proposals', async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    res.json({ rows: await strategyDiscoveryService.getProposals({ status, limit: req.query.limit }) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/strategy-discovery/summary', async (_req, res) => {
+  try { res.json(await strategyDiscoveryService.getDashboardSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/strategy-proposals/:id/apply', requireOperator, async (req, res) => {
+  try { res.json(await strategyDiscoveryService.applyProposal({ id: req.params.id })); }
+  catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+app.post('/api/strategy-proposals/:id/dismiss', requireOperator, async (req, res) => {
+  try { res.json(await strategyDiscoveryService.dismissProposal({ id: req.params.id })); }
+  catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+app.delete('/api/strategy-overlays/:id', requireOperator, async (req, res) => {
+  try { res.json(await strategyDiscoveryService.revokeOverlay({ id: req.params.id })); }
+  catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+app.post('/api/strategy-discovery/refresh', requireOperator, async (_req, res) => {
+  try { res.json({ ok: true, ...(await strategyDiscoveryService.refresh({ force: true })) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // Self-play scenario simulation introspection — per-symbol probabilistic

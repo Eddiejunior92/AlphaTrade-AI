@@ -1625,6 +1625,23 @@ setInterval(() => {
   propagationService.refresh().catch(() => {});
 }, 30 * 60 * 1000);
 
+// Automated Strategy Discovery warm-up. Periodically backtests small
+// variations of trading rules and persists the strongest as PENDING
+// proposals for the operator to apply or dismiss on the dashboard. NEVER
+// auto-applies — operator approval is mandatory. 4-hour cadence (slow,
+// expensive signal). Failures are logged and swallowed.
+const strategyDiscoveryService = require('./services/strategyDiscoveryService');
+setTimeout(async () => {
+  try {
+    const r = await strategyDiscoveryService.refresh({ force: true });
+    if (r?.error) console.error('[StrategyDiscovery] Startup refresh failed:', r.error);
+    else console.log(`[StrategyDiscovery] Startup refresh: ${r?.proposalsInserted ?? 0} new proposals from ${r?.candidates ?? 0} candidates over ${r?.bucketsEvaluated ?? 0} buckets (${r?.totalCloses ?? 0} closes scanned)`);
+  } catch (e) { console.error('[StrategyDiscovery] Startup refresh failed:', e.message); }
+}, 210_000);
+setInterval(() => {
+  strategyDiscoveryService.refresh().catch(() => {});
+}, 4 * 60 * 60 * 1000);
+
 (async () => {
   try {
     await db.ensureSchema();
