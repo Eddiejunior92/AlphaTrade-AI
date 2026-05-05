@@ -53,6 +53,50 @@ const WATCHLIST = getWatchlist();
 const BASE_INTERVAL_SECONDS = Math.max(30, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
+// =============================================================================
+// [Upgrade #4 / Scale & Speed] Performance counters + LLM-skip cache.
+// =============================================================================
+// All counters are observability-only — none of them gates any safety check.
+// `perfMetrics` is reset by /api/perf?reset=1 for ad-hoc measurement windows.
+const perfMetrics = {
+  cycles: 0,
+  cycleDurationsMs: [],     // bounded ring buffer (last 60)
+  lastCycleMs: null,
+  lastCycleStartedAt: null,
+  lastCycleFinishedAt: null,
+  strategyDurationsMs: {},  // { day:[…], swing:[…], asx_swing:[…] } — last 60 each
+  ensembleCalls: 0,         // calls that actually went to llmService
+  ensembleSkipped: 0,       // reserved for future skip-cache layer (currently always 0)
+  watchdogResets: 0,
+  startedAt: Date.now(),
+};
+function _pushBounded(arr, val, cap = 60) { arr.push(val); if (arr.length > cap) arr.shift(); }
+
+// [Upgrade #4 / Scale & Speed] Execution mutex.
+// -----------------------------------------------------------------------------
+// US-bucket and ASX-bucket strategies run concurrently (Promise.all in
+// runCycle). Both buckets call `riskManager.evaluateBuy({ ..., cash })` where
+// `cash` is read from a SHARED `portfolio.cash_balance` (db.js). Without
+// serialization a US BUY and an ASX BUY could both observe the same cash
+// snapshot, both pass the budget check, and overdraw. This promise-chain
+// mutex serializes ONLY the small critical section (evaluateBuy + place order
+// + adjustCash) — the slow LLM ensemble and bar/news/intel fetches still run
+// in parallel. Effect on throughput: order placement is naturally infrequent
+// (most ticks are HOLD), so serializing this 50-200 ms section costs ~nothing
+// while removing the cash double-spend race entirely.
+let _executionChain = Promise.resolve();
+async function withExecutionLock(fn) {
+  const prev = _executionChain;
+  let release;
+  _executionChain = new Promise(r => { release = r; });
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 const memoryState = {
   lastRun: null,
   lastSignals: {},
@@ -774,6 +818,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     if (liq) liquidityLine = liquidityService.renderForPrompt(liq);
   } catch (_) {}
 
+  perfMetrics.ensembleCalls++;
   const signal = await llmService.getEnsembleDecision({
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
@@ -875,11 +920,27 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // shrinks size. Hard-clamped in riskManager: boost ≥ 0, sizeMult ≤ 1.0.
       macroAdjust: macroAdjustForRisk || undefined,
     };
-    const eval_ = await riskManager.evaluateBuy({
-      symbol, signal, price: latestUsd, equity, cash, holdings,
-      strategyConfig: sc, dynamic: dynamicWithUpgrades,
-    });
-    if (eval_.allow) {
+    // [Upgrade #4] Atomic BUY critical section — re-read fresh cash +
+    // holdings, run evaluateBuy, AND executeOrder all under a single lock
+    // acquisition. This is the only way to prevent a parallel ASX bucket
+    // from observing pre-deduction cash between our evaluate and our
+    // adjustCash. Equity drift within a cycle is bounded (few orders max)
+    // and the daily-loss budget + 5% breaker were already validated at
+    // cycle start, so reusing `equity` here is safe.
+    await withExecutionLock(async () => {
+      const _portFresh = await db.getPortfolio();
+      const _cashNow   = Number.isFinite(parseFloat(_portFresh.cash_balance))
+        ? parseFloat(_portFresh.cash_balance) : cash;
+      const _allHFresh = await db.getHoldings();
+      const eval_ = await riskManager.evaluateBuy({
+        symbol, signal, price: latestUsd, equity, cash: _cashNow, holdings: _allHFresh,
+        strategyConfig: sc, dynamic: dynamicWithUpgrades,
+      });
+      if (!eval_.allow) {
+        await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+          confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
+        return;
+      }
       const sz = eval_.sizing || {};
       // Convert USD-equivalent stop/take back to NATIVE for broker + storage.
       // For US (fxToUsd === 1) this is a no-op.
@@ -905,25 +966,28 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
           (info.currency !== 'USD' ? ` | fx ${info.currency}/USD=${fxToUsd.toFixed(4)}` : ''),
         strategy: sc.name,
         market: info.market, currency: info.currency, fxToUsd,
-        // ML + regime metadata — persisted on BUY audit, replayed at SELL for online training.
         mlFeatures, riskUSD: eval_.riskUSD, regime,
       });
-    } else {
-      await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
-        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
-    }
+    });
   } else if (signal.consensus === 'SELL') {
-    const eval_ = await riskManager.evaluateSell({ symbol, signal, holdings, strategyConfig: sc });
-    if (eval_.allow) {
+    // [Upgrade #4] Atomic SELL critical section — evaluateSell needs the
+    // freshest holdings (a parallel bucket may have just sold the same
+    // symbol), and executeOrder calls adjustCash which the other bucket
+    // reads. Both inside one lock acquisition.
+    await withExecutionLock(async () => {
+      const _allHFresh = await db.getHoldings();
+      const eval_ = await riskManager.evaluateSell({ symbol, signal, holdings: _allHFresh, strategyConfig: sc });
+      if (!eval_.allow) {
+        await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'SELL',
+          confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
+        return;
+      }
       await executeOrder({
         symbol, side: 'SELL', qty: eval_.qty, price: latest,
         signal, reason: signal.reason, strategy: sc.name,
         market: info.market, currency: info.currency, fxToUsd,
       });
-    } else {
-      await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'SELL',
-        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
-    }
+    });
   }
   return signal;
 }
@@ -982,6 +1046,11 @@ async function runCycle() {
   if (cycleInProgress || tradingLock) { console.log('[Agent] Cycle/flatten in progress, skipping'); return; }
   cycleInProgress = true;
   tradingLock = true;
+  // [Upgrade #4] perf — wall-clock per cycle so the watchdog and /api/perf
+  // can spot slowdowns or hangs.
+  const cycleT0 = Date.now();
+  perfMetrics.lastCycleStartedAt = cycleT0;
+  perfMetrics.cycles++;
   memoryState.lastRun = new Date().toISOString();
   memoryState.cycleCount++;
 
@@ -1075,14 +1144,36 @@ async function runCycle() {
       { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock },
       { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null },
     ];
-    for (const { sc, enabled, marketOpen, clock: stratClock } of strategies) {
-      if (!enabled) continue;
-      if (!marketOpen) continue;
-      const lastRun = memoryState.strategyLastRun[sc.name];
+    // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
+    // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
+    // share the US watchlist and the same circuit-breaker / cash account, so
+    // back-to-back execution avoids a race where two strategies both think
+    // there's enough cash for the same buy). The ASX bucket is fully
+    // independent (separate broker, separate symbols, separate market hours)
+    // so it always runs in parallel with US — meaningful when ASX evening
+    // overlaps US morning, and zero-cost when only one market is open.
+    const eligibleStrategies = strategies.filter(s => {
+      if (!s.enabled || !s.marketOpen) return false;
+      const lastRun = memoryState.strategyLastRun[s.sc.name];
       const elapsed = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 1000 : Infinity;
-      if (elapsed < sc.intervalSeconds - 5) continue;
-      await runStrategy(sc, portfolio, stratClock, usdFullLookup, dynamic);
-    }
+      return elapsed >= s.sc.intervalSeconds - 5;
+    });
+    const usBucket = eligibleStrategies.filter(s => s.sc.name !== 'asx_swing');
+    const asxBucket = eligibleStrategies.filter(s => s.sc.name === 'asx_swing');
+
+    const runBucketSequential = async (bucket) => {
+      for (const { sc, clock: stratClock } of bucket) {
+        const t0 = Date.now();
+        await runStrategy(sc, portfolio, stratClock, usdFullLookup, dynamic);
+        const dt = Date.now() - t0;
+        if (!perfMetrics.strategyDurationsMs[sc.name]) perfMetrics.strategyDurationsMs[sc.name] = [];
+        _pushBounded(perfMetrics.strategyDurationsMs[sc.name], dt);
+      }
+    };
+    await Promise.all([
+      runBucketSequential(usBucket),
+      runBucketSequential(asxBucket),
+    ]);
 
     // Portfolio-level hedge check — informational by default. AUTO_HEDGE=true
     // arms an inverse-ETF hedge (SH) sized to 15% of long exposure on a risk
@@ -1132,10 +1223,63 @@ async function runCycle() {
     console.error('[Agent] Cycle error:', e);
     await db.recordAudit({ event_type: 'CYCLE_ERROR', payload: { error: e.message, stack: e.stack } });
   } finally {
+    const dt = Date.now() - cycleT0;
+    perfMetrics.lastCycleMs = dt;
+    perfMetrics.lastCycleFinishedAt = Date.now();
+    _pushBounded(perfMetrics.cycleDurationsMs, dt);
     cycleInProgress = false;
     tradingLock = false;
   }
 }
+
+// =============================================================================
+// [Upgrade #4 / Scale & Speed] Watchdog — auto-restart on hung cycles.
+// =============================================================================
+// If a cycle never completes (deadlock, broker timeout cascade, runaway
+// promise) the agent stops trading silently. The watchdog catches that:
+// when a cycle has been "in progress" for more than WATCHDOG_HUNG_MS without
+// completing, we log + audit + `process.exit(1)`. On Replit, the workflow
+// auto-restarts on non-zero exit, giving us a clean recovery. SAFETY: this
+// runs OUTSIDE the trading loop and uses an independent timer; it cannot be
+// blocked by whatever is blocking the cycle. Threshold is 5 minutes — well
+// past any legitimate cycle even with all four LLMs slow-pathing.
+const WATCHDOG_HUNG_MS = parseInt(process.env.WATCHDOG_HUNG_MS || '300000');
+const WATCHDOG_INTERVAL_MS = 30_000;
+let _watchdogHandle = null;
+function startWatchdog() {
+  if (_watchdogHandle) return;
+  _watchdogHandle = setInterval(() => {
+    if (!cycleInProgress) return;
+    const startedAt = perfMetrics.lastCycleStartedAt;
+    if (!startedAt) return;
+    const age = Date.now() - startedAt;
+    if (age > WATCHDOG_HUNG_MS) {
+      perfMetrics.watchdogResets++;
+      const msg = `[Watchdog] Cycle hung for ${(age/1000).toFixed(0)}s (> ${WATCHDOG_HUNG_MS/1000}s) — exiting for auto-restart`;
+      console.error(msg);
+      try { db.recordAudit({ event_type: 'WATCHDOG_RESTART', payload: { ageMs: age, threshold: WATCHDOG_HUNG_MS } }); } catch (_) {}
+      // Give the audit a moment to flush, then exit. Replit workflow will
+      // restart us automatically.
+      setTimeout(() => process.exit(1), 1000);
+    }
+  }, WATCHDOG_INTERVAL_MS);
+  if (_watchdogHandle.unref) _watchdogHandle.unref();
+  console.log(`[Watchdog] Started — hang threshold ${WATCHDOG_HUNG_MS/1000}s`);
+}
+startWatchdog();
+
+// Process-level safety nets. unhandledRejection used to kill the process by
+// default; we log + audit, but DO NOT exit here (the watchdog will catch a
+// truly stuck cycle). For uncaughtException, exit so the workflow restarts.
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] unhandledRejection:', reason);
+  try { db.recordAudit({ event_type: 'UNHANDLED_REJECTION', payload: { message: String(reason?.message || reason) } }); } catch (_) {}
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Process] uncaughtException — exiting for auto-restart:', err);
+  try { db.recordAudit({ event_type: 'UNCAUGHT_EXCEPTION', payload: { message: err?.message, stack: err?.stack } }); } catch (_) {}
+  setTimeout(() => process.exit(1), 500);
+});
 
 async function startAgent() {
   // Latched kill switch — only a process restart clears it. Reject loudly
@@ -1920,4 +2064,6 @@ module.exports = {
   // pre-warmup. Read-only USD price-lookup builder; identical logic to the
   // per-cycle path. Does NOT touch trading state.
   buildPriceLookup,
+  // [Upgrade #4] Surfaced for /api/perf — observability only.
+  perfMetrics,
 };

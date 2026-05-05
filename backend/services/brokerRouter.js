@@ -22,8 +22,75 @@ async function placeOrder({ symbol, qty, side, type, time_in_force }) {
   return broker.placeOrder({ symbol, qty, side: side.toLowerCase(), type, time_in_force });
 }
 
+// =============================================================================
+// [Upgrade #4 / Scale & Speed] Bar-cache layer + in-flight de-duplication.
+// =============================================================================
+// A single trading cycle can request the same (symbol, timeframe, limit) many
+// times across different code paths (price snapshot in runCycle, intraday
+// analysis, indicators, signal storage). Hitting the broker every time is
+// wasteful and adds 50-300 ms of latency per repeat. This cache:
+//   • TTLs short timeframes only (1Min=8s, 5Min=60s) — long timeframes either
+//     have their own service-level caches (varStress, liquidity, historical)
+//     or are bespoke historical fetches (skip when opts.start/end is set).
+//   • Coalesces in-flight identical calls so 5 simultaneous requests for the
+//     same bars produce ONE broker round-trip instead of five.
+//   • SAFETY: cache is bypassed entirely when `opts.start`, `opts.end`,
+//     `opts.paginate`, or `opts.noMock` is set — those callers (historical
+//     intelligence, VaR, liquidity) need exact, unshared data.
+//   • Cache is read-only data. Cannot influence sizing, quorum, or any
+//     existing safety check.
+const BAR_CACHE_TTL_MS = { '1Min': 8000, '5Min': 60_000, '15Min': 180_000, '1Hour': 600_000 };
+const _barCache = new Map();   // key -> { ts, data }
+const _barInFlight = new Map(); // key -> Promise
+const _barMetrics = { hits: 0, misses: 0, inflight: 0, bypass: 0 };
+
+function _shouldBypass(opts) {
+  if (!opts) return false;
+  return !!(opts.start || opts.end || opts.paginate || opts.noMock);
+}
+
 async function getBars(symbol, timeframe, limit, opts) {
-  return getBroker(symbol).getBars(symbol, timeframe, limit, opts);
+  const ttl = BAR_CACHE_TTL_MS[timeframe];
+  if (!ttl || _shouldBypass(opts)) {
+    _barMetrics.bypass++;
+    return getBroker(symbol).getBars(symbol, timeframe, limit, opts);
+  }
+  const key = `${symbol}|${timeframe}|${limit}`;
+  const cached = _barCache.get(key);
+  if (cached && Date.now() - cached.ts < ttl) {
+    _barMetrics.hits++;
+    return cached.data;
+  }
+  // Coalesce concurrent fetches for the same key.
+  const pending = _barInFlight.get(key);
+  if (pending) {
+    _barMetrics.inflight++;
+    return pending;
+  }
+  _barMetrics.misses++;
+  const p = getBroker(symbol).getBars(symbol, timeframe, limit, opts)
+    .then(data => {
+      _barCache.set(key, { ts: Date.now(), data });
+      return data;
+    })
+    .finally(() => { _barInFlight.delete(key); });
+  _barInFlight.set(key, p);
+  return p;
+}
+
+function getBarCacheMetrics() {
+  const total = _barMetrics.hits + _barMetrics.misses + _barMetrics.inflight + _barMetrics.bypass;
+  const cacheable = _barMetrics.hits + _barMetrics.misses + _barMetrics.inflight;
+  return {
+    ..._barMetrics,
+    total,
+    hitRatePct: cacheable > 0 ? +(((_barMetrics.hits + _barMetrics.inflight) / cacheable) * 100).toFixed(1) : 0,
+    cacheSize: _barCache.size,
+  };
+}
+
+function resetBarCacheMetrics() {
+  _barMetrics.hits = 0; _barMetrics.misses = 0; _barMetrics.inflight = 0; _barMetrics.bypass = 0;
 }
 
 async function closePosition(symbol) {
@@ -94,4 +161,6 @@ module.exports = {
   getBroker, placeOrder, getBars, closePosition,
   closeAllPositionsAllBrokers, cancelAllOpenOrdersAllBrokers,
   setKillSwitchActiveAll, getMarketStatus,
+  // [Upgrade #4] bar-cache observability — surfaced via /api/perf
+  getBarCacheMetrics, resetBarCacheMetrics,
 };

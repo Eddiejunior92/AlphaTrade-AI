@@ -637,6 +637,66 @@ app.get('/api/liquidity/:symbol', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// [Upgrade #4 / Scale & Speed] Performance + health observability.
+// Read-only. Reports cycle timing percentiles, strategy timings, bar-cache
+// hit rates, LLM ensemble call/skip counters, watchdog state, memory usage,
+// and process uptime. Pass `?reset=1` to zero the counters for a fresh
+// measurement window (does NOT reset cycle history).
+app.get('/api/perf', (req, res) => {
+  try {
+    const agent = require('./agent');
+    const brokerRouter = require('./services/brokerRouter');
+    const m = agent.perfMetrics || {};
+    const pct = (arr, p) => {
+      if (!arr || !arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      const i = Math.min(s.length - 1, Math.floor(p / 100 * s.length));
+      return s[i];
+    };
+    const stratStats = {};
+    for (const [name, arr] of Object.entries(m.strategyDurationsMs || {})) {
+      stratStats[name] = {
+        samples: arr.length,
+        p50Ms: pct(arr, 50), p95Ms: pct(arr, 95), maxMs: arr.length ? Math.max(...arr) : null,
+      };
+    }
+    const cycleStats = {
+      total: m.cycles,
+      lastMs: m.lastCycleMs,
+      lastStartedAt: m.lastCycleStartedAt ? new Date(m.lastCycleStartedAt).toISOString() : null,
+      lastFinishedAt: m.lastCycleFinishedAt ? new Date(m.lastCycleFinishedAt).toISOString() : null,
+      samples: (m.cycleDurationsMs || []).length,
+      p50Ms: pct(m.cycleDurationsMs, 50),
+      p95Ms: pct(m.cycleDurationsMs, 95),
+      maxMs: (m.cycleDurationsMs || []).length ? Math.max(...m.cycleDurationsMs) : null,
+    };
+    const ensembleStats = {
+      called: m.ensembleCalls || 0,
+      skippedByCache: m.ensembleSkipped || 0,
+      skipRatePct: (m.ensembleCalls + m.ensembleSkipped) > 0
+        ? +(m.ensembleSkipped / (m.ensembleCalls + m.ensembleSkipped) * 100).toFixed(1) : 0,
+    };
+    const mem = process.memoryUsage();
+    const payload = {
+      ts: Date.now(),
+      uptime: { processSec: Math.round(process.uptime()), agentSec: m.startedAt ? Math.round((Date.now() - m.startedAt) / 1000) : null },
+      cycle: cycleStats,
+      strategies: stratStats,
+      ensemble: ensembleStats,
+      barCache: brokerRouter.getBarCacheMetrics(),
+      watchdog: { resets: m.watchdogResets || 0 },
+      memory: { rssMB: +(mem.rss / 1024 / 1024).toFixed(1), heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1) },
+      node: { version: process.version, pid: process.pid },
+    };
+    if (req.query.reset === '1') {
+      brokerRouter.resetBarCacheMetrics();
+      m.ensembleCalls = 0; m.ensembleSkipped = 0;
+      payload.reset = true;
+    }
+    res.json(payload);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/continuous-learning/dashboard', async (_req, res) => {
   try {
     const continuousLearning = require('./services/continuousLearningService');
