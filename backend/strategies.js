@@ -29,9 +29,12 @@ const STRATEGIES = {
     timeframe: '1Min',
     lookback: 60, // need ≥35 bars for MACD(12,26,9); 60 gives a stable EMA warmup
     intervalSeconds: 20,
-    // base stop/target — scaled by risk scale's stop/target multipliers
-    stopLossPct: 0.005,
-    takeProfitPct: 0.01,
+    // base stop/target — scaled by risk scale's stop/target multipliers.
+    // Widened to 1.0%/2.0% (May 2026) so balanced (1.0× multipliers) hits
+    // the operator-spec'd day stop/target without being knocked out by
+    // ordinary intraday wiggle on 1Min bars.
+    stopLossPct: 0.01,
+    takeProfitPct: 0.02,
     maxHoldings: 4,
     forceFlattenBeforeClose: true,
     holdOvernight: false,
