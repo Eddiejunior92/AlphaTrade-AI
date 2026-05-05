@@ -8,9 +8,9 @@
     "start": "node backend/server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:conservative": "node scripts/risk.js test conservative",
-    "test:balanced":     "node scripts/risk.js test balanced",
-    "test:aggressive":   "node scripts/risk.js test aggressive",
-    "risk:status":       "node scripts/risk.js status"
+    "test:balanced": "node scripts/risk.js test balanced",
+    "test:aggressive": "node scripts/risk.js test aggressive",
+    "risk:status": "node scripts/risk.js status"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +21,7 @@
     "autoprefixer": "^10.5.0",
     "axios": "^1.16.0",
     "cors": "^2.8.6",
+    "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "lucide-react": "^1.14.0",

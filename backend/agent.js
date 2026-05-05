@@ -1431,9 +1431,20 @@ async function runCycle() {
     // default if the column is unset/invalid. Quorum, confidence gate,
     // dip-buy filter, recovery buffer remain unchanged — this only controls
     // scheduler pacing.
-    const dayCadenceLive = Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
-      ? parseInt(portfolio.day_trading_cadence_seconds)
-      : DAY_CADENCE_DEFAULT;
+    // Per-market cadence reads (live each cycle so dashboard changes apply
+    // on the very next eligibility check). US cadence drives the day strategy
+    // tick; ASX cadence drives asx_swing. Falls back through:
+    //   us_cadence_seconds → day_trading_cadence_seconds (legacy) → DEFAULT
+    //   asx_cadence_seconds → ASX_CADENCE_DEFAULT
+    const usCadenceLive = Number.isFinite(parseInt(portfolio?.us_cadence_seconds))
+      ? parseInt(portfolio.us_cadence_seconds)
+      : (Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
+          ? parseInt(portfolio.day_trading_cadence_seconds)
+          : CADENCE_DEFAULTS.US);
+    const asxCadenceLive = Number.isFinite(parseInt(portfolio?.asx_cadence_seconds))
+      ? parseInt(portfolio.asx_cadence_seconds)
+      : CADENCE_DEFAULTS.ASX;
+    const dayCadenceLive = usCadenceLive; // back-compat alias for the day strategy
     // Per-market operator master switches. Default TRUE (legacy rows). When
     // OFF, every strategy targeting that market is force-disabled regardless
     // of its individual day/swing/asx_swing toggle.
@@ -1454,7 +1465,7 @@ async function runCycle() {
       // marketRegistry.isAsxOpen() returns false anyway → strategy is never
       // eligible. The asxMarketOn switch only blocks new entries; exits
       // continue so any existing ASX position can still be managed.
-      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
+      { sc: { ...applyRiskScale(STRATEGIES.asx_swing, scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
     ];
     // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
     // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
@@ -1805,20 +1816,52 @@ const RECOVERY_BUFFER_DEFAULT = 75;
 const DAY_CADENCE_MIN = 5;
 const DAY_CADENCE_MAX = 600;
 const DAY_CADENCE_DEFAULT = 60;
-async function setDayCadence(seconds) {
+// Per-market cadence bounds. ASX swing is intentionally allowed a wider
+// upper bound (1800s = 30 min) since it's a swing strategy that holds
+// overnight — minute-level pacing is wasteful. Lower bound mirrors US
+// (5s) so an operator can still hand-test fast cycles in paper mode.
+const ASX_CADENCE_MIN = 5;
+const ASX_CADENCE_MAX = 1800;
+const CADENCE_DEFAULTS = { US: 60, ASX: 120 };
+const CADENCE_BOUNDS   = {
+  US:  { min: DAY_CADENCE_MIN, max: DAY_CADENCE_MAX,  default: CADENCE_DEFAULTS.US,  presets: [15, 20, 30, 60, 90, 120],     appliesTo: 'day'       },
+  ASX: { min: ASX_CADENCE_MIN, max: ASX_CADENCE_MAX,  default: CADENCE_DEFAULTS.ASX, presets: [60, 120, 180, 300, 600, 900], appliesTo: 'asx_swing' },
+};
+const CADENCE_COLUMN = { US: 'us_cadence_seconds', ASX: 'asx_cadence_seconds' };
+
+// Unified per-market cadence setter. Operator-gated upstream. Audit-logged
+// as MARKET_CADENCE_CHANGED so the existing day-cadence audit consumers can
+// add a `market` filter if they want. Keeps `day_trading_cadence_seconds` in
+// sync with US so legacy readers (downstream tools, /api/state.dayCadence)
+// don't drift.
+async function setMarketCadence(market, seconds) {
+  const m = String(market || '').toUpperCase();
+  if (m !== 'US' && m !== 'ASX') throw new Error('market must be "US" or "ASX"');
   const n = Number(seconds);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < DAY_CADENCE_MIN || n > DAY_CADENCE_MAX) {
-    throw new Error(`day_trading_cadence_seconds must be an integer in [${DAY_CADENCE_MIN}, ${DAY_CADENCE_MAX}]`);
+  const bounds = CADENCE_BOUNDS[m];
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < bounds.min || n > bounds.max) {
+    throw new Error(`${CADENCE_COLUMN[m]} must be an integer in [${bounds.min}, ${bounds.max}]`);
   }
   const prevPort = await db.getPortfolio();
-  const prev = prevPort?.day_trading_cadence_seconds ?? DAY_CADENCE_DEFAULT;
-  await db.updatePortfolio({ day_trading_cadence_seconds: n });
+  const prev = prevPort?.[CADENCE_COLUMN[m]] ?? bounds.default;
+  const updates = { [CADENCE_COLUMN[m]]: n };
+  // Mirror US cadence into the legacy column so any tool still reading
+  // `day_trading_cadence_seconds` (or the `dayCadence` block in /api/state)
+  // sees the same value. ASX never had a legacy column.
+  if (m === 'US') updates.day_trading_cadence_seconds = n;
+  await db.updatePortfolio(updates);
   await db.recordAudit({
-    event_type: 'DAY_CADENCE_CHANGED',
-    payload: { from: prev, to: n, min: DAY_CADENCE_MIN, max: DAY_CADENCE_MAX },
+    event_type: 'MARKET_CADENCE_CHANGED',
+    payload: { market: m, from: prev, to: n, min: bounds.min, max: bounds.max },
   });
-  console.log(`[Agent] Day-trading cadence: ${prev}s → ${n}s`);
-  return { prev, current: n };
+  console.log(`[Agent] ${m} cadence: ${prev}s → ${n}s`);
+  return { market: m, prev, current: n };
+}
+
+// Back-compat shim — older endpoint /api/agent/day-cadence still works and
+// just forwards to the unified setter as if the operator targeted US.
+async function setDayCadence(seconds) {
+  return setMarketCadence('US', seconds);
 }
 async function setRecoveryBuffer(seconds) {
   const n = Number(seconds);
@@ -2346,15 +2389,38 @@ async function getAgentSnapshot() {
       envVar: 'DAY_TRADING_DIP_REQUIREMENT_STRICTNESS',
       appliesTo: 'day',
     },
+    // Legacy shape retained for back-compat (older UI build still reads
+    // /api/state.dayCadence). New UI reads /api/state.cadences instead,
+    // which exposes both US and ASX in a uniform shape.
     dayCadence: {
-      seconds: Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
-        ? parseInt(portfolio.day_trading_cadence_seconds)
-        : DAY_CADENCE_DEFAULT,
+      seconds: Number.isFinite(parseInt(portfolio?.us_cadence_seconds))
+        ? parseInt(portfolio.us_cadence_seconds)
+        : (Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
+            ? parseInt(portfolio.day_trading_cadence_seconds)
+            : CADENCE_DEFAULTS.US),
       min: DAY_CADENCE_MIN,
       max: DAY_CADENCE_MAX,
-      default: DAY_CADENCE_DEFAULT,
-      presets: [15, 20, 30, 60, 90, 120],
+      default: CADENCE_DEFAULTS.US,
+      presets: CADENCE_BOUNDS.US.presets,
       appliesTo: 'day',
+    },
+    cadences: {
+      US: {
+        seconds: Number.isFinite(parseInt(portfolio?.us_cadence_seconds))
+          ? parseInt(portfolio.us_cadence_seconds)
+          : CADENCE_DEFAULTS.US,
+        ...CADENCE_BOUNDS.US,
+        broker: 'Alpaca',
+        flag: '🇺🇸',
+      },
+      ASX: {
+        seconds: Number.isFinite(parseInt(portfolio?.asx_cadence_seconds))
+          ? parseInt(portfolio.asx_cadence_seconds)
+          : CADENCE_DEFAULTS.ASX,
+        ...CADENCE_BOUNDS.ASX,
+        broker: 'IBKR',
+        flag: '🇦🇺',
+      },
     },
     recoveryBuffer: {
       seconds: Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
@@ -2662,7 +2728,7 @@ module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence, setMarketCadence,
   setMarketEnabled, setMarketMode,
   WATCHLIST,
   // Exposed for the /api/risk-capacity endpoint so it can compute on-demand

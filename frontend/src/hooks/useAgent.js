@@ -243,6 +243,15 @@ export function useAgent() {
         return r;
       } finally { setLoad('dayCadence', false); }
     },
+    setMarketCadence: async (market, seconds) => {
+      const k = `marketCadence:${market}`;
+      setLoad(k, true);
+      try {
+        const r = await apiPost('/agent/market-cadence', { market, seconds: parseInt(seconds, 10) });
+        await refreshLogs();
+        return r;
+      } finally { setLoad(k, false); }
+    },
     setMarketEnabled: async (market, enabled) => {
       const k = `marketEnabled:${market}`;
       setLoad(k, true);

@@ -44,6 +44,12 @@ async function ensureSchema() {
   // ([5, 600]) — fast enough to catch micro-setups, slow enough to avoid
   // rate-limiting Alpaca's bar API. NEVER affects swing/asx_swing.
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_trading_cadence_seconds INTEGER NOT NULL DEFAULT 60`);
+  // Per-market cadence (operator-tunable). `us_cadence_seconds` controls the
+  // US day strategy tick; `asx_cadence_seconds` controls the ASX swing tick.
+  // The legacy `day_trading_cadence_seconds` column remains as a fallback for
+  // any tooling that still reads it; new code reads the per-market columns.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS us_cadence_seconds INTEGER NOT NULL DEFAULT 60`);
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_cadence_seconds INTEGER NOT NULL DEFAULT 120`);
   // Per-market operator toggles. The agent has always supported a single
   // top-level `trading_mode` (paper/live) which controlled Alpaca only.
   // With the dual-broker dashboard (Alpaca US + IBKR ASX), each market gets
@@ -505,6 +511,8 @@ const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'auto_breaker_reset',
   'day_trading_recovery_buffer_seconds',
   'day_trading_cadence_seconds',
+  'us_cadence_seconds',
+  'asx_cadence_seconds',
   'us_market_enabled', 'asx_market_enabled', 'asx_trading_mode',
 ]);
 

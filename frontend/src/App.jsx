@@ -100,7 +100,7 @@ export default function App() {
     connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
-    toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
+    toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence, setMarketCadence,
     setMarketEnabled, setMarketMode,
     authStatus, setOperatorToken, getStoredOperatorToken,
     setBreakerAutoReset,
@@ -471,14 +471,23 @@ export default function App() {
               loading={loading.recoveryBuffer}
             />
 
-            {/* Day-trading cycle cadence — operator-tunable interval between
-                day-strategy ticks. Pacing only; quorum/confidence/dip-buy/
-                recovery-buffer all unchanged. */}
-            <DayCadenceControl
-              dayCadence={state?.dayCadence}
-              onChange={setDayCadence}
-              loading={loading.dayCadence}
-            />
+            {/* Per-market cycle cadence — operator-tunable interval between
+                strategy ticks for US (day) and ASX (swing). Pacing only;
+                quorum/confidence/dip-buy/recovery-buffer all unchanged.
+                Falls back to legacy single-cadence panel on older backends. */}
+            {state?.cadences ? (
+              <MarketCadenceControls
+                cadences={state.cadences}
+                onChange={setMarketCadence}
+                loading={loading}
+              />
+            ) : (
+              <DayCadenceControl
+                dayCadence={state?.dayCadence}
+                onChange={setDayCadence}
+                loading={loading.dayCadence}
+              />
+            )}
 
             {/* Dynamic Sizing — compounding × confidence × performance */}
             <DynamicSizingPanel riskScale={riskScale} />
@@ -1370,6 +1379,117 @@ function RecoveryBufferControl({ recoveryBuffer, onChange, loading }) {
 // 90/120s); the numeric input still allows any value in [min, max] for
 // fine-tuning. Apply enables only when the draft differs from live AND is
 // in-range, preventing accidental no-op writes.
+// Per-market cadence container. Renders one MarketCadenceRow per market
+// (US + ASX) using the unified /api/state.cadences shape. Each row is fully
+// independent — the operator can tune US tick rate without touching ASX
+// (and vice versa). Loading state is keyed per market so spinners don't
+// cross-fire.
+function MarketCadenceControls({ cadences, onChange, loading }) {
+  const order = ['US', 'ASX'];
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
+          Per-Market Cycle Cadence
+        </div>
+        <div className="text-[10px] text-[var(--text-dim)]">
+          Independent US (day) + ASX (swing) pacing
+        </div>
+      </div>
+      <div className="space-y-3">
+        {order.map(m => cadences[m] && (
+          <MarketCadenceRow
+            key={m}
+            market={m}
+            cad={cadences[m]}
+            onChange={(s) => onChange(m, s)}
+            loading={loading?.[`marketCadence:${m}`]}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MarketCadenceRow({ market, cad, onChange, loading }) {
+  const live = Number.isFinite(parseInt(cad?.seconds))
+    ? parseInt(cad.seconds)
+    : (cad?.default ?? 60);
+  const min  = cad?.min ?? 5;
+  const max  = cad?.max ?? 600;
+  const def  = cad?.default ?? 60;
+  const presets = Array.isArray(cad?.presets) && cad.presets.length ? cad.presets : [60, 120];
+  const [draft, setDraft] = useState(String(live));
+  const [err, setErr] = useState('');
+  useEffect(() => { setDraft(String(live)); }, [live]);
+  const n = parseInt(draft, 10);
+  const valid = Number.isFinite(n) && n >= min && n <= max;
+  const dirty = valid && n !== live;
+  const apply = async (override) => {
+    setErr('');
+    const target = Number.isFinite(override) ? override : n;
+    if (!Number.isFinite(target) || target < min || target > max) { setErr(`Must be ${min}–${max}`); return; }
+    if (target === live) return;
+    const r = await onChange(target);
+    if (!r?.success) setErr(r?.error || 'Failed');
+  };
+  return (
+    <div className="glass p-3 sm:p-4 border border-white/5">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[12px] font-semibold text-[var(--text)]">
+          {cad.flag} {market} <span className="text-[var(--text-dim)] font-normal">· {cad.broker} · {cad.appliesTo}</span>
+        </div>
+        <div className="text-[10px] text-[var(--text-dim)]">
+          {min}–{max}s · default {def}s · live <span className="text-[var(--text)] font-semibold">{live}s</span>
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5 flex-wrap mb-2">
+        {presets.map(p => {
+          const active = p === live;
+          return (
+            <button
+              key={p}
+              onClick={() => apply(p)}
+              disabled={loading || active}
+              className={`text-[11px] font-semibold px-2.5 py-1 rounded-xl border transition-colors ${
+                active
+                  ? 'bg-[var(--blue)]/25 border-[var(--blue)]/50 text-[var(--blue)] cursor-default'
+                  : 'bg-white/5 border-white/10 text-[var(--text-dim)] hover:text-white hover:border-white/30'
+              }`}
+            >{p}s</button>
+          );
+        })}
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <input
+          type="number" min={min} max={max} step={5} value={draft}
+          onChange={e => setDraft(e.target.value)}
+          disabled={loading}
+          className="w-24 bg-black/30 border border-white/10 rounded px-2 py-1 text-sm text-[var(--text)] focus:outline-none focus:border-[var(--blue)]/60"
+        />
+        <span className="text-[11px] text-[var(--text-dim)]">seconds</span>
+        <button
+          onClick={() => apply()}
+          disabled={!dirty || loading}
+          className={`text-[11px] font-semibold px-3 py-1 rounded transition-colors ${
+            dirty && !loading
+              ? 'bg-[var(--blue)]/20 text-[var(--blue)] border border-[var(--blue)]/40 hover:bg-[var(--blue)]/30'
+              : 'bg-white/5 text-[var(--text-dim)] border border-white/10 cursor-not-allowed'
+          }`}
+        >{loading ? '…' : 'Apply'}</button>
+        {live !== def && (
+          <button
+            onClick={() => apply(def)}
+            disabled={loading}
+            className="text-[10px] text-[var(--text-dim)] hover:text-[var(--text)] underline"
+          >reset to {def}s</button>
+        )}
+      </div>
+      {err && <div className="text-[10px] text-[var(--red)] mt-1">{err}</div>}
+    </div>
+  );
+}
+
 function DayCadenceControl({ dayCadence, onChange, loading }) {
   const live = Number.isFinite(parseInt(dayCadence?.seconds))
     ? parseInt(dayCadence.seconds)

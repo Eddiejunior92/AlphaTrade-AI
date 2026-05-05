@@ -168,6 +168,31 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
     escalated: perfMetrics.ensembleEscalated   || 0,
   } : null;
 
+  // Operating-cost estimate. Token-level accounting would require capturing
+  // the `usage` block from every OpenRouter response — out of scope for this
+  // pass. Instead we use an env-tunable per-call rate. The default 0.002 USD
+  // is a generous mid-range estimate (Grok-4-Fast/Gemini-Flash sit far below;
+  // GPT-4o sits above) so reported "net after costs" is conservative — not
+  // optimistic. Operators can tune LLM_CALL_COST_USD once they want a
+  // tighter number. Data-feed cost is a flat daily figure (Alpaca free tier
+  // = $0; if/when a paid feed is wired, set DATA_FEED_COST_USD_PER_DAY).
+  const llmCallCost  = Number(process.env.LLM_CALL_COST_USD) || 0.002;
+  const dataDailyUSD = Number(process.env.DATA_FEED_COST_USD_PER_DAY) || 0;
+  const llmCalls     = (llm?.calls || 0) + (llm?.escalated || 0);
+  const llmCostUSD   = +(llmCalls * llmCallCost).toFixed(2);
+  const totalGrossUSD = (us.net_pnl_usd || 0) + (asx.net_pnl_usd || 0);
+  const totalCostsUSD = +(llmCostUSD + dataDailyUSD).toFixed(2);
+  const totalNetUSD   = +(totalGrossUSD - totalCostsUSD).toFixed(2);
+  const expenses = {
+    llm_call_cost_usd: llmCallCost,
+    llm_calls_billed:  llmCalls,
+    llm_cost_usd:      llmCostUSD,
+    data_feed_usd:     +dataDailyUSD.toFixed(2),
+    total_costs_usd:   totalCostsUSD,
+    total_gross_usd:   +totalGrossUSD.toFixed(2),
+    total_net_usd:     totalNetUSD,
+  };
+
   return {
     tradingDate: date,
     us, asx,
@@ -177,6 +202,7 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
     day_start_equity: portfolio.day_start_equity != null ? parseFloat(portfolio.day_start_equity) : null,
     insights,
     llm,
+    expenses,
   };
 }
 
@@ -283,9 +309,22 @@ function formatSummaryText(summary) {
   const usRegime  = fmtRegime(summary.us.best_regime);
   const asxRegime = fmtRegime(summary.asx.best_regime);
 
+  // P&L summary — gross, expenses, net-after-costs. Always rendered (even
+  // on zero-trade days) so the operator can see today's run rate of LLM
+  // spend against revenue.
+  const e = summary.expenses || {};
+  const fmtSigned = (v) => `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`;
+  const pnlBlock = e.total_gross_usd != null ? [
+    `💰 **Net P&L (after costs)**`,
+    `• Gross: **${fmtSigned(e.total_gross_usd)}**  •  Costs: $${e.total_costs_usd.toFixed(2)}  •  **Net: ${fmtSigned(e.total_net_usd)}**`,
+    `• Expenses: LLM $${e.llm_cost_usd.toFixed(2)} (${e.llm_calls_billed.toLocaleString()} calls @ $${e.llm_call_cost_usd}) + Data $${e.data_feed_usd.toFixed(2)}`,
+    '',
+  ] : [];
+
   return [
     `📊 **Daily Performance — ${dateLabel}**`,
     '─────────────────────────────',
+    ...pnlBlock,
     formatMarketBlock('US Markets',  '🇺🇸', summary.us),
     '',
     formatMarketBlock('ASX Markets', '🇦🇺', summary.asx),

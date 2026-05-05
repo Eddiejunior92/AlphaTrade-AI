@@ -10,8 +10,9 @@ const {
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
-  setMarketEnabled, setMarketMode,
+  setMarketEnabled, setMarketMode, setMarketCadence,
 } = require('./agent');
+const discordChatService = require('./services/discordChatService');
 const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
@@ -326,6 +327,20 @@ app.post('/api/agent/day-cadence', requireOperator, async (req, res) => {
   try {
     const { seconds } = req.body || {};
     const r = await setDayCadence(seconds);
+    broadcastState();
+    res.json({ success: true, ...r });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Per-market cadence — operator-tunable interval (seconds) between strategy
+// ticks for a given market. Body: { market: 'US'|'ASX', seconds: int }.
+// Bounds enforced in agent.setMarketCadence (US: [5, 600], ASX: [5, 1800]).
+// US writes also mirror to the legacy day_trading_cadence_seconds column so
+// downstream tools that still read it stay in sync.
+app.post('/api/agent/market-cadence', requireOperator, async (req, res) => {
+  try {
+    const { market, seconds } = req.body || {};
+    const r = await setMarketCadence(market, seconds);
     broadcastState();
     res.json({ success: true, ...r });
   } catch (e) { res.status(400).json({ success: false, error: e.message }); }
@@ -1568,6 +1583,16 @@ server.listen(PORT, '0.0.0.0', () => {
   // the same Grok endpoint.
   setTimeout(refreshAllSentiment, 3000);
   setInterval(refreshAllSentiment, 10 * 60 * 1000);
+
+  // Discord chat — start the bot if DISCORD_BOT_TOKEN is set. Without the
+  // token the service no-ops and logs once at boot. The bot listens in a
+  // designated channel (DISCORD_CHAT_CHANNEL_ID) or DMs and routes each
+  // message through brokerService (same Grok stack as the in-app voice
+  // chat). It NEVER places trades — it's a read/info interface only.
+  discordChatService.start({
+    getSnapshot: getAgentSnapshot,
+    getRecentTrades: () => db.getRecentTrades(10),
+  }).catch(e => console.error('[DiscordChat] start error:', e.message));
 });
 
 process.on('uncaughtException', (e) => console.error('[Process] uncaughtException:', e));
