@@ -329,6 +329,7 @@ const rlExecution = require('./services/rlExecutionService');
 const optionsFlowService = require('./services/optionsFlowService');
 const macroForecastService = require('./services/macroForecastService');
 const scenarioSimService = require('./services/scenarioSimService');
+const llmWeightingService = require('./services/llmWeightingService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -450,6 +451,22 @@ app.get('/api/macro-forecast', async (_req, res) => {
     const cached = macroForecastService.getCachedRaw();
     if (!cached) return res.status(404).json({ error: 'no_macro_forecast', hint: 'warms ~75s after boot, refreshes every 60 min during US market hours' });
     res.json({ ...cached, prompt: macroForecastService.renderForPrompt(cached) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Dynamic LLM ensemble-weighting introspection. Returns the current weight
+// table for a (strategy, regime, market) context plus a summary of how many
+// context buckets we have data for. Read-only.
+app.get('/api/llm-weights', async (req, res) => {
+  try {
+    const strategy = String(req.query.strategy || 'day');
+    const regime = String(req.query.regime || 'unknown');
+    const market = String(req.query.market || 'US').toUpperCase();
+    const [snap, summary] = await Promise.all([
+      llmWeightingService.getWeights({ strategy, regime: { primary: regime }, market }),
+      llmWeightingService.getDashboardSummary(),
+    ]);
+    res.json({ ...snap, summary, prompt: llmWeightingService.renderForPrompt(snap) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

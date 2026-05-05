@@ -76,6 +76,29 @@ async function ensureSchema() {
     )
   `);
 
+  // Per-model performance bucketed by regime + market — drives the dynamic
+  // ensemble-weighting layer (llmWeightingService). The base model_performance
+  // table above captures (model, strategy); this finer table adds regime and
+  // market so weights can adapt to *context* (e.g. Claude is strong in
+  // RISK_OFF + ASX swing but mid-pack in RISK_ON + US day). Bayesian-smoothed
+  // when sample counts are low so cold-start weights stay near 1.0.
+  await query(`
+    CREATE TABLE IF NOT EXISTS model_regime_performance (
+      model_id   TEXT NOT NULL,
+      strategy   TEXT NOT NULL,
+      regime     TEXT NOT NULL,
+      market     TEXT NOT NULL,
+      n_trades   INTEGER NOT NULL DEFAULT 0,
+      n_wins     INTEGER NOT NULL DEFAULT 0,
+      gross_pnl  NUMERIC(14,4) NOT NULL DEFAULT 0,
+      win_rate   NUMERIC(5,4) NOT NULL DEFAULT 0,
+      avg_pnl    NUMERIC(14,4) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (model_id, strategy, regime, market)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS model_regime_perf_lookup_idx ON model_regime_performance (strategy, regime, market)`);
+
   // ML adaptive layer (mlAdaptiveService) — persistent online-learned weights
   // for the logistic + linear heads that calibrate confidence and nudge
   // sizing within the [0.85, 1.15] band. Single row, JSONB blob.

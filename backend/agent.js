@@ -659,6 +659,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
     regimeContext, knowledgeContext, macroForecast, scenarioSim,
+    // Dynamic-weighting + meta-reasoner context. Both are strictly
+    // informational; raw quorum + confidence gate retain full veto.
+    regime, market: info.market,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -679,7 +682,16 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       historicalAvailable: !!historical,
       votes: signal.votes, reason: signal.reason, strategy: sc.name,
       ml_features: _mlFeaturesForAudit,
-      regime, regime_adjust: regimeAdjust },
+      regime, regime_adjust: regimeAdjust,
+      // Dynamic-weighting + meta-reasoner audit fields — informational only,
+      // never gate trading. Surfaced for the dashboard + post-hoc review.
+      raw_confidence: signal.rawConfidence,
+      weighted_consensus: signal.weightedConsensus,
+      weighted_confidence: signal.weightedConfidence,
+      weighted_votes: signal.weightedVotes,
+      ensemble_weights: signal.weights,
+      weight_context: signal.weightContext,
+      meta_opinion: signal.meta },
   });
 
   // Tag signal with market+currency so the dashboard can filter US vs ASX

@@ -1,4 +1,6 @@
 const axios = require('axios');
+const llmWeighting = require('./llmWeightingService');
+const metaReasoner = require('./metaReasonerService');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
@@ -36,7 +38,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
@@ -59,11 +61,19 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // built from regime + macro + IV + recent price action. Strictly
   // informational; does not vote, size, or gate anything.
   const simBlock = scenarioSim ? `\n${scenarioSim}\n` : '';
+  // Dynamic ensemble weighting block — shows each peer model's current
+  // weight + sample size in this (strategy × regime × market) context.
+  // Strictly informational; the prior weight may inform the model's own
+  // confidence calibration but never overrides quorum/gate.
+  const weightsBlock = ensembleWeights ? `\n${ensembleWeights}\n` : '';
+  // Prior cycle's meta-reasoner opinion (if any). Models can see and
+  // disagree with the prior take — useful context, not gospel.
+  const metaBlock = priorMeta ? `\n${priorMeta}\n` : '';
   // Long-term knowledge-graph block — slow-moving per-symbol context
   // (sector peers, earnings track, valuation, macro, major events).
   // Informational; never overrides quorum/gate/sizing.
   const knowledgeBlock = knowledgeContext ? `\n${knowledgeContext}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${knowledgeBlock}`;
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${knowledgeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -317,9 +327,31 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market }) {
+  // ---------------------------------------------------------------------
+  // STEP 1 — Resolve dynamic per-model weights for this (strategy, regime,
+  // market) context. Cold-start safe (uniform 1.0). Failures degrade to
+  // null → caller treats as uniform.
+  // ---------------------------------------------------------------------
+  let weightSnap = null, weightsBlock = null;
+  try {
+    weightSnap = await llmWeighting.getWeights({ strategy: strategyName, regime, market });
+    weightsBlock = llmWeighting.renderForPrompt(weightSnap);
+  } catch (_) { /* silent — uniform weights */ }
+
+  // ---------------------------------------------------------------------
+  // STEP 2 — Inject prior meta-reasoner opinion (from last cycle, same
+  // strategy:symbol) so each voter sees the prior take and can disagree.
+  // ---------------------------------------------------------------------
+  const metaKey = `${strategyName || 'day'}:${symbol}`;
+  const priorMetaObj = metaReasoner.getLast(metaKey);
+  const priorMetaBlock = metaReasoner.renderForPrompt(priorMetaObj);
+
+  // ---------------------------------------------------------------------
+  // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
+  // ---------------------------------------------------------------------
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled
@@ -335,31 +367,85 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
       votes: { BUY: 0, SELL: 0, HOLD: MODELS.length },
       models: results,
       reason: `Only ${valid.length}/${MODELS.length} models returned (need ${MIN_VALID_MODELS}). Forcing HOLD for safety.`,
+      weights: weightSnap?.weights || null,
     };
   }
 
+  // ---------------------------------------------------------------------
+  // RAW (unweighted) tally — feeds riskManager.checkQuorum unchanged.
+  // ---------------------------------------------------------------------
   const votes = { BUY: 0, SELL: 0, HOLD: 0 };
   let confSum = { BUY: 0, SELL: 0, HOLD: 0 };
   valid.forEach(r => {
     votes[r.action] = (votes[r.action] || 0) + 1;
     confSum[r.action] = (confSum[r.action] || 0) + r.confidence;
   });
-
-  const consensus = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
-  const avgConfidence = votes[consensus] > 0 ? confSum[consensus] / votes[consensus] : 0;
-  const agreementCount = votes[consensus];
+  const rawConsensus = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
+  const rawAvgConfidence = votes[rawConsensus] > 0 ? confSum[rawConsensus] / votes[rawConsensus] : 0;
+  const agreementCount = votes[rawConsensus];
   const agreementRatio = agreementCount / valid.length;
 
+  // ---------------------------------------------------------------------
+  // WEIGHTED tally — informational. Computes both (a) weighted vote sums
+  // by action and (b) weighted-confidence on the raw consensus side.
+  // ---------------------------------------------------------------------
+  const weightedVotes = { BUY: 0, SELL: 0, HOLD: 0 };
+  let weightedConfSum = { BUY: 0, SELL: 0, HOLD: 0 };
+  let weightedConfDenom = { BUY: 0, SELL: 0, HOLD: 0 };
+  valid.forEach(r => {
+    const w = weightSnap?.weights?.[r.model]?.weight ?? 1.0;
+    weightedVotes[r.action] = (weightedVotes[r.action] || 0) + w;
+    weightedConfSum[r.action] = (weightedConfSum[r.action] || 0) + r.confidence * w;
+    weightedConfDenom[r.action] = (weightedConfDenom[r.action] || 0) + w;
+  });
+  const weightedConsensus = Object.entries(weightedVotes).sort((a, b) => b[1] - a[1])[0][0];
+  const weightedConfidence = weightedConfDenom[rawConsensus] > 0
+    ? weightedConfSum[rawConsensus] / weightedConfDenom[rawConsensus]
+    : rawAvgConfidence;
+
+  // SAFETY FLOOR — the gate confidence we expose downstream is
+  // min(rawAvgConfidence, weightedConfidence). This means dynamic weights
+  // can ONLY tighten the existing gate, never relax it. If high-weight
+  // models disagree with the majority, weightedConfidence drops below
+  // rawAvgConfidence and the gate gets stricter. If low-weight models
+  // drive the majority and high-weight models agree, weightedConfidence
+  // can be ABOVE rawAvgConfidence — but we use the lower of the two so
+  // the gate never becomes easier to clear.
+  const gateConfidence = Math.min(rawAvgConfidence, weightedConfidence);
+
+  // ---------------------------------------------------------------------
+  // STEP 4 — Run the meta-reasoner synthesis. This is informational only;
+  // failures swallow and return null.
+  // ---------------------------------------------------------------------
+  let meta = null;
+  try {
+    meta = await metaReasoner.synthesize({
+      symbol, strategy: strategyName, regime, market,
+      votes, weights: weightSnap, modelResults: results,
+    });
+    if (meta) metaReasoner.rememberLast(metaKey, meta);
+  } catch (_) { /* swallow */ }
+
   return {
-    consensus,
-    confidence: avgConfidence,
+    // EXISTING contract — unchanged shape, used by riskManager.checkQuorum.
+    consensus: rawConsensus,
+    confidence: gateConfidence,
     agreement: agreementRatio,
     agreementCount,
     validCount: valid.length,
     totalModels: MODELS.length,
     votes,
     models: results,
-    reason: `${agreementCount}/${valid.length} models agree on ${consensus} (avg conf ${(avgConfidence * 100).toFixed(0)}%)`,
+    reason: `${agreementCount}/${valid.length} models agree on ${rawConsensus} (raw avg conf ${(rawAvgConfidence * 100).toFixed(0)}%, gate conf ${(gateConfidence * 100).toFixed(0)}%)`,
+    // NEW informational fields — surfaced in audit + dashboard. Do NOT
+    // gate trading; risk manager continues to read consensus + confidence.
+    rawConfidence: rawAvgConfidence,
+    weightedConsensus,
+    weightedConfidence,
+    weightedVotes: Object.fromEntries(Object.entries(weightedVotes).map(([k, v]) => [k, +v.toFixed(3)])),
+    weights: weightSnap?.weights || null,
+    weightContext: weightSnap ? { strategy: weightSnap.strategy, regime: weightSnap.regime, market: weightSnap.market } : null,
+    meta, // { action, confidence, rationale, model, ts } | null
   };
 }
 

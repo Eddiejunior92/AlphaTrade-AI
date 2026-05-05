@@ -5,6 +5,7 @@
 // The size multiplier is clamped to [0.7, 1.2] and is applied AFTER all gates
 // inside riskManager.evaluateBuy.
 const db = require('./db');
+const llmWeighting = require('./llmWeightingService');
 
 const MIN_SAMPLES_FOR_TRUST = 5;          // need ≥5 closed trades before nudging size
 const MULT_FLOOR = 0.70;
@@ -299,10 +300,11 @@ async function recordOutcome({ symbol, strategy, pnl, closedAt }) {
     //    (TRADE_EXECUTED audit, NOT SIGNAL — SIGNAL rows can exist for BUYs
     //    that were later rejected by the risk gate). Best-effort; silent if
     //    no row found. The TRADE_EXECUTED audit row already carries the
-    //    voting models in its `models` column.
+    //    voting models in its `models` column AND the regime + market keys
+    //    we need for the dynamic-weighting context bucket.
     try {
       const { rows: sig } = await db.query(`
-        SELECT models FROM audit_log
+        SELECT models, payload FROM audit_log
         WHERE event_type = 'TRADE_EXECUTED' AND symbol = $1
           AND decision = 'BUY' AND created_at <= $2
           AND created_at >= $2 - INTERVAL '14 days'
@@ -311,6 +313,16 @@ async function recordOutcome({ symbol, strategy, pnl, closedAt }) {
         LIMIT 1
       `, [sym, ts.toISOString(), strat]);
       const models = sig[0]?.models || [];
+      // Feed the dynamic-weighting layer with regime + market resolved from
+      // the originating BUY audit. Best-effort; never blocks the rest of
+      // attribution.
+      try {
+        const regime = sig[0]?.payload?.regime || null;
+        const market = sig[0]?.payload?.market || 'US';
+        await llmWeighting.recordContextOutcome({
+          symbol: sym, strategy: strat, regime, market, pnl: pnlNum, models,
+        });
+      } catch (_) { /* swallow */ }
       for (const m of models) {
         if (!m || m.error || m.action !== 'BUY' || !m.model) continue;
         const mkey = `${m.model}|${strat}`;
