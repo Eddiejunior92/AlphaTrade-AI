@@ -507,6 +507,16 @@ app.get('/api/markets', async (req, res) => {
     const sigs = snap.signals || {};
     const sents = sentimentService.getAllCached();
 
+    // Lazy backfill: any watchlist symbol still uncached gets prefetched in
+    // the background. The current request returns whatever's already in the
+    // cache; the next 30s poll from MarketsTab will pick up the new entries.
+    // Fire-and-forget — the Promise never blocks the response.
+    const missing = watchlist.filter(s => !sents[s]);
+    if (missing.length) {
+      sentimentService.getSentimentBatch(missing, { concurrency: 4 })
+        .catch(e => console.error('[Sentiment] Backfill error:', e.message));
+    }
+
     // Latest price per symbol — single 1Min bar via brokerRouter so ASX symbols
     // come from IBKR. Failures (e.g. closed market, mock unavailable) just
     // surface as price=null, never as a 500.
@@ -868,6 +878,26 @@ server.listen(PORT, '0.0.0.0', () => {
       premarketService.bootstrapAll({ us: usWl, asx: asxWl });
     })
     .catch(e => console.error('[Premarket] init error:', e.message));
+
+  // Bootstrap news sentiment for the full combined watchlist on boot so the
+  // Markets tab stops showing "Pending…" the moment the user opens it.
+  // Refreshes every 10 min to keep cards in sync with the cache TTL. Whether
+  // or not the trading agent is running, the dashboard now always has data.
+  const refreshAllSentiment = async () => {
+    try {
+      const wl = getCombinedWatchlist();
+      if (!wl.length) return;
+      console.log(`[Sentiment] Bootstrap/refresh for ${wl.length} symbols...`);
+      await sentimentService.getSentimentBatch(wl, { concurrency: 4 });
+      console.log(`[Sentiment] Cache populated (${Object.keys(sentimentService.getAllCached()).length} entries).`);
+    } catch (e) {
+      console.error('[Sentiment] Bootstrap error:', e.message);
+    }
+  };
+  // Stagger the boot fetch so it doesn't compete with premarket bootstrap on
+  // the same Grok endpoint.
+  setTimeout(refreshAllSentiment, 3000);
+  setInterval(refreshAllSentiment, 10 * 60 * 1000);
 });
 
 process.on('uncaughtException', (e) => console.error('[Process] uncaughtException:', e));

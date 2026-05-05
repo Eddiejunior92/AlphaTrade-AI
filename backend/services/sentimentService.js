@@ -6,14 +6,21 @@ const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_SENTIMENT_MODEL || 'grok-4-fast-non-reasoning';
 const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '600') * 1000; // 10 min default — keep tighter so each vote sees recent news + social
 const TIMEOUT_MS = 12000;
-const MAX_CACHE = parseInt(process.env.SENTIMENT_CACHE_MAX || '64'); // hard cap entries
+// Cap is sized for the full US (30) + ASX (27) universe with headroom; bumped
+// from 64 → 128 when the watchlist expanded so no entry gets evicted under
+// normal operation.
+const MAX_CACHE = parseInt(process.env.SENTIMENT_CACHE_MAX || '128');
 
 // LRU cache (symbol → { ts, data }) — Map iteration order = insertion order, so
 // touching = delete+re-set keeps recently-used items at the tail; evict from head.
 const cache = new Map();
 // In-flight promise dedupe: if a fetch is already underway for symbol, reuse it.
 const inflight = new Map(); // symbol → Promise<data>
-let batchLock = false;
+// Shared in-flight batch promise. When multiple callers (agent cycle, server
+// boot/interval refresh, /api/markets lazy backfill) ask for a batch at the
+// same time, the second caller awaits the first instead of getting an empty
+// result back. The promise resolves to the merged result map.
+let batchInflight = null;
 
 function touchCache(sym, entry) {
   if (cache.has(sym)) cache.delete(sym);
@@ -162,9 +169,13 @@ async function getSentiment(symbol, { force = false } = {}) {
 // rate-limit). Guarded by a global lock so a slow batch never overlaps with
 // the next cycle's batch — at most one refresh runs at a time.
 async function getSentimentBatch(symbols, { concurrency = 4 } = {}) {
-  if (batchLock) return {};
-  batchLock = true;
-  try {
+  // Coalesce overlapping batch calls onto a single in-flight promise. Per-
+  // symbol getSentiment() already does its own inflight-dedupe, so the
+  // worst-case overlap is a no-op rather than a duplicate Grok request — but
+  // returning the shared promise means the caller actually gets the data
+  // instead of an empty {} (which previously caused silent missed refreshes).
+  if (batchInflight) return batchInflight;
+  const run = (async () => {
     const out = {};
     const queue = [...symbols];
     async function worker() {
@@ -176,9 +187,9 @@ async function getSentimentBatch(symbols, { concurrency = 4 } = {}) {
     }
     await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, worker));
     return out;
-  } finally {
-    batchLock = false;
-  }
+  })();
+  batchInflight = run.finally(() => { batchInflight = null; });
+  return batchInflight;
 }
 
 function getCached(symbol) {

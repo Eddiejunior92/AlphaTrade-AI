@@ -264,7 +264,10 @@ function MarketCard({ card }) {
               </div>
             </>
           ) : (
-            <div className="text-[10px] text-[var(--text-dim)]">Pending…</div>
+            <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5">
+              <span className="w-1 h-1 rounded-full bg-[var(--text-dim)] animate-pulse" />
+              Loading sentiment…
+            </div>
           )}
         </div>
       </div>
