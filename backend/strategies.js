@@ -19,6 +19,7 @@ const STRATEGIES = {
     name: 'day',
     label: 'Day Trading',
     description: 'Fast intraday trades on 1-minute bars. Auto-flattens 5 min before close. No overnight risk.',
+    market: 'US',                     // routes via Alpaca, US clock, US watchlist
     timeframe: '1Min',
     lookback: 60, // need ≥35 bars for MACD(12,26,9); 60 gives a stable EMA warmup
     intervalSeconds: 30,
@@ -37,6 +38,7 @@ const STRATEGIES = {
     name: 'swing',
     label: 'Longer Hold',
     description: 'Multi-day swing trades on 15-minute bars. Wider stops, larger targets, can hold overnight. Trailing stop locks in 2.5% below peak once +2% in profit.',
+    market: 'US',                     // routes via Alpaca, US clock, US watchlist
     timeframe: '15Min',
     lookback: 60,
     intervalSeconds: 300,
@@ -49,6 +51,33 @@ const STRATEGIES = {
     maxPositionPct: 0.05,
     trailingStopPct: 0.025,           // 2.5% trail below peak
     trailingActivatePct: 0.02,        // arms once +2% above entry
+  },
+  // ASX swing strategy — runs on Australian market hours (10:00–16:00
+  // Sydney, Mon–Fri). Uses 15-min bars, holds overnight, trails 2.5%.
+  // Routes via IBKR (separate broker) and uses the ASX watchlist. All
+  // existing safety rails (3-of-4 quorum, confidence gate, daily loss
+  // budget, circuit breaker, kill switch) apply identically — they work
+  // in USD-equivalent terms (FX-converted at sizing time and at equity
+  // computation), so the loss budget remains a unified portfolio cap
+  // across both markets.
+  asx_swing: {
+    name: 'asx_swing',
+    label: 'ASX Swing',
+    description: 'Australian-market swing trades via IBKR. 15-min bars, holds overnight. AUD-priced; risk sized in USD-equivalent so the daily loss budget remains a single portfolio cap across both markets.',
+    market: 'ASX',                    // routes via IBKR, ASX clock, ASX watchlist
+    currency: 'AUD',
+    timeframe: '15Min',
+    lookback: 60,
+    intervalSeconds: 300,
+    stopLossPct: 0.02,
+    takeProfitPct: 0.05,
+    maxHoldings: 3,
+    forceFlattenBeforeClose: false,
+    holdOvernight: true,
+    minDirectionalAgreement: 3,
+    maxPositionPct: 0.05,
+    trailingStopPct: 0.025,
+    trailingActivatePct: 0.02,
   },
 };
 
@@ -141,7 +170,20 @@ function getWatchlist() {
   return fromEnv.length ? fromEnv : DEFAULT_WATCHLIST;
 }
 
+// Per-strategy watchlist resolver. US strategies use the US watchlist; the
+// ASX strategy pulls from marketRegistry. Caller-side dispatch so we
+// don't have to import marketRegistry at the top (avoids a cycle if
+// marketRegistry ever needs strategy metadata).
+function getWatchlistForStrategy(strategyName) {
+  if (strategyName === 'asx_swing') {
+    const { getAsxWatchlist } = require('./services/marketRegistry');
+    return getAsxWatchlist();
+  }
+  return getWatchlist();
+}
+
 module.exports = {
   STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE, DEFAULT_WATCHLIST, getWatchlist,
+  getWatchlistForStrategy,
   getStrategy, listStrategies, getRiskScale, applyRiskScale, listRiskScales,
 };

@@ -20,6 +20,10 @@ async function ensureSchema() {
   await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS strategy TEXT`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  // ASX swing strategy toggle — defaults TRUE so adding the strategy is
+  // opt-out rather than opt-in, but operators who don't want ASX exposure
+  // can turn it off via the existing /api/agent/strategy endpoint.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS risk_scale TEXT NOT NULL DEFAULT 'balanced'`);
   // Trailing-stop tracking: highest price seen since entry, used to ratchet stop_loss UP.
@@ -103,7 +107,20 @@ async function ensureSchema() {
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity'`);
   await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity'`);
 
-  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance tables)');
+  // Multi-market scaffolding (Phase 5: ASX via IBKR). `market` is the
+  // listing exchange ('US' or 'ASX'), `currency` is the trade ccy, and
+  // `fx_rate` is the FX→USD rate captured at trade time / entry time. All
+  // existing rows default to US/USD/1.0 so older code paths are
+  // identity-preserving. Equity computation reads holdings.currency +
+  // current FX to convert AUD positions to USD on the fly.
+  await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS market   TEXT NOT NULL DEFAULT 'US'`);
+  await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD'`);
+  await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS fx_rate  NUMERIC(12,6) NOT NULL DEFAULT 1.0`);
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS market   TEXT NOT NULL DEFAULT 'US'`);
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD'`);
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS fx_rate_at_entry NUMERIC(12,6) NOT NULL DEFAULT 1.0`);
+
+  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance + multi-market tables)');
 }
 
 async function getPortfolio() {
@@ -114,7 +131,7 @@ async function getPortfolio() {
 const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'cash_balance', 'starting_balance', 'day_start_equity',
   'circuit_breaker', 'emergency_pause', 'agent_running',
-  'day_enabled', 'swing_enabled', 'trading_mode', 'risk_scale',
+  'day_enabled', 'swing_enabled', 'asx_swing_enabled', 'trading_mode', 'risk_scale',
 ]);
 
 async function updatePortfolio(updates) {
@@ -147,16 +164,25 @@ async function getHolding(symbol, strategy = 'day') {
   return rows[0] || null;
 }
 
-async function upsertHolding({ symbol, strategy = 'day', qty, avg_cost, stop_loss, take_profit }) {
+async function upsertHolding({ symbol, strategy = 'day', qty, avg_cost, stop_loss, take_profit,
+                               market, currency, fx_rate_at_entry }) {
+  // market / currency / fx_rate_at_entry default to US/USD/1.0 at the SQL
+  // layer when omitted, preserving the pre-multi-market call sites.
   await query(
-    `INSERT INTO holdings (symbol, strategy, qty, avg_cost, stop_loss, take_profit)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO holdings (symbol, strategy, qty, avg_cost, stop_loss, take_profit,
+                           market, currency, fx_rate_at_entry)
+     VALUES ($1, $2, $3, $4, $5, $6,
+             COALESCE($7,'US'), COALESCE($8,'USD'), COALESCE($9, 1.0))
      ON CONFLICT (symbol, strategy) DO UPDATE SET
        qty = EXCLUDED.qty,
        avg_cost = EXCLUDED.avg_cost,
        stop_loss = COALESCE(EXCLUDED.stop_loss, holdings.stop_loss),
-       take_profit = COALESCE(EXCLUDED.take_profit, holdings.take_profit)`,
-    [symbol, strategy, qty, avg_cost, stop_loss, take_profit]
+       take_profit = COALESCE(EXCLUDED.take_profit, holdings.take_profit),
+       market = EXCLUDED.market,
+       currency = EXCLUDED.currency,
+       fx_rate_at_entry = EXCLUDED.fx_rate_at_entry`,
+    [symbol, strategy, qty, avg_cost, stop_loss, take_profit,
+     market || null, currency || null, fx_rate_at_entry || null]
   );
 }
 
@@ -179,11 +205,14 @@ async function updateTrailing(symbol, strategy, { highest_price, trailing_armed,
 
 async function recordTrade(trade) {
   const { rows } = await query(
-    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy, asset_class)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy, asset_class,
+                         market, currency, fx_rate)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+             COALESCE($13,'US'), COALESCE($14,'USD'), COALESCE($15,1.0)) RETURNING *`,
     [trade.symbol, trade.side, trade.qty, trade.price, trade.confidence,
      trade.consensus, trade.order_id, trade.status, trade.pnl || null, trade.reason,
-     trade.strategy || null, trade.asset_class || 'equity']
+     trade.strategy || null, trade.asset_class || 'equity',
+     trade.market || null, trade.currency || null, trade.fx_rate || null]
   );
   return rows[0];
 }

@@ -2,6 +2,10 @@ require('dotenv').config();
 const llmService = require('./services/llmService');
 const premarketService = require('./services/premarketService');
 const alpacaService = require('./services/alpacaService');
+const ibkrService = require('./services/ibkrService');
+const brokerRouter = require('./services/brokerRouter');
+const marketRegistry = require('./services/marketRegistry');
+const fxService = require('./services/fxService');
 const discordService = require('./services/discordService');
 const riskManager = require('./services/riskManager');
 const sentimentService = require('./services/sentimentService');
@@ -17,7 +21,7 @@ const orderFlowService = require('./services/orderFlowService');
 const optionsActivityService = require('./services/optionsActivityService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
-const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist } = require('./strategies');
+const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
 
 const WATCHLIST = getWatchlist();
 const BASE_INTERVAL_SECONDS = Math.max(30, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
@@ -57,84 +61,122 @@ async function withTradingLock(label, fn) {
   finally { tradingLock = false; }
 }
 
+// Build BOTH a native-price lookup (for stop/take comparisons + broker logic
+// — must match how the broker quotes the symbol) and a USD-equivalent
+// lookup (for portfolio equity, circuit breaker, daily-loss budget — all
+// of which are USD-denominated).
+//
+// For US holdings the two are identical. For ASX holdings the native price
+// is in AUD and the USD-equivalent is `native * audUsdRate`. Each call
+// fetches the FX rate once and reuses it across all ASX symbols in the
+// batch to keep numbers internally consistent.
 async function buildPriceLookup(holdings) {
-  const lookup = {};
+  const lookup = {};      // native-currency prices (matches each symbol's quote)
+  const usdLookup = {};   // USD-equivalent for equity / risk math
   const stale = {};
+  const audUsd = await fxService.getAudToUsd();
   await Promise.all(holdings.map(async h => {
-    const bars = await alpacaService.getBars(h.symbol, '1Min', 1);
-    if (bars.length) lookup[h.symbol] = bars[bars.length - 1].c;
-    else { lookup[h.symbol] = parseFloat(h.avg_cost); stale[h.symbol] = true; }
+    const info = marketRegistry.getSymbolInfo(h.symbol);
+    const bars = await brokerRouter.getBars(h.symbol, '1Min', 1);
+    let native;
+    if (bars.length) native = bars[bars.length - 1].c;
+    else { native = parseFloat(h.avg_cost); stale[h.symbol] = true; }
+    lookup[h.symbol] = native;
+    usdLookup[h.symbol] = info.currency === 'AUD' ? native * audUsd : native;
   }));
-  return { lookup, stale };
+  return { lookup, usdLookup, stale, audUsd };
 }
 
-async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_profit, reason, strategy }) {
+// `price`, `stop_loss`, `take_profit` are NATIVE-currency (AUD for ASX,
+// USD for US). `fxToUsd` is the AUD→USD rate captured at the moment of
+// sizing (1.0 for US trades). All cash bookkeeping stays in USD — we
+// abstract over the fact that an Alpaca USD account and an IBKR AUD
+// account are physically separate by treating the portfolio as one
+// USD-functional-currency book. Realized P&L is computed in native units
+// then converted to USD using the close-time FX rate, which is the
+// correct economic treatment (FX moves between entry and exit are part of
+// the position's true return).
+async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_profit,
+                              reason, strategy, market, currency, fxToUsd }) {
+  market   = market   || marketRegistry.getSymbolInfo(symbol).market;
+  currency = currency || marketRegistry.getSymbolInfo(symbol).currency;
+  fxToUsd  = Number.isFinite(fxToUsd) ? fxToUsd
+            : (currency === 'AUD' ? await fxService.getAudToUsd() : 1.0);
+
   // Kill-switch hard guard — once tripped, NO new buy/sell orders may be placed
-  // until the process restarts. This is the last-line defense against an
-  // in-flight cycle that already passed the cycle-level emergency_pause check
-  // and is mid-symbol when the operator hits kill. The flatten path uses a
-  // separate Alpaca DELETE /v2/positions call, not executeOrder, so flatten
-  // continues to work after this trips.
+  // until the process restarts. brokerRouter.placeOrder also enforces this at
+  // the broker sink, but we short-circuit here to avoid even constructing an
+  // order request after kill.
   if (killSwitchActive) {
     console.log(`[Agent] Kill switch active — refused ${side} ${qty} ${symbol}`);
     await db.recordAudit({ event_type: 'KILL_SWITCH_BLOCKED_ORDER', symbol, decision: side,
-      payload: { qty, price, strategy, reason: 'kill switch active' } });
+      payload: { qty, price, strategy, market, reason: 'kill switch active' } });
     return null;
   }
   let order = { id: `mock-${Date.now()}`, status: 'mock_filled' };
   try {
-    if (alpacaService.isConfigured()) {
-      order = await alpacaService.placeOrder({ symbol, qty, side: side.toLowerCase() });
-    }
+    order = await brokerRouter.placeOrder({ symbol, qty, side: side.toLowerCase() });
   } catch (e) {
     await db.recordTrade({
       symbol, side, qty, price, confidence: signal?.confidence,
       consensus: signal?.consensus, status: 'error',
       reason: `Order failed: ${e.message}`, strategy,
+      market, currency, fx_rate: fxToUsd,
     });
-    await db.recordAudit({ event_type: 'TRADE_ERROR', symbol, decision: side, payload: { error: e.message, qty, price, strategy } });
+    await db.recordAudit({ event_type: 'TRADE_ERROR', symbol, decision: side,
+      payload: { error: e.message, qty, price, strategy, market } });
     return null;
   }
 
-  const cost = qty * price;
-  let pnl = null;
+  const nativeCost = qty * price;
+  const usdCost = nativeCost * fxToUsd;
+  let nativePnl = null;
+  let usdPnl = null;
 
   if (side === 'BUY') {
-    await db.adjustCash(-cost);
-    await db.upsertHolding({ symbol, strategy, qty, avg_cost: price, stop_loss, take_profit });
+    await db.adjustCash(-usdCost);
+    await db.upsertHolding({
+      symbol, strategy, qty, avg_cost: price, stop_loss, take_profit,
+      market, currency, fx_rate_at_entry: fxToUsd,
+    });
   } else {
     const existing = await db.getHolding(symbol, strategy);
     if (existing) {
-      pnl = (price - parseFloat(existing.avg_cost)) * qty;
+      nativePnl = (price - parseFloat(existing.avg_cost)) * qty;
+      // Convert native P&L to USD at CLOSE-time FX. This means FX drift
+      // between entry and exit shows up in the realized USD return,
+      // matching how a USD-functional-currency book actually reports.
+      usdPnl = nativePnl * fxToUsd;
       await db.deleteHolding(symbol, strategy);
     }
-    await db.adjustCash(cost);
+    await db.adjustCash(usdCost);
   }
 
   const trade = await db.recordTrade({
     symbol, side, qty, price,
     confidence: signal?.confidence, consensus: signal?.consensus,
     order_id: order.id, status: order.status || 'submitted',
-    pnl, reason, strategy,
+    pnl: usdPnl, reason, strategy,
+    market, currency, fx_rate: fxToUsd,
   });
 
   await db.recordAudit({
     event_type: 'TRADE_EXECUTED', symbol, decision: side,
     confidence: signal?.confidence, models: signal?.models,
-    payload: { qty, price, stop_loss, take_profit, pnl, reason, strategy },
+    payload: { qty, price, stop_loss, take_profit, pnl: usdPnl, native_pnl: nativePnl,
+               reason, strategy, market, currency, fx_rate: fxToUsd },
   });
 
+  const ccyTag = currency === 'USD' ? '$' : `${currency} `;
   await discordService.sendTradeAlert({
-    symbol, action: side, qty, price: price.toFixed(2),
-    confidence: signal?.confidence || 1, reason: `[${strategy}] ${reason}`,
+    symbol, action: side, qty, price: `${ccyTag}${price.toFixed(2)}`,
+    confidence: signal?.confidence || 1, reason: `[${strategy}/${market}] ${reason}`,
   });
 
-  // REAL-TIME adaptive learning — every closed trade with realized P&L feeds
-  // immediately into the rolling-window stats so the next LLM cycle (and the
-  // next BUY's sizing multiplier) already reflects this outcome. Fire-and-
-  // forget; recordOutcome swallows errors internally so it can never block.
-  if (side === 'SELL' && pnl !== null && Number.isFinite(pnl)) {
-    adaptiveLearning.recordOutcome({ symbol, strategy, pnl, closedAt: new Date() })
+  // REAL-TIME adaptive learning — feed USD P&L (the unified portfolio
+  // measurement unit) so the multi-market track-record stays comparable.
+  if (side === 'SELL' && usdPnl !== null && Number.isFinite(usdPnl)) {
+    adaptiveLearning.recordOutcome({ symbol, strategy, pnl: usdPnl, closedAt: new Date() })
       .catch(() => {});
   }
 
@@ -180,30 +222,36 @@ async function flattenStrategyPositions(strategyName, reason) {
   const holdings = await db.getHoldings(strategyName);
   if (!holdings.length) return { closed: 0 };
   const priceMap = await buildPriceLookup(holdings);
+  const audUsd = priceMap.audUsd;
   let closed = 0;
   for (const h of holdings) {
-    const price = priceMap.lookup[h.symbol] || parseFloat(h.avg_cost);
+    const price = priceMap.lookup[h.symbol] || parseFloat(h.avg_cost); // native
     const qty = parseFloat(h.qty);
+    const currency = h.currency || 'USD';
+    const fxToUsd = currency === 'AUD' ? audUsd : 1.0;
     try {
-      if (alpacaService.isConfigured()) {
-        await alpacaService.placeOrder({ symbol: h.symbol, qty, side: 'sell' });
-      }
+      // Route per-symbol — US holdings go to Alpaca, ASX holdings to IBKR.
+      // brokerRouter also enforces the kill-switch guard at the broker sink.
+      await brokerRouter.placeOrder({ symbol: h.symbol, qty, side: 'sell' });
     } catch (e) {
       console.error(`[Agent] flatten ${h.symbol} order failed:`, e.message);
       continue;
     }
-    const pnl = (price - parseFloat(h.avg_cost)) * qty;
-    await db.adjustCash(qty * price);
+    const nativePnl = (price - parseFloat(h.avg_cost)) * qty;
+    const usdPnl = nativePnl * fxToUsd;
+    await db.adjustCash(qty * price * fxToUsd);
     await db.deleteHolding(h.symbol, strategyName);
     await db.recordTrade({
       symbol: h.symbol, side: 'SELL', qty, price,
       confidence: 1.0, consensus: 'SELL',
       order_id: `flatten-${Date.now()}`, status: 'flattened',
-      pnl, reason, strategy: strategyName,
+      pnl: usdPnl, reason, strategy: strategyName,
+      market: h.market || 'US', currency, fx_rate: fxToUsd,
     });
     await db.recordAudit({ event_type: 'FORCE_FLATTEN', symbol: h.symbol, decision: 'SELL',
-      payload: { qty, price, pnl, reason, strategy: strategyName } });
-    adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: strategyName, pnl, closedAt: new Date() })
+      payload: { qty, price, pnl: usdPnl, native_pnl: nativePnl, reason, strategy: strategyName,
+                 market: h.market || 'US', currency, fx_rate: fxToUsd } });
+    adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: strategyName, pnl: usdPnl, closedAt: new Date() })
       .catch(() => {});
     closed++;
   }
@@ -225,42 +273,56 @@ async function flattenAllPositions(reason = 'Manual flatten') {
     console.log(`[Agent] Flattening ALL ${holdings.length} positions — ${reason}`);
     await db.recordAudit({ event_type: 'FORCE_FLATTEN_START', payload: { reason, count: holdings.length } });
 
-    if (alpacaService.isConfigured()) {
-      try {
-        await alpacaService.closeAllPositions();
-        await new Promise(r => setTimeout(r, 1500));
-        const remaining = await alpacaService.getPositions();
-        if (remaining.length > 0) {
-          await db.recordAudit({ event_type: 'FORCE_FLATTEN_BROKER_FAIL',
-            payload: { reason, remaining: remaining.map(p => p.symbol) } });
-          await discordService.sendCircuitBreakerAlert(
-            `⚠ FLATTEN INCOMPLETE — broker still holds: ${remaining.map(p => p.symbol).join(', ')}. Local state NOT cleared.`
-          );
-          return;
-        }
-      } catch (e) {
-        await db.recordAudit({ event_type: 'FORCE_FLATTEN_BROKER_FAIL', payload: { reason, error: e.message } });
-        await discordService.sendCircuitBreakerAlert(`⚠ FLATTEN ERROR — ${e.message}.`);
+    // Flatten via BOTH brokers in parallel. Each broker's bulk-close API is
+    // used (Alpaca DELETE /v2/positions; IBKR per-position market sell loop).
+    // Either broker failing is a hard stop for that broker's positions —
+    // we DO NOT clear local holdings for a broker that didn't confirm.
+    try {
+      const out = await brokerRouter.closeAllPositionsAllBrokers();
+      await new Promise(r => setTimeout(r, 1500));
+      const [aPos, iPos] = await Promise.allSettled([
+        alpacaService.isConfigured() ? alpacaService.getPositions() : [],
+        ibkrService.isConfigured()   ? ibkrService.getPositions()   : [],
+      ]);
+      const stillOpen = []
+        .concat(aPos.status === 'fulfilled' ? aPos.value.map(p => p.symbol) : [])
+        .concat(iPos.status === 'fulfilled' ? iPos.value.map(p => p.symbol) : []);
+      if (stillOpen.length) {
+        await db.recordAudit({ event_type: 'FORCE_FLATTEN_BROKER_FAIL',
+          payload: { reason, remaining: stillOpen, brokers: out } });
+        await discordService.sendCircuitBreakerAlert(
+          `⚠ FLATTEN INCOMPLETE — brokers still hold: ${stillOpen.join(', ')}. Local state NOT cleared.`
+        );
         return;
       }
+    } catch (e) {
+      await db.recordAudit({ event_type: 'FORCE_FLATTEN_BROKER_FAIL', payload: { reason, error: e.message } });
+      await discordService.sendCircuitBreakerAlert(`⚠ FLATTEN ERROR — ${e.message}.`);
+      return;
     }
 
     const priceMap = await buildPriceLookup(holdings);
+    const audUsd = priceMap.audUsd;
     for (const h of holdings) {
-      const price = priceMap.lookup[h.symbol] || parseFloat(h.avg_cost);
+      const price = priceMap.lookup[h.symbol] || parseFloat(h.avg_cost); // native
       const qty = parseFloat(h.qty);
-      const pnl = (price - parseFloat(h.avg_cost)) * qty;
-      await db.adjustCash(qty * price);
+      const currency = h.currency || 'USD';
+      const fxToUsd = currency === 'AUD' ? audUsd : 1.0;
+      const nativePnl = (price - parseFloat(h.avg_cost)) * qty;
+      const usdPnl = nativePnl * fxToUsd;
+      await db.adjustCash(qty * price * fxToUsd);
       await db.deleteHolding(h.symbol, h.strategy);
       await db.recordTrade({
         symbol: h.symbol, side: 'SELL', qty, price,
         confidence: 1.0, consensus: 'SELL',
         order_id: `flatten-${Date.now()}`, status: 'flattened',
-        pnl, reason, strategy: h.strategy,
+        pnl: usdPnl, reason, strategy: h.strategy,
+        market: h.market || 'US', currency, fx_rate: fxToUsd,
       });
       await db.recordAudit({ event_type: 'FORCE_FLATTEN', symbol: h.symbol, decision: 'SELL',
-        payload: { qty, price, pnl, reason, strategy: h.strategy } });
-      adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: h.strategy, pnl, closedAt: new Date() })
+        payload: { qty, price, pnl: usdPnl, native_pnl: nativePnl, reason, strategy: h.strategy,
+                   market: h.market || 'US', currency, fx_rate: fxToUsd } });
+      adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: h.strategy, pnl: usdPnl, closedAt: new Date() })
         .catch(() => {});
     }
     memoryState.lastFlatten = new Date().toISOString();
@@ -275,10 +337,19 @@ async function flattenAllPositions(reason = 'Manual flatten') {
 
 async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, strategyConfig, dynamic) {
   const sc = strategyConfig;
-  const bars = await alpacaService.getBars(symbol, sc.timeframe, sc.lookback);
+  const info = marketRegistry.getSymbolInfo(symbol);
+  const isAsxSymbol = info.market === 'ASX';
+  // Bars come from the symbol's broker (Alpaca for US, IBKR for ASX). The
+  // analyzer below is broker-agnostic — bars are normalized to {t,o,h,l,c,v}
+  // by each broker service.
+  const bars = await brokerRouter.getBars(symbol, sc.timeframe, sc.lookback);
   if (!bars.length) return null;
+  // FX rate snapshot — captured once per symbol per cycle so all sizing /
+  // P&L math for this analysis uses an internally consistent rate.
+  const fxToUsd = info.currency === 'AUD' ? await fxService.getAudToUsd() : 1.0;
   const prices = bars.map(b => b.c);
-  const latest = prices[prices.length - 1];
+  const latest = prices[prices.length - 1];           // native currency
+  const latestUsd = latest * fxToUsd;                 // USD-equivalent for risk math
   const change = ((latest - prices[0]) / prices[0] * 100).toFixed(2);
   const sentiment = parseFloat(change) > 0.5 ? 'bullish' : parseFloat(change) < -0.5 ? 'bearish' : 'neutral';
 
@@ -315,30 +386,31 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     fundamentals = fundamentalsService.getCached(symbol);
   }
 
-  // Intraday tactical setups — day strategy only.
-  // Looks at the last 30–60 1-min bars for dip-buy and profit-take patterns.
-  // Purely informational; quorum + confidence gate are unchanged.
+  // Intraday tactical setups — US day strategy only. Skipped for ASX
+  // (intradayService relies on US session microstructure / open clock).
   let intraday = null;
-  if (sc.name === 'day') {
+  if (sc.name === 'day' && !isAsxSymbol) {
     try { intraday = intradayService.analyzeIntraday(bars, indicators, patterns, holding); }
     catch (e) { intraday = { ok: false, reason: e.message }; }
   }
 
-  // 20-year historical intelligence (cached daily). Both strategies receive it.
-  // Day strategy gets an "early-session" emphasis flag during the first 90
-  // minutes after open, when intraday data is still thin.
+  // 20-year historical intelligence — Alpaca-sourced, US-only. Skipped for
+  // ASX symbols (no equivalent feed wired in yet); analyzer falls back to
+  // bar-derived signals which is the safe degradation for a new market.
   let historical = null;
-  try {
-    const minSinceOpen = minutesSinceOpenET();
-    const earlySession = sc.name === 'day' && minSinceOpen != null && minSinceOpen >= 0 && minSinceOpen <= 90;
-    historical = await historicalIntel.getInsightsForPrompt(symbol, { withinFirst90Min: earlySession });
-  } catch (e) {
-    console.error(`[Agent] historicalIntel render error for ${symbol}:`, e.message);
+  if (!isAsxSymbol) {
+    try {
+      const minSinceOpen = minutesSinceOpenET();
+      const earlySession = sc.name === 'day' && minSinceOpen != null && minSinceOpen >= 0 && minSinceOpen <= 90;
+      historical = await historicalIntel.getInsightsForPrompt(symbol, { withinFirst90Min: earlySession });
+    } catch (e) {
+      console.error(`[Agent] historicalIntel render error for ${symbol}:`, e.message);
+    }
   }
 
-  // Pre-market briefing context — only present during first 60 min after open.
+  // Pre-market briefing context — US-only (uses NYSE clock). Skipped for ASX.
   // Returns null otherwise; LLM prompt is unchanged. Never throws.
-  const premarket = await premarketService.getActiveBriefingContext(symbol, {
+  const premarket = isAsxSymbol ? null : await premarketService.getActiveBriefingContext(symbol, {
     open: memoryState.marketOpen,
     nextClose: memoryState.nextClose,
   });
@@ -365,11 +437,14 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   let orderFlow = null;
   try { orderFlow = orderFlowService.analyzeOrderFlow(bars); } catch (_) {}
 
+  // Options activity — US-only (CBOE-derived). Skipped for ASX symbols.
   let optionsActivity = null;
-  try {
-    const opt = await optionsActivityService.getCached(symbol);
-    if (opt) optionsActivity = optionsActivityService.renderForPrompt(opt);
-  } catch (_) {}
+  if (!isAsxSymbol) {
+    try {
+      const opt = await optionsActivityService.getCached(symbol);
+      if (opt) optionsActivity = optionsActivityService.renderForPrompt(opt);
+    } catch (_) {}
+  }
 
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
@@ -406,23 +481,38 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
-    // Pass adaptive + portfolio multipliers through `dynamic` so riskManager
-    // can apply them as pure SIZING modifiers (after quorum/gate). Existing
-    // safety gates remain unchanged.
+    // Risk sizing happens entirely in USD-equivalent — that keeps the
+    // single daily-loss budget and circuit breaker valid across markets.
+    // For ASX, we feed the AUD price multiplied by the FX rate; the qty
+    // returned is dimensionless (shares), and stop/take come back in
+    // USD-equivalent which we convert back to AUD for both the broker
+    // order and the holdings table (holdings store NATIVE so the
+    // broker-level stop/take comparisons match how the symbol is quoted).
     const dynamicWithUpgrades = { ...(dynamic || {}), adaptiveMult, portfolioMult };
-    const eval_ = await riskManager.evaluateBuy({ symbol, signal, price: latest, equity, cash, holdings, strategyConfig: sc, dynamic: dynamicWithUpgrades });
+    const eval_ = await riskManager.evaluateBuy({
+      symbol, signal, price: latestUsd, equity, cash, holdings,
+      strategyConfig: sc, dynamic: dynamicWithUpgrades,
+    });
     if (eval_.allow) {
       const sz = eval_.sizing || {};
+      // Convert USD-equivalent stop/take back to NATIVE for broker + storage.
+      // For US (fxToUsd === 1) this is a no-op.
+      const nativeStop = eval_.stop_loss   / fxToUsd;
+      const nativeTake = eval_.take_profit / fxToUsd;
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
-        signal, stop_loss: eval_.stop_loss, take_profit: eval_.take_profit,
+        signal,
+        stop_loss:   parseFloat(nativeStop.toFixed(4)),
+        take_profit: parseFloat(nativeTake.toFixed(4)),
         reason: `${signal.reason} | risk $${eval_.riskUSD}` +
-          (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : ''),
+          (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : '') +
+          (info.currency !== 'USD' ? ` | fx ${info.currency}/USD=${fxToUsd.toFixed(4)}` : ''),
         strategy: sc.name,
+        market: info.market, currency: info.currency, fxToUsd,
       });
     } else {
       await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
-        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name } });
+        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
     }
   } else if (signal.consensus === 'SELL') {
     const eval_ = await riskManager.evaluateSell({ symbol, signal, holdings, strategyConfig: sc });
@@ -430,10 +520,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       await executeOrder({
         symbol, side: 'SELL', qty: eval_.qty, price: latest,
         signal, reason: signal.reason, strategy: sc.name,
+        market: info.market, currency: info.currency, fxToUsd,
       });
     } else {
       await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'SELL',
-        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name } });
+        confidence: signal.confidence, payload: { reason: eval_.reason, strategy: sc.name, market: info.market } });
     }
   }
   return signal;
@@ -447,21 +538,30 @@ function minutesUntilClose(clock) {
 }
 
 async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
-  const minsLeft = minutesUntilClose(clock);
-  if (sc.forceFlattenBeforeClose && minsLeft <= FORCE_FLATTEN_MINUTES_BEFORE_CLOSE) {
-    console.log(`[${sc.name}] ${minsLeft.toFixed(1)}m to close — flattening day positions`);
-    await flattenStrategyPositions(sc.name, `Auto-flatten ${FORCE_FLATTEN_MINUTES_BEFORE_CLOSE}m before close`);
-    return;
+  // Auto-flatten only applies to strategies with a defined "next close"
+  // (US day strategy via Alpaca clock). ASX swing holds overnight and
+  // never auto-flattens, so we just skip the check when clock is null.
+  if (clock) {
+    const minsLeft = minutesUntilClose(clock);
+    if (sc.forceFlattenBeforeClose && minsLeft <= FORCE_FLATTEN_MINUTES_BEFORE_CLOSE) {
+      console.log(`[${sc.name}] ${minsLeft.toFixed(1)}m to close — flattening day positions`);
+      await flattenStrategyPositions(sc.name, `Auto-flatten ${FORCE_FLATTEN_MINUTES_BEFORE_CLOSE}m before close`);
+      return;
+    }
   }
+
+  // Use the strategy's own watchlist (US for day/swing; ASX for asx_swing).
+  const stratWatchlist = getWatchlistForStrategy(sc.name);
 
   const stratHoldings = await db.getHoldings(sc.name);
   await evaluateExistingPositions(stratHoldings, fullPriceLookup, {}, sc);
 
-  for (const symbol of WATCHLIST) {
+  for (const symbol of stratWatchlist) {
     try {
       const sh = await db.getHoldings(sc.name);
       const allH = await db.getHoldings();
-      // Mark-to-market full equity using the FULL lookup covering both strategies
+      // Mark-to-market full equity using the USD-equivalent lookup so
+      // ASX positions contribute their USD value to the unified portfolio.
       const live = await riskManager.computeEquity(allH, fullPriceLookup);
       const cb2 = await riskManager.checkCircuitBreaker(live.equity);
       if (cb2.tripped) {
@@ -495,19 +595,33 @@ async function runCycle() {
     // Sync alpaca mode with DB
     if (alpacaService.mode !== portfolio.trading_mode) alpacaService.setMode(portfolio.trading_mode);
 
+    // US clock from Alpaca (authoritative — accounts for early closes,
+    // half-days, holidays). ASX clock is computed locally from Sydney
+    // timezone math (no holiday calendar — ASX-holiday orders simply fail
+    // at the broker, which is logged + audit-tagged).
     const clock = await alpacaService.getClock();
-    memoryState.marketOpen = clock.is_open;
+    const asxOpen = marketRegistry.isAsxOpen();
+    const asxNextOpen = asxOpen ? null : marketRegistry.nextAsxOpen();
+    memoryState.marketOpen = clock.is_open;       // legacy field — US open
     memoryState.nextOpen = clock.next_open;
     memoryState.nextClose = clock.next_close;
+    memoryState.usMarketOpen = clock.is_open;
+    memoryState.asxMarketOpen = asxOpen;
+    memoryState.asxNextOpen = asxNextOpen;
 
-    if (!clock.is_open) {
-      console.log(`[Agent] Market closed — next open: ${clock.next_open}`);
+    // We continue the cycle if ANY market is open — equity must still be
+    // marked-to-market for circuit-breaker monitoring even if no strategy
+    // can place new orders this tick.
+    if (!clock.is_open && !asxOpen) {
+      console.log(`[Agent] All markets closed — US next: ${clock.next_open}, ASX next: ${asxNextOpen}`);
       return;
     }
 
     const allH = await db.getHoldings();
     const pmap = await buildPriceLookup(allH);
-    const { equity } = await riskManager.computeEquity(allH, pmap.lookup);
+    // USD-equivalent lookup is what the breaker, daily-loss budget, and
+    // dynamic-scaling math expect — they all operate in USD.
+    const { equity } = await riskManager.computeEquity(allH, pmap.usdLookup);
     const cb = await riskManager.checkCircuitBreaker(equity);
     if (cb.tripped) {
       console.log(`[Agent] CB active — ${cb.reason || 'tripped'}`);
@@ -516,35 +630,36 @@ async function runCycle() {
       return;
     }
 
-    // Build a unified price lookup covering all open holdings + watchlist symbols
-    // so cross-strategy equity is correctly mark-to-market everywhere
-    const symbolsToPrice = new Set([...allH.map(h => h.symbol), ...WATCHLIST]);
-    const fullLookup = { ...pmap.lookup };
-    await Promise.all([...symbolsToPrice].filter(s => fullLookup[s] === undefined).map(async sym => {
-      const bars = await alpacaService.getBars(sym, '1Min', 1);
-      if (bars.length) fullLookup[sym] = bars[bars.length - 1].c;
+    // Unified USD-equivalent price lookup covering all open holdings +
+    // watchlist symbols across BOTH markets. Cross-strategy equity stays
+    // accurate even when the same symbol appears under multiple strategies.
+    const asxWatchlist = marketRegistry.getAsxWatchlist();
+    const symbolsToPrice = new Set([...allH.map(h => h.symbol), ...WATCHLIST, ...asxWatchlist]);
+    const usdFullLookup = { ...pmap.usdLookup };
+    const audUsd = pmap.audUsd;
+    await Promise.all([...symbolsToPrice].filter(s => usdFullLookup[s] === undefined).map(async sym => {
+      try {
+        const symInfo = marketRegistry.getSymbolInfo(sym);
+        const bars = await brokerRouter.getBars(sym, '1Min', 1);
+        if (bars.length) {
+          const native = bars[bars.length - 1].c;
+          usdFullLookup[sym] = symInfo.currency === 'AUD' ? native * audUsd : native;
+        }
+      } catch (e) { /* per-symbol price fetch failure is non-fatal */ }
     }));
 
-    // Refresh news sentiment for the watchlist (cached, TTL-bounded — only
-    // hits Grok when stale). Runs in parallel; a slow/failed sentiment call
-    // never blocks trading because we use cached/default values downstream.
-    sentimentService.getSentimentBatch(WATCHLIST, { concurrency: 4 })
+    // Refresh news sentiment for the FULL watchlist (US + ASX). Cached;
+    // failure never blocks trading.
+    const allWatchlistSymbols = [...new Set([...WATCHLIST, ...asxWatchlist])];
+    sentimentService.getSentimentBatch(allWatchlistSymbols, { concurrency: 4 })
       .catch(e => console.error('[Agent] Sentiment refresh error:', e.message));
 
-    // Refresh swing-only fundamentals (Grok, 6h TTL). Skipped entirely if the
-    // swing strategy is disabled. Background; cached/default values are used
-    // downstream so a slow/failed call never blocks trading.
-    if (portfolio.swing_enabled) {
-      fundamentalsService.getFundamentalsBatch(WATCHLIST, { concurrency: 3 })
+    if (portfolio.swing_enabled || portfolio.asx_swing_enabled) {
+      fundamentalsService.getFundamentalsBatch(allWatchlistSymbols, { concurrency: 3 })
         .catch(e => console.error('[Agent] Fundamentals refresh error:', e.message));
     }
 
-    // Apply the user's chosen risk scale to each strategy before running.
-    // This dynamically adjusts confidence gate, $ risk per trade, and stop/target ratios.
     const scaleName = portfolio.risk_scale || DEFAULT_RISK_SCALE;
-
-    // Compute dynamic compounding scaling for THIS cycle (account-growth + performance curve).
-    // Confidence weighting is per-signal and added inside evaluateBuy.
     const recentClosed = await db.getRecentTrades(50);
     const dynamic = riskManager.computeDynamicScaling({
       equity,
@@ -553,16 +668,22 @@ async function runCycle() {
     });
     memoryState.lastDynamic = dynamic;
 
+    // Per-strategy market gating — a strategy only runs when its market is
+    // open. ASX swing runs on Sydney hours; US day/swing on NYSE hours.
+    // The clock arg passed to runStrategy is null for ASX (no
+    // forceFlatten-before-close logic applies — ASX swing holds overnight).
     const strategies = [
-      { sc: applyRiskScale(STRATEGIES.day, scaleName), enabled: portfolio.day_enabled },
-      { sc: applyRiskScale(STRATEGIES.swing, scaleName), enabled: portfolio.swing_enabled },
+      { sc: applyRiskScale(STRATEGIES.day, scaleName),       enabled: portfolio.day_enabled,        marketOpen: clock.is_open, clock },
+      { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock },
+      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null },
     ];
-    for (const { sc, enabled } of strategies) {
+    for (const { sc, enabled, marketOpen, clock: stratClock } of strategies) {
       if (!enabled) continue;
+      if (!marketOpen) continue;
       const lastRun = memoryState.strategyLastRun[sc.name];
       const elapsed = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 1000 : Infinity;
       if (elapsed < sc.intervalSeconds - 5) continue;
-      await runStrategy(sc, portfolio, clock, fullLookup, dynamic);
+      await runStrategy(sc, portfolio, stratClock, usdFullLookup, dynamic);
     }
 
     // Portfolio-level hedge check — informational by default. AUTO_HEDGE=true
@@ -630,11 +751,11 @@ async function emergencyPause(pause = true) {
 // completing in-flight orders without forcing position liquidation.
 async function cancelAllOpenOrders(reason = 'operator request') {
   await db.recordAudit({ event_type: 'CANCEL_ALL_ORDERS', payload: { reason } });
-  let result = { cancelled: 0 };
-  try { result = await alpacaService.cancelAllOpenOrders(); }
-  catch (e) { console.error('[Agent] cancelAllOpenOrders error:', e.message); }
-  console.log(`[Agent] Cancelled ${result.cancelled} open orders (${reason})`);
-  return result;
+  // Hit BOTH brokers — operators expect "cancel all" to be all-broker.
+  const out = await brokerRouter.cancelAllOpenOrdersAllBrokers();
+  const cancelled = (out.alpaca?.cancelled || 0) + (out.ibkr?.cancelled || 0);
+  console.log(`[Agent] Cancelled ${cancelled} open orders across brokers (${reason})`);
+  return { cancelled, brokers: out };
 }
 
 // Kill switch — the nuclear option. Atomic cascade:
@@ -660,7 +781,7 @@ async function killSwitch({ reason = 'operator kill switch', actor = 'operator' 
   // Mirror to the broker layer so any code path that calls placeOrder()
   // directly (hedging auto-exec, future hand-rolled call sites) is also
   // refused, not just the executeOrder() funnel.
-  try { alpacaService.setKillSwitchActive(true); } catch (_) {}
+  try { brokerRouter.setKillSwitchActiveAll(true); } catch (_) {}
   await db.recordAudit({ event_type: 'KILL_SWITCH_START', payload: startSummary });
   console.log(`[Agent] 🛑 KILL SWITCH ENGAGED — ${reason} (actor: ${actor})`);
   try { await discordService.sendCircuitBreakerAlert(`🛑 KILL SWITCH — ${reason}`); } catch (_) {}
@@ -682,9 +803,13 @@ async function killSwitch({ reason = 'operator kill switch', actor = 'operator' 
     console.error('[Agent] Kill switch: cycle drain timed out after 30s — proceeding with flatten anyway (executeOrder is already blocked)');
   }
 
-  // STEP 4: Cancel open orders (best-effort, audit-logged inside).
+  // STEP 4: Cancel open orders across BOTH brokers (best-effort, allSettled
+  // inside the router so one broker failing doesn't skip the other).
   let cancelResult = { cancelled: 0 };
-  try { cancelResult = await alpacaService.cancelAllOpenOrders(); } catch (e) {
+  try {
+    const out = await brokerRouter.cancelAllOpenOrdersAllBrokers();
+    cancelResult = { cancelled: (out.alpaca?.cancelled || 0) + (out.ibkr?.cancelled || 0), brokers: out };
+  } catch (e) {
     await db.recordAudit({ event_type: 'KILL_SWITCH_CANCEL_FAIL', payload: { error: e.message } });
   }
 
@@ -717,7 +842,8 @@ async function killSwitch({ reason = 'operator kill switch', actor = 'operator' 
 async function resetCircuitBreaker() {
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
-  const { equity } = await riskManager.computeEquity(holdings, priceMap.lookup);
+  // USD-equivalent — day_start_equity is stored in USD.
+  const { equity } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
   await db.updatePortfolio({ circuit_breaker: false, day_start_equity: equity.toFixed(2) });
   await db.recordAudit({ event_type: 'CIRCUIT_BREAKER_RESET', payload: { newDayStart: equity } });
 }
@@ -744,7 +870,10 @@ async function setRiskScale(scaleName) {
 }
 
 async function setStrategyEnabled(strategyName, enabled) {
-  const field = strategyName === 'day' ? 'day_enabled' : strategyName === 'swing' ? 'swing_enabled' : null;
+  const field = strategyName === 'day'       ? 'day_enabled'
+              : strategyName === 'swing'     ? 'swing_enabled'
+              : strategyName === 'asx_swing' ? 'asx_swing_enabled'
+              : null;
   if (!field) throw new Error(`Unknown strategy: ${strategyName}`);
   await db.updatePortfolio({ [field]: !!enabled });
   await db.recordAudit({ event_type: 'STRATEGY_TOGGLE', payload: { strategy: strategyName, enabled: !!enabled } });
@@ -769,7 +898,8 @@ async function setTradingMode(mode) {
 async function dailyReset() {
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
-  const { equity } = await riskManager.computeEquity(holdings, priceMap.lookup);
+  // USD-equivalent — equity / day_start_equity are USD throughout.
+  const { equity } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
   await db.updatePortfolio({ day_start_equity: equity.toFixed(2), circuit_breaker: false });
   await db.recordAudit({ event_type: 'DAILY_RESET', payload: { dayStartEquity: equity } });
   console.log(`[Agent] Daily reset — new day-start equity: $${equity.toFixed(2)}`);
@@ -853,8 +983,10 @@ async function getAgentSnapshot() {
   const portfolio = await db.getPortfolio();
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
+  // `lookup` (native) is for per-holding display fields (currentPrice in
+  // the symbol's own currency). `usdLookup` is what equity / P&L math uses.
   const lookup = priceMap.lookup;
-  const { equity } = holdings.length ? await riskManager.computeEquity(holdings, lookup) : { equity: parseFloat(portfolio.cash_balance) };
+  const { equity } = holdings.length ? await riskManager.computeEquity(holdings, priceMap.usdLookup) : { equity: parseFloat(portfolio.cash_balance) };
   const dayStart = parseFloat(portfolio.day_start_equity);
   const dailyPnL = equity - dayStart;
   const totalPnL = equity - parseFloat(portfolio.starting_balance);
@@ -890,7 +1022,10 @@ async function getAgentSnapshot() {
 
   const strategies = listStrategies(scaleName).map(s => ({
     ...s,
-    enabled: s.name === 'day' ? !!portfolio.day_enabled : !!portfolio.swing_enabled,
+    enabled: s.name === 'day'       ? !!portfolio.day_enabled
+           : s.name === 'swing'     ? !!portfolio.swing_enabled
+           : s.name === 'asx_swing' ? portfolio.asx_swing_enabled !== false
+           : false,
     holdings: holdings.filter(h => h.strategy === s.name).length,
     lastRun: memoryState.strategyLastRun[s.name] || null,
     cycles: memoryState.strategyCycles[s.name] || 0,
@@ -910,15 +1045,30 @@ async function getAgentSnapshot() {
     dailyPnLPct: dayStart ? (dailyPnL / dayStart * 100) : 0,
     dailyLossUSD,
     market: { open: memoryState.marketOpen, nextOpen: memoryState.nextOpen, nextClose: memoryState.nextClose },
-    holdings: holdings.map(h => ({
-      symbol: h.symbol, strategy: h.strategy,
-      qty: parseFloat(h.qty), avgCost: parseFloat(h.avg_cost),
-      currentPrice: lookup[h.symbol] || parseFloat(h.avg_cost),
-      stopLoss: h.stop_loss ? parseFloat(h.stop_loss) : null,
-      takeProfit: h.take_profit ? parseFloat(h.take_profit) : null,
-      marketValue: parseFloat(h.qty) * (lookup[h.symbol] || parseFloat(h.avg_cost)),
-      unrealizedPnL: (lookup[h.symbol] - parseFloat(h.avg_cost)) * parseFloat(h.qty),
-    })),
+    markets: {
+      US:  { open: !!memoryState.usMarketOpen,  nextOpen: memoryState.nextOpen || null, nextClose: memoryState.nextClose || null },
+      ASX: { open: !!memoryState.asxMarketOpen, nextOpen: memoryState.asxNextOpen || null, nextClose: null },
+    },
+    fx: fxService.getStatus(),
+    asxWatchlist: marketRegistry.getAsxWatchlist(),
+    holdings: holdings.map(h => {
+      // Per-holding values are reported in the symbol's NATIVE currency
+      // (USD for US, AUD for ASX). The UI shows `currency` so users can
+      // distinguish them. USD-equivalent equity above already accounts
+      // for FX so the top-line numbers stay comparable across markets.
+      const native = lookup[h.symbol] || parseFloat(h.avg_cost);
+      return {
+        symbol: h.symbol, strategy: h.strategy,
+        market: h.market || 'US',
+        currency: h.currency || 'USD',
+        qty: parseFloat(h.qty), avgCost: parseFloat(h.avg_cost),
+        currentPrice: native,
+        stopLoss: h.stop_loss ? parseFloat(h.stop_loss) : null,
+        takeProfit: h.take_profit ? parseFloat(h.take_profit) : null,
+        marketValue: parseFloat(h.qty) * native,
+        unrealizedPnL: (native - parseFloat(h.avg_cost)) * parseFloat(h.qty),
+      };
+    }),
     signals: memoryState.lastSignals,
     lastRun: memoryState.lastRun,
     lastFlatten: memoryState.lastFlatten,
