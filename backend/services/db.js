@@ -26,6 +26,11 @@ async function ensureSchema() {
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS risk_scale TEXT NOT NULL DEFAULT 'balanced'`);
+  // Optional auto-reset of the circuit breaker at the daily roll (paper mode
+  // only — never auto-resets in live). Defaults TRUE so paper testing resumes
+  // every day without operator intervention; live operators must explicitly
+  // reset via the dashboard.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS auto_breaker_reset BOOLEAN NOT NULL DEFAULT TRUE`);
   // Trailing-stop tracking: highest price seen since entry, used to ratchet stop_loss UP.
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS highest_price NUMERIC(12,4)`);
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS trailing_armed BOOLEAN NOT NULL DEFAULT FALSE`);
@@ -471,6 +476,7 @@ const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'cash_balance', 'starting_balance', 'day_start_equity',
   'circuit_breaker', 'emergency_pause', 'agent_running',
   'day_enabled', 'swing_enabled', 'asx_swing_enabled', 'trading_mode', 'risk_scale',
+  'auto_breaker_reset',
 ]);
 
 async function updatePortfolio(updates) {

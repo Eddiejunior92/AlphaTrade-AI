@@ -53,6 +53,37 @@ class DiscordService {
       color: 0xff0000,
     });
   }
+
+  // Richer breaker-tripped alert with structured detail (drawdown %, dayStart,
+  // current equity, threshold). Falls back to plain alert if any field missing.
+  async sendBreakerTrippedAlert({ reason, drawdownPct, dayStartEquity, equity, thresholdPct, lossUSD, mode }) {
+    const fields = [];
+    if (Number.isFinite(drawdownPct))    fields.push({ name: 'Drawdown',  value: `${(drawdownPct * 100).toFixed(2)}%`, inline: true });
+    if (Number.isFinite(thresholdPct))   fields.push({ name: 'Threshold', value: `${(thresholdPct * 100).toFixed(2)}%`, inline: true });
+    if (Number.isFinite(lossUSD))        fields.push({ name: 'Loss',      value: `$${lossUSD.toFixed(2)}`, inline: true });
+    if (Number.isFinite(dayStartEquity)) fields.push({ name: 'Day-start', value: `$${dayStartEquity.toFixed(2)}`, inline: true });
+    if (Number.isFinite(equity))         fields.push({ name: 'Equity',    value: `$${equity.toFixed(2)}`, inline: true });
+    if (mode)                            fields.push({ name: 'Mode',      value: String(mode).toUpperCase(), inline: true });
+    await this.sendAlert({
+      title: '🚨 Circuit Breaker TRIPPED — all positions flattened',
+      description: reason || 'Daily loss budget exceeded.',
+      color: 0xff0000,
+      fields,
+    });
+  }
+
+  async sendBreakerResetAlert({ newDayStartEquity, mode, source }) {
+    const fields = [];
+    if (Number.isFinite(newDayStartEquity)) fields.push({ name: 'New day-start', value: `$${newDayStartEquity.toFixed(2)}`, inline: true });
+    if (mode)   fields.push({ name: 'Mode', value: String(mode).toUpperCase(), inline: true });
+    if (source) fields.push({ name: 'Reset by', value: String(source), inline: true });
+    await this.sendAlert({
+      title: '✅ Circuit Breaker Reset — trading re-armed',
+      description: 'The drawdown breaker has been cleared. The agent will resume trading on the next cycle, subject to all other safety gates.',
+      color: 0x00c851,
+      fields,
+    });
+  }
 }
 
 module.exports = new DiscordService();

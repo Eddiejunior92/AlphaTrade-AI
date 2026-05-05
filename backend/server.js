@@ -7,7 +7,7 @@ const fs = require('fs');
 const WebSocket = require('ws');
 const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
-  emergencyPause, resetCircuitBreaker, flattenAllPositions,
+  emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale,
 } = require('./agent');
@@ -152,6 +152,16 @@ app.get('/api/state', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Auth probe — lets the dashboard know whether it must collect an operator
+// token. Reports whether the request's currently-supplied token (if any) is
+// valid. Read-only; safe to call unauthenticated.
+app.get('/api/auth/status', (req, res) => {
+  const provided = req.get('x-operator-token') || req.query.token;
+  const tokenRequired = !!OPERATOR_TOKEN;
+  const authenticated = !tokenRequired || provided === OPERATOR_TOKEN;
+  res.json({ tokenRequired, authenticated });
+});
+
 app.post('/api/agent/start', async (req, res) => {
   try {
     if (isKillSwitchLatched()) return res.status(409).json({ success: false, error: 'Kill switch is latched — restart the backend process to resume trading.' });
@@ -185,7 +195,18 @@ app.post('/api/agent/resume', async (req, res) => {
   await emergencyPause(false); broadcastState(); res.json({ success: true });
 });
 app.post('/api/agent/reset-circuit-breaker', async (req, res) => {
-  await resetCircuitBreaker(); broadcastState(); res.json({ success: true });
+  await resetCircuitBreaker('operator-dashboard'); broadcastState(); res.json({ success: true });
+});
+// Toggle the auto-reset-at-daily-roll behaviour. Only effective in paper mode;
+// live mode NEVER auto-resets a tripped breaker.
+app.post('/api/agent/breaker-auto-reset', async (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== 'boolean') return res.status(400).json({ success: false, error: 'enabled (boolean) required' });
+    await setAutoBreakerReset(enabled);
+    broadcastState();
+    res.json({ success: true, enabled });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 app.post('/api/agent/flatten', async (req, res) => {
   try { await flattenAllPositions(req.body?.reason || 'Manual flatten via dashboard'); broadcastState(); res.json({ success: true }); }

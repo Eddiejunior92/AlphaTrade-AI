@@ -1,18 +1,34 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 const API = '/api';
+const TOKEN_STORAGE_KEY = 'alphatrade.operatorToken';
+
+export function getStoredOperatorToken() {
+  try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ''; } catch { return ''; }
+}
+export function setStoredOperatorToken(tok) {
+  try {
+    if (tok) localStorage.setItem(TOKEN_STORAGE_KEY, tok);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {}
+}
+
+function authHeaders() {
+  const tok = getStoredOperatorToken();
+  return tok ? { 'x-operator-token': tok } : {};
+}
 
 async function apiPost(path, body) {
   const res = await fetch(`${API}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
   return res.json();
 }
 
 async function apiGet(path) {
-  const res = await fetch(`${API}${path}`);
+  const res = await fetch(`${API}${path}`, { headers: authHeaders() });
   return res.json();
 }
 
@@ -26,7 +42,23 @@ export function useAgent() {
   const [connected, setConnected] = useState(false);
   const [liveAuditAt, setLiveAuditAt] = useState(0);
   const [loading, setLoading] = useState({});
+  // { tokenRequired: bool, authenticated: bool } from /api/auth/status. When
+  // tokenRequired && !authenticated, the dashboard shows a token-entry banner
+  // and every protected POST will fail until the operator pastes the token.
+  const [authStatus, setAuthStatus] = useState({ tokenRequired: false, authenticated: true });
   const wsRef = useRef(null);
+
+  const refreshAuthStatus = useCallback(async () => {
+    try {
+      const r = await apiGet('/auth/status');
+      if (r && typeof r.tokenRequired === 'boolean') setAuthStatus(r);
+    } catch {}
+  }, []);
+
+  const setOperatorToken = useCallback(async (tok) => {
+    setStoredOperatorToken((tok || '').trim());
+    await refreshAuthStatus();
+  }, [refreshAuthStatus]);
 
   const setLoad = (key, val) => setLoading(l => ({ ...l, [key]: val }));
 
@@ -56,6 +88,7 @@ export function useAgent() {
   }, []);
 
   useEffect(() => {
+    refreshAuthStatus();
     apiGet('/state').then(setState).catch(() => {});
     apiGet('/premarket/latest').then(b => {
       if (!b || b.empty) return;
@@ -143,12 +176,18 @@ export function useAgent() {
 
   return {
     state, trades, audit, premarket, refreshPremarket, connected, liveAuditAt, loading, brokerChat,
+    authStatus, refreshAuthStatus, setOperatorToken, getStoredOperatorToken,
     startAgent: wrap('start', () => apiPost('/agent/start')),
     stopAgent: wrap('stop', () => apiPost('/agent/stop')),
     runNow: wrap('runNow', () => apiPost('/agent/run-now')),
     emergencyPause: wrap('pause', () => apiPost('/agent/emergency-pause')),
     resume: wrap('resume', () => apiPost('/agent/resume')),
     resetCircuitBreaker: wrap('cbReset', () => apiPost('/agent/reset-circuit-breaker')),
+    setBreakerAutoReset: async (enabled) => {
+      setLoad('cbAuto', true);
+      try { return await apiPost('/agent/breaker-auto-reset', { enabled: !!enabled }); }
+      finally { setLoad('cbAuto', false); }
+    },
     flatten: wrap('flatten', () => apiPost('/agent/flatten', { reason: 'Manual flatten via dashboard' })),
     toggleStrategy: async (name, enabled) => {
       setLoad(`strat:${name}`, true);

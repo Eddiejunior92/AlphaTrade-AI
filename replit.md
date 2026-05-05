@@ -89,7 +89,7 @@ VM deployment configured via `.replit` — runs both backend and Vite preview to
 
 ## Safety Features
 - Server-side 85% confidence gate (cannot be bypassed by frontend).
-- Circuit breaker auto-trips at 5% daily drawdown; requires manual reset.
+- **Circuit breaker (hardened May 2026)**: auto-trips when daily drawdown exceeds `MAX_DAILY_DRAWDOWN_PCT` (default 0.05 = 5%, configurable via Secrets) OR when daily $ loss exceeds the active scale's budget capped by `MAX_DAILY_LOSS_USD`. **Trip logic in `riskManager.checkCircuitBreaker` is unchanged** — only recovery/UX changed. On trip: all positions flatten + Discord rich-embed alert (drawdown%, threshold, day-start, equity, mode). Recovery options: (a) operator hits the prominent dashboard banner's "Reset Breaker" button (sends `x-operator-token` header → `POST /api/agent/reset-circuit-breaker` → re-arms day-start to current equity + Discord reset alert); (b) optional daily-roll auto-reset gated on `portfolio.auto_breaker_reset` AND `trading_mode==='paper'` — **live mode NEVER auto-resets**. Toggle via Settings UI (with confirm modal) → `POST /api/agent/breaker-auto-reset`. Frontend stores the operator token in `localStorage` (`alphatrade.operatorToken`) and probes `GET /api/auth/status` on mount to surface a red "token required" banner when missing. `breakerConfig` is exposed on `/api/state` so the UI shows live drawdown vs threshold.
 - Emergency pause button halts all trading immediately.
 - ≥3/4 LLMs must respond or system forces HOLD.
 - Stop-loss skipped on stale price data (no fallback to avg cost).

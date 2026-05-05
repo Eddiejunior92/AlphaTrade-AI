@@ -100,7 +100,24 @@ export default function App() {
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
     toggleStrategy, setTradingMode, setRiskScale,
+    authStatus, setOperatorToken, getStoredOperatorToken,
+    setBreakerAutoReset,
   } = useAgent();
+  // Operator token entry — UI lives in Settings, but the saved value is also
+  // shown as a top-of-page red banner whenever the token is required but
+  // missing/wrong, since otherwise every control button silently 401s.
+  const [tokenInput, setTokenInput] = useState('');
+  const [tokenSaved, setTokenSaved] = useState(false);
+  useEffect(() => { setTokenInput(getStoredOperatorToken() || ''); }, [getStoredOperatorToken]);
+  const saveOperatorToken = async () => {
+    await setOperatorToken(tokenInput);
+    setTokenSaved(true);
+    setTimeout(() => setTokenSaved(false), 1800);
+  };
+  // Breaker auto-reset confirm modal: null | { nextEnabled: boolean }
+  const [breakerToggleConfirm, setBreakerToggleConfirm] = useState(null);
+  const breakerCfg = state?.breakerConfig;
+  const tokenMissing = authStatus?.tokenRequired && !authStatus?.authenticated;
 
   const equity = state?.equity || 0;
   const cash = state?.cash || 0;
@@ -272,19 +289,51 @@ export default function App() {
           </div>
         </div>
       )}
-      {cbTripped && (
+      {tokenMissing && (
         <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
-          <div className="glass p-3.5 flex items-center justify-between border border-[var(--red)]/30">
+          <div className="rounded-2xl p-4 border-2 border-[var(--red)]/60 bg-[var(--red)]/10 flex items-center justify-between gap-3">
             <div className="flex items-center gap-3">
-              <div className="text-xl">🚨</div>
+              <div className="text-2xl">🔐</div>
               <div>
-                <div className="text-sm font-semibold text-[var(--red)]">Circuit Breaker Tripped</div>
-                <div className="text-[11px] text-[var(--text-dim)]">Daily loss budget exceeded. All positions flattened. Reset to resume.</div>
+                <div className="text-sm font-bold text-[var(--red)]">Operator token required</div>
+                <div className="text-[11px] text-[var(--text-dim)]">All control buttons (start, stop, reset breaker, mode switch) will fail until you paste the token in Settings.</div>
               </div>
             </div>
-            <button onClick={resetCircuitBreaker} disabled={loading.cbReset} className="ios-btn ios-btn-danger text-xs">
-              {loading.cbReset ? '…' : 'Reset'}
-            </button>
+            <button onClick={() => setTab('settings')} className="ios-btn ios-btn-danger text-xs whitespace-nowrap">Open Settings</button>
+          </div>
+        </div>
+      )}
+      {cbTripped && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
+          <div className="rounded-2xl p-5 border-2 border-[var(--red)]/70 bg-gradient-to-r from-[var(--red)]/20 via-[var(--red)]/15 to-[var(--red)]/20 shadow-lg shadow-[var(--red)]/20 anim-fade">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-4">
+                <div className="text-3xl pulse-live">🚨</div>
+                <div>
+                  <div className="text-base sm:text-lg font-bold text-[var(--red)] tracking-tight">Circuit Breaker Tripped — trading halted</div>
+                  <div className="text-[12px] text-[var(--text-dim)] mt-0.5">
+                    All positions were flattened. New trades are blocked until you reset the breaker.
+                    {breakerCfg && (
+                      <> Drawdown <span className="font-semibold text-[var(--red)]">{(breakerCfg.currentDrawdownPct * 100).toFixed(2)}%</span> of <span className="font-semibold">{(breakerCfg.maxDailyDrawdownPct * 100).toFixed(0)}%</span> · day-start ${fmt(breakerCfg.dayStartEquity)}.</>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={resetCircuitBreaker}
+                  disabled={loading.cbReset || tokenMissing}
+                  title={tokenMissing ? 'Set the operator token in Settings first' : 'Clear the breaker — re-arms day-start equity to current and resumes trading'}
+                  className="ios-btn ios-btn-danger text-sm font-semibold px-5">
+                  {loading.cbReset ? 'Resetting…' : '↻ Reset Breaker'}
+                </button>
+              </div>
+            </div>
+            {breakerCfg?.autoResetEnabled && breakerCfg?.autoResetActiveInMode && (
+              <div className="mt-3 pt-3 border-t border-[var(--red)]/20 text-[11px] text-[var(--text-dim)]">
+                ℹ Paper-mode auto-reset is enabled — the breaker will clear automatically at the next daily roll (~13:30 UTC). Toggle in Settings.
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -709,9 +758,105 @@ export default function App() {
                   <button onClick={emergencyPause} disabled={loading.pause} className="ios-btn ios-btn-danger col-span-2">🛑 Emergency Pause</button>
                 )}
                 {cbTripped && (
-                  <button onClick={resetCircuitBreaker} disabled={loading.cbReset} className="ios-btn ios-btn-danger col-span-2">↻ Reset Circuit Breaker</button>
+                  <button onClick={resetCircuitBreaker} disabled={loading.cbReset || tokenMissing} className="ios-btn ios-btn-danger col-span-2">↻ Reset Circuit Breaker</button>
                 )}
               </div>
+            </div>
+
+            {/* Operator token */}
+            <div className="glass p-5">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <div className="font-semibold text-[14px]">Operator Token</div>
+                  <div className="text-[11px] text-[var(--text-dim)]">
+                    {authStatus?.tokenRequired
+                      ? (authStatus?.authenticated
+                          ? '✅ Token saved — control endpoints unlocked.'
+                          : '⚠ Required by the server. Without it, every control button will return 401.')
+                      : 'Server has no OPERATOR_TOKEN set — control endpoints are open. Set OPERATOR_TOKEN in Secrets to require authentication.'}
+                  </div>
+                </div>
+                <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${
+                  !authStatus?.tokenRequired ? 'bg-white/10 text-[var(--text-dim)]'
+                  : authStatus?.authenticated ? 'bg-[var(--green)]/15 text-[var(--green)]'
+                                              : 'bg-[var(--red)]/15 text-[var(--red)]'
+                }`}>
+                  {!authStatus?.tokenRequired ? 'OPEN' : authStatus?.authenticated ? 'AUTHED' : 'BLOCKED'}
+                </span>
+              </div>
+              {authStatus?.tokenRequired && (
+                <div className="flex items-center gap-2 mt-3">
+                  <input
+                    type="password"
+                    value={tokenInput}
+                    onChange={e => setTokenInput(e.target.value)}
+                    placeholder="Paste OPERATOR_TOKEN value"
+                    className="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-[13px] font-mono outline-none focus:border-[var(--blue)]/50"
+                  />
+                  <button onClick={saveOperatorToken} className="ios-btn ios-btn-primary text-xs whitespace-nowrap">
+                    {tokenSaved ? '✓ Saved' : 'Save'}
+                  </button>
+                </div>
+              )}
+              <div className="text-[10px] text-[var(--text-dim)] mt-2">
+                Stored locally in your browser only. Sent as <span className="font-mono">x-operator-token</span> header on every protected request.
+              </div>
+            </div>
+
+            {/* Circuit Breaker config */}
+            <div className="glass p-5 space-y-3">
+              <div>
+                <div className="font-semibold text-[14px] mb-1">Circuit Breaker</div>
+                <div className="text-[11px] text-[var(--text-dim)]">Drawdown threshold + auto-reset behaviour. Core trip logic is unchanged — this only configures how it recovers.</div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Drawdown threshold</div>
+                  <div className="text-lg font-semibold">{breakerCfg ? `${(breakerCfg.maxDailyDrawdownPct * 100).toFixed(2)}%` : '—'}</div>
+                  <div className="text-[10px] text-[var(--text-dim)] mt-1">via <span className="font-mono">MAX_DAILY_DRAWDOWN_PCT</span> secret · default 5%</div>
+                </div>
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Daily $ loss budget</div>
+                  <div className="text-lg font-semibold">{breakerCfg ? `$${fmt(breakerCfg.maxDailyLossUSD)}` : '—'}</div>
+                  <div className="text-[10px] text-[var(--text-dim)] mt-1">{breakerCfg?.envCapUSD ? <>capped by <span className="font-mono">MAX_DAILY_LOSS_USD</span></> : 'from active risk scale'}</div>
+                </div>
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Current drawdown</div>
+                  <div className={`text-lg font-semibold ${breakerCfg && breakerCfg.currentDrawdownPct >= breakerCfg.maxDailyDrawdownPct * 0.5 ? 'text-[var(--yellow)]' : ''}`}>
+                    {breakerCfg ? `${(breakerCfg.currentDrawdownPct * 100).toFixed(2)}%` : '—'}
+                  </div>
+                  <div className="text-[10px] text-[var(--text-dim)] mt-1">{breakerCfg ? `loss $${fmt(breakerCfg.currentLossUSD)}` : ''}</div>
+                </div>
+                <div className="bg-white/3 rounded-xl p-3">
+                  <div className="text-[10px] text-[var(--text-dim)] uppercase">Day-start equity</div>
+                  <div className="text-lg font-semibold">{breakerCfg ? `$${fmt(breakerCfg.dayStartEquity)}` : '—'}</div>
+                  <div className="text-[10px] text-[var(--text-dim)] mt-1">anchor for the daily PnL math</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between bg-white/3 rounded-xl p-3 mt-1">
+                <div>
+                  <div className="text-[13px] font-semibold">Auto-reset at daily roll</div>
+                  <div className="text-[10px] text-[var(--text-dim)]">
+                    {mode === 'paper'
+                      ? 'When ON, a tripped breaker clears automatically at the next 13:30 UTC roll. Paper mode only.'
+                      : 'Disabled in LIVE mode — operator must reset explicitly.'}
+                  </div>
+                </div>
+                <button
+                  disabled={loading.cbAuto || mode !== 'paper' || tokenMissing}
+                  onClick={() => setBreakerToggleConfirm({ nextEnabled: !breakerCfg?.autoResetEnabled })}
+                  className={`text-[10px] font-bold px-3 py-1.5 rounded-full transition-colors ${
+                    breakerCfg?.autoResetEnabled && mode === 'paper'
+                      ? 'bg-[var(--green)]/15 text-[var(--green)] hover:bg-[var(--green)]/25'
+                      : 'bg-white/10 text-[var(--text-dim)] hover:bg-white/15'
+                  } ${(mode !== 'paper' || tokenMissing) ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  {loading.cbAuto ? '…' : (breakerCfg?.autoResetEnabled ? 'ON' : 'OFF')}
+                </button>
+              </div>
+              <button onClick={resetCircuitBreaker} disabled={!cbTripped || loading.cbReset || tokenMissing}
+                className={`ios-btn w-full ${cbTripped ? 'ios-btn-danger' : 'ios-btn-ghost'}`}>
+                {loading.cbReset ? 'Resetting…' : (cbTripped ? '↻ Reset Breaker Now' : 'Breaker not tripped')}
+              </button>
             </div>
 
             {/* AI Models */}
@@ -779,6 +924,41 @@ export default function App() {
       </Tooltip>
 
       <VoiceChat open={chatOpen} onClose={() => setChatOpen(false)} brokerChat={brokerChat} />
+
+      {/* Breaker auto-reset confirm modal */}
+      {breakerToggleConfirm && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 anim-fade">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={() => setBreakerToggleConfirm(null)} />
+          <div className="relative glass-strong w-full max-w-md p-6 anim-slide-up">
+            <div className="text-3xl mb-2">{breakerToggleConfirm.nextEnabled ? '🔁' : '⏸'}</div>
+            <h3 className="text-xl font-semibold tracking-tight mb-2">
+              {breakerToggleConfirm.nextEnabled ? 'Enable daily auto-reset?' : 'Disable daily auto-reset?'}
+            </h3>
+            <div className="text-[13px] text-[var(--text-dim)] space-y-2">
+              {breakerToggleConfirm.nextEnabled ? (
+                <>
+                  <p>If the breaker trips during a paper-trading session, it will be cleared automatically at the next daily roll (~13:30 UTC) so testing resumes the next day.</p>
+                  <p className="text-[var(--yellow)]">This setting is ignored in LIVE mode — live operators must always reset manually.</p>
+                </>
+              ) : (
+                <p>The breaker will stay tripped across the daily roll until you explicitly reset it. Recommended for stricter testing.</p>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2 mt-5">
+              <button onClick={() => setBreakerToggleConfirm(null)} disabled={loading.cbAuto} className="ios-btn ios-btn-ghost">Cancel</button>
+              <button
+                onClick={async () => {
+                  await setBreakerAutoReset(breakerToggleConfirm.nextEnabled);
+                  setBreakerToggleConfirm(null);
+                }}
+                disabled={loading.cbAuto}
+                className={`ios-btn ${breakerToggleConfirm.nextEnabled ? 'ios-btn-success' : 'ios-btn-danger'}`}>
+                {loading.cbAuto ? '…' : (breakerToggleConfirm.nextEnabled ? 'Enable' : 'Disable')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Mode-switch confirmation modal */}
       {modeModal && (

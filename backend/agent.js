@@ -1028,7 +1028,7 @@ async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
       const cb2 = await riskManager.checkCircuitBreaker(live.equity);
       if (cb2.tripped) {
         console.log(`[${sc.name}] CB tripped mid-cycle — halting and flattening all`);
-        await flattenAllPositions(cb2.reason || 'Circuit breaker tripped mid-cycle');
+        await handleBreakerTrip({ cb: cb2, portfolio, equity: live.equity, where: `mid-cycle:${sc.name}` });
         break;
       }
       await analyzeAndTradeSymbol(symbol, portfolio, sh, live.equity, live.cash, sc, dynamic);
@@ -1092,8 +1092,7 @@ async function runCycle() {
     const cb = await riskManager.checkCircuitBreaker(equity);
     if (cb.tripped) {
       console.log(`[Agent] CB active — ${cb.reason || 'tripped'}`);
-      await discordService.sendCircuitBreakerAlert(cb.reason || `Drawdown ${(cb.drawdown * 100).toFixed(2)}%`);
-      await flattenAllPositions(cb.reason || 'Circuit breaker tripped');
+      await handleBreakerTrip({ cb, portfolio, equity, where: 'pre-cycle' });
       return;
     }
 
@@ -1405,13 +1404,48 @@ async function killSwitch({ reason = 'operator kill switch', actor = 'operator' 
   return result;
 }
 
-async function resetCircuitBreaker() {
+// Centralized breaker-trip handler — used by BOTH the pre-cycle check in
+// runCycle AND the mid-cycle check inside runStrategy so every genuine trip
+// produces an alert + flatten. Discord send is best-effort: a webhook failure
+// must NEVER block flattening.
+async function handleBreakerTrip({ cb, portfolio, equity, where }) {
+  try {
+    const cfg = riskManager.getConfig(portfolio);
+    await discordService.sendBreakerTrippedAlert({
+      reason: `${cb.reason || `Drawdown ${(cb.drawdown * 100).toFixed(2)}%`} (${where})`,
+      drawdownPct: cb.drawdown,
+      dayStartEquity: parseFloat(portfolio.day_start_equity),
+      equity,
+      thresholdPct: cfg.maxDailyDrawdownPct,
+      lossUSD: cb.lossUSD,
+      mode: portfolio.trading_mode,
+    });
+  } catch (e) { console.error('[Discord] tripped alert failed:', e.message); }
+  await flattenAllPositions(cb.reason || 'Circuit breaker tripped');
+}
+
+async function resetCircuitBreaker(source = 'operator') {
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
   // USD-equivalent — day_start_equity is stored in USD.
-  const { equity } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
+  const { equity, portfolio } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
   await db.updatePortfolio({ circuit_breaker: false, day_start_equity: equity.toFixed(2) });
-  await db.recordAudit({ event_type: 'CIRCUIT_BREAKER_RESET', payload: { newDayStart: equity } });
+  await db.recordAudit({ event_type: 'CIRCUIT_BREAKER_RESET', payload: { newDayStart: equity, source } });
+  try {
+    await discordService.sendBreakerResetAlert({
+      newDayStartEquity: equity,
+      mode: portfolio?.trading_mode,
+      source,
+    });
+  } catch (e) { console.error('[Discord] reset alert failed:', e.message); }
+}
+
+async function setAutoBreakerReset(enabled) {
+  await db.updatePortfolio({ auto_breaker_reset: !!enabled });
+  await db.recordAudit({
+    event_type: 'BREAKER_AUTO_RESET_CHANGED',
+    payload: { enabled: !!enabled, note: 'Only takes effect in paper mode; live mode never auto-resets.' },
+  });
 }
 
 async function setRiskScale(scaleName) {
@@ -1465,10 +1499,29 @@ async function dailyReset() {
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
   // USD-equivalent — equity / day_start_equity are USD throughout.
-  const { equity } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
-  await db.updatePortfolio({ day_start_equity: equity.toFixed(2), circuit_breaker: false });
-  await db.recordAudit({ event_type: 'DAILY_RESET', payload: { dayStartEquity: equity } });
-  console.log(`[Agent] Daily reset — new day-start equity: $${equity.toFixed(2)}`);
+  const { equity, portfolio } = await riskManager.computeEquity(holdings, priceMap.usdLookup);
+  // The daily PnL anchor is ALWAYS rolled forward — that's a hard requirement
+  // for the daily-loss budget math. The breaker, however, is only auto-cleared
+  // when the operator has opted in AND we're in paper mode. Live mode NEVER
+  // auto-resets a tripped breaker — operator must do it explicitly.
+  const wasTripped = !!portfolio.circuit_breaker;
+  const mode = portfolio.trading_mode || 'paper';
+  const autoResetOptedIn = portfolio.auto_breaker_reset !== false;
+  const shouldAutoReset = wasTripped && autoResetOptedIn && mode === 'paper';
+  const update = { day_start_equity: equity.toFixed(2) };
+  if (shouldAutoReset) update.circuit_breaker = false;
+  await db.updatePortfolio(update);
+  await db.recordAudit({
+    event_type: 'DAILY_RESET',
+    payload: { dayStartEquity: equity, breakerWasTripped: wasTripped, breakerAutoReset: shouldAutoReset, mode },
+  });
+  if (shouldAutoReset) {
+    try {
+      await discordService.sendBreakerResetAlert({ newDayStartEquity: equity, mode, source: 'daily-auto-reset' });
+    } catch (e) { console.error('[Discord] daily auto-reset alert failed:', e.message); }
+  }
+  console.log(`[Agent] Daily reset — new day-start equity: $${equity.toFixed(2)}` +
+    (wasTripped ? (shouldAutoReset ? ' | breaker auto-reset (paper)' : ' | breaker LEFT TRIPPED (live or opt-out)') : ''));
 }
 
 function scheduleDailyReset() {
@@ -1712,12 +1765,25 @@ async function getAgentSnapshot() {
     cycles: memoryState.strategyCycles[s.name] || 0,
   }));
 
+  const breakerCfg = riskManager.getConfig(portfolio);
+  const drawdownPctLive = dayStart > 0 ? Math.max(0, (dayStart - equity) / dayStart) : 0;
   return {
     mode: tradingMode,
     liveAvailable: alpacaService.hasLiveCredentials(),
     running: portfolio.agent_running,
     emergencyPause: portfolio.emergency_pause,
     circuitBreakerTripped: portfolio.circuit_breaker,
+    breakerConfig: {
+      maxDailyDrawdownPct: breakerCfg.maxDailyDrawdownPct,
+      maxDailyLossUSD:     breakerCfg.maxDailyLossUSD,
+      envCapUSD:           breakerCfg.envCapUSD,
+      autoResetEnabled:    portfolio.auto_breaker_reset !== false,
+      autoResetActiveInMode: tradingMode === 'paper',
+      currentDrawdownPct:  drawdownPctLive,
+      currentLossUSD:      dailyLossUSD,
+      dayStartEquity:      dayStart,
+      configuredVia:       'MAX_DAILY_DRAWDOWN_PCT secret (default 0.05)',
+    },
     cash: parseFloat(portfolio.cash_balance),
     equity,
     dayStartEquity: dayStart,
@@ -2057,7 +2123,7 @@ setInterval(() => {
 
 module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
-  emergencyPause, resetCircuitBreaker, flattenAllPositions,
+  emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, WATCHLIST,
   // Exposed for the /api/risk-capacity endpoint so it can compute on-demand
