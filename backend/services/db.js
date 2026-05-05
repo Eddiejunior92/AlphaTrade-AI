@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const crypto = require('crypto');
 const bus = require('./eventBus');
 
 const pool = new Pool({
@@ -88,7 +89,21 @@ async function ensureSchema() {
   `);
   await query(`CREATE INDEX IF NOT EXISTS backtest_runs_created_idx ON backtest_runs (created_at DESC)`);
 
-  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest tables)');
+  // --- Phase 4 compliance / multi-asset scaffolding ----------------------
+  // Hash-chain on audit_log for tamper-evidence. row_hash = sha256(prev_hash
+  // || serialized event body). prev_hash is the row_hash of the immediately
+  // preceding audit row (by id). The verifier walks the chain forward.
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS row_hash TEXT`);
+  await query(`CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log (created_at)`);
+  // Asset-class scaffolding — every trade/holding/audit row knows what it
+  // represents. Default 'equity' preserves all existing behavior; future
+  // option / futures support can target rows where asset_class differs.
+  await query(`ALTER TABLE trades   ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity'`);
+  await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity'`);
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity'`);
+
+  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance tables)');
 }
 
 async function getPortfolio() {
@@ -164,10 +179,11 @@ async function updateTrailing(symbol, strategy, { highest_price, trailing_armed,
 
 async function recordTrade(trade) {
   const { rows } = await query(
-    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+    `INSERT INTO trades (symbol, side, qty, price, confidence, consensus, order_id, status, pnl, reason, strategy, asset_class)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
     [trade.symbol, trade.side, trade.qty, trade.price, trade.confidence,
-     trade.consensus, trade.order_id, trade.status, trade.pnl || null, trade.reason, trade.strategy || null]
+     trade.consensus, trade.order_id, trade.status, trade.pnl || null, trade.reason,
+     trade.strategy || null, trade.asset_class || 'equity']
   );
   return rows[0];
 }
@@ -177,16 +193,68 @@ async function getRecentTrades(limit = 50) {
   return rows;
 }
 
-async function recordAudit({ event_type, symbol, decision, confidence, models, payload }) {
-  const { rows } = await query(
-    `INSERT INTO audit_log (event_type, symbol, decision, confidence, models, payload)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING *`,
-    [event_type, symbol || null, decision || null, confidence || null,
-     models ? JSON.stringify(models) : null, payload ? JSON.stringify(payload) : null]
-  );
-  const row = rows[0];
-  // Fire-and-forget: any subscriber (e.g. WS broadcaster) gets the row live.
+// Hash-chain helpers — tamper-evident audit log. Each row hashes (prev_hash ||
+// canonical body). A consumer can replay every row and confirm row_hash[i] ==
+// sha256(row_hash[i-1] || body[i]); any silent edit breaks the chain.
+// Serialized in a single transaction so concurrent writers can't race the
+// "previous row" lookup. Fail-closed: if hash insert fails we still write the
+// audit row (compliance value of having the record beats perfect chaining),
+// but we log loudly so an operator notices.
+function canonicalAuditBody({ event_type, symbol, decision, confidence, models, payload, asset_class, created_at }) {
+  return JSON.stringify({
+    event_type: event_type || null,
+    symbol: symbol || null,
+    decision: decision || null,
+    confidence: confidence != null ? +confidence : null,
+    models: models || null,
+    payload: payload || null,
+    asset_class: asset_class || 'equity',
+    created_at: created_at ? new Date(created_at).toISOString() : null,
+  });
+}
+
+async function recordAudit({ event_type, symbol, decision, confidence, models, payload, asset_class }) {
+  const ac = asset_class || 'equity';
+  const client = await pool.connect();
+  let row;
+  try {
+    await client.query('BEGIN');
+    // Serialize chain reads so concurrent inserts can't both read the same prev.
+    await client.query('LOCK TABLE audit_log IN SHARE ROW EXCLUSIVE MODE');
+    const prev = await client.query('SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1');
+    const prevHash = prev.rows[0]?.row_hash || 'GENESIS';
+    const insert = await client.query(
+      `INSERT INTO audit_log (event_type, symbol, decision, confidence, models, payload, asset_class, prev_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [event_type, symbol || null, decision || null, confidence || null,
+       models ? JSON.stringify(models) : null, payload ? JSON.stringify(payload) : null,
+       ac, prevHash]
+    );
+    row = insert.rows[0];
+    const body = canonicalAuditBody({
+      event_type, symbol, decision, confidence, models, payload, asset_class: ac, created_at: row.created_at,
+    });
+    const rowHash = crypto.createHash('sha256').update(prevHash + '|' + body).digest('hex');
+    const upd = await client.query(
+      'UPDATE audit_log SET row_hash = $1 WHERE id = $2 RETURNING *',
+      [rowHash, row.id]
+    );
+    row = upd.rows[0];
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('[DB] recordAudit chained-insert failed, falling back to plain insert:', e.message);
+    // Fallback: at least preserve the audit record even if chain breaks.
+    const f = await query(
+      `INSERT INTO audit_log (event_type, symbol, decision, confidence, models, payload, asset_class)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [event_type, symbol || null, decision || null, confidence || null,
+       models ? JSON.stringify(models) : null, payload ? JSON.stringify(payload) : null, ac]
+    );
+    row = f.rows[0];
+  } finally {
+    client.release();
+  }
   if (row) { try { bus.emit('audit', row); } catch (_) { /* never block writes */ } }
   return row;
 }
@@ -196,10 +264,43 @@ async function getRecentAudit(limit = 50) {
   return rows;
 }
 
+// Walk the audit chain forward and verify every row_hash matches
+// sha256(prev_hash || canonical body). Returns { ok, total, verified, brokenAt[] }.
+// Skips rows missing row_hash (older legacy rows pre-Phase-4) with a count.
+async function verifyAuditChain({ since } = {}) {
+  const args = [];
+  let where = '';
+  if (since) { args.push(since); where = `WHERE created_at >= $${args.length}`; }
+  const { rows } = await query(
+    `SELECT id, event_type, symbol, decision, confidence, models, payload, asset_class, prev_hash, row_hash, created_at
+     FROM audit_log ${where} ORDER BY id ASC`, args
+  );
+  let verified = 0, legacy = 0;
+  const brokenAt = [];
+  let expectedPrev = null;
+  for (const r of rows) {
+    if (!r.row_hash) { legacy += 1; expectedPrev = null; continue; }
+    if (expectedPrev != null && r.prev_hash !== expectedPrev) {
+      brokenAt.push({ id: r.id, reason: 'prev_hash mismatch', expected: expectedPrev, found: r.prev_hash });
+      expectedPrev = r.row_hash;
+      continue;
+    }
+    const body = canonicalAuditBody(r);
+    const h = crypto.createHash('sha256').update((r.prev_hash || 'GENESIS') + '|' + body).digest('hex');
+    if (h !== r.row_hash) {
+      brokenAt.push({ id: r.id, reason: 'row_hash mismatch (tampered or schema drift)' });
+    } else {
+      verified += 1;
+    }
+    expectedPrev = r.row_hash;
+  }
+  return { ok: brokenAt.length === 0, total: rows.length, verified, legacy, brokenAt };
+}
+
 module.exports = {
   query, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
   getHoldings, getHolding, upsertHolding, deleteHolding,
   recordTrade, getRecentTrades,
-  recordAudit, getRecentAudit,
+  recordAudit, getRecentAudit, verifyAuditChain,
   updateTrailing,
 };

@@ -43,6 +43,8 @@ let dailyResetHandle = null;
 let cycleInProgress = false;
 let flattenInProgress = false;
 let tradingLock = false; // global lock — flatten / mode-switch / cycle cannot overlap
+let killSwitchActive = false; // sticky abort flag — once set, no new orders can be placed
+                              // until the process restarts. Survives mid-cycle in-flight work.
 
 async function withTradingLock(label, fn) {
   const start = Date.now();
@@ -67,6 +69,18 @@ async function buildPriceLookup(holdings) {
 }
 
 async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_profit, reason, strategy }) {
+  // Kill-switch hard guard — once tripped, NO new buy/sell orders may be placed
+  // until the process restarts. This is the last-line defense against an
+  // in-flight cycle that already passed the cycle-level emergency_pause check
+  // and is mid-symbol when the operator hits kill. The flatten path uses a
+  // separate Alpaca DELETE /v2/positions call, not executeOrder, so flatten
+  // continues to work after this trips.
+  if (killSwitchActive) {
+    console.log(`[Agent] Kill switch active — refused ${side} ${qty} ${symbol}`);
+    await db.recordAudit({ event_type: 'KILL_SWITCH_BLOCKED_ORDER', symbol, decision: side,
+      payload: { qty, price, strategy, reason: 'kill switch active' } });
+    return null;
+  }
   let order = { id: `mock-${Date.now()}`, status: 'mock_filled' };
   try {
     if (alpacaService.isConfigured()) {
@@ -466,6 +480,7 @@ async function runStrategy(sc, portfolio, clock, fullPriceLookup, dynamic) {
 }
 
 async function runCycle() {
+  if (killSwitchActive) { console.log('[Agent] Kill switch active — cycle refused'); return; }
   if (cycleInProgress || tradingLock) { console.log('[Agent] Cycle/flatten in progress, skipping'); return; }
   cycleInProgress = true;
   tradingLock = true;
@@ -560,7 +575,8 @@ async function runCycle() {
       if (allHForHedge.length >= 2) {
         const safeForAutoHedge = !portfolio.circuit_breaker
           && !portfolio.emergency_pause
-          && portfolio.agent_running;
+          && portfolio.agent_running
+          && !killSwitchActive;
         const autoHedge = process.env.AUTO_HEDGE === 'true' && safeForAutoHedge;
         await hedgingService.evaluateAndAlert(allHForHedge, { autoHedge });
       }
@@ -579,12 +595,23 @@ async function runCycle() {
 }
 
 async function startAgent() {
+  // Latched kill switch — only a process restart clears it. Reject loudly
+  // here so an operator who clicks Start sees the truth instead of a silent
+  // no-op (cycles would refuse anyway via the killSwitchActive guard, but
+  // the operator deserves explicit feedback).
+  if (killSwitchActive) {
+    const e = new Error('Kill switch is latched — restart the backend process to resume trading.');
+    e.code = 'KILL_SWITCH_LATCHED';
+    throw e;
+  }
   await db.updatePortfolio({ agent_running: true });
   await db.recordAudit({ event_type: 'AGENT_STARTED', payload: { intervalSeconds: BASE_INTERVAL_SECONDS } });
   if (!intervalHandle) intervalHandle = setInterval(runCycle, BASE_INTERVAL_SECONDS * 1000);
   console.log(`[Agent] Started — base interval ${BASE_INTERVAL_SECONDS}s`);
   runCycle();
 }
+
+function isKillSwitchLatched() { return killSwitchActive; }
 
 async function stopAgent() {
   await db.updatePortfolio({ agent_running: false });
@@ -596,6 +623,95 @@ async function emergencyPause(pause = true) {
   await db.updatePortfolio({ emergency_pause: pause, agent_running: pause ? false : (await db.getPortfolio()).agent_running });
   await db.recordAudit({ event_type: pause ? 'EMERGENCY_PAUSE' : 'EMERGENCY_RESUME' });
   if (pause) await discordService.sendCircuitBreakerAlert('Emergency pause activated by operator');
+}
+
+// Standalone "cancel all open orders" — touches working/pending orders only,
+// never positions. Used by operators when they want to stop the agent from
+// completing in-flight orders without forcing position liquidation.
+async function cancelAllOpenOrders(reason = 'operator request') {
+  await db.recordAudit({ event_type: 'CANCEL_ALL_ORDERS', payload: { reason } });
+  let result = { cancelled: 0 };
+  try { result = await alpacaService.cancelAllOpenOrders(); }
+  catch (e) { console.error('[Agent] cancelAllOpenOrders error:', e.message); }
+  console.log(`[Agent] Cancelled ${result.cancelled} open orders (${reason})`);
+  return result;
+}
+
+// Kill switch — the nuclear option. Atomic cascade:
+//   1. Audit-log KILL_SWITCH_START with reason + actor
+//   2. Cancel every open Alpaca order (no in-flight executions can complete)
+//   3. Force-flatten every position (uses existing flattenAllPositions, which
+//      already handles broker-fail rollback + per-position audit + Discord)
+//   4. Set emergency_pause = true and agent_running = false
+//   5. Audit-log KILL_SWITCH_COMPLETE with the result summary
+//   6. Discord blast
+// Operator must double-confirm (server.js requires confirm:"KILL"). Returns
+// the outcome rather than throwing so the API can render a structured response.
+// All existing safety rails (3-of-4 quorum, gates, sizing, hedging) remain
+// untouched — this only halts the agent, it does not change decision logic.
+async function killSwitch({ reason = 'operator kill switch', actor = 'operator' } = {}) {
+  const startedAt = new Date();
+  const startSummary = { reason, actor, startedAt: startedAt.toISOString() };
+  // STEP 1: Trip the sticky abort flag FIRST. Any in-flight executeOrder()
+  // call from a cycle that already passed emergency_pause will now refuse.
+  // Set BEFORE any await so there is zero window between the operator's
+  // intent and the order-blocking guard.
+  killSwitchActive = true;
+  // Mirror to the broker layer so any code path that calls placeOrder()
+  // directly (hedging auto-exec, future hand-rolled call sites) is also
+  // refused, not just the executeOrder() funnel.
+  try { alpacaService.setKillSwitchActive(true); } catch (_) {}
+  await db.recordAudit({ event_type: 'KILL_SWITCH_START', payload: startSummary });
+  console.log(`[Agent] 🛑 KILL SWITCH ENGAGED — ${reason} (actor: ${actor})`);
+  try { await discordService.sendCircuitBreakerAlert(`🛑 KILL SWITCH — ${reason}`); } catch (_) {}
+
+  // STEP 2: Halt scheduling so no new cycle can start mid-kill.
+  if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+  await db.updatePortfolio({ agent_running: false, emergency_pause: true });
+
+  // STEP 3: Wait for any in-flight cycle to drain. executeOrder is now
+  // refusing new orders, but an analyzeAndTradeSymbol() call may still be
+  // mid-LLM-await — let it finish cleanly so audit/state writes complete.
+  const drainStart = Date.now();
+  while (cycleInProgress && Date.now() - drainStart < 30000) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (cycleInProgress) {
+    await db.recordAudit({ event_type: 'KILL_SWITCH_DRAIN_TIMEOUT',
+      payload: { waitedMs: Date.now() - drainStart } });
+    console.error('[Agent] Kill switch: cycle drain timed out after 30s — proceeding with flatten anyway (executeOrder is already blocked)');
+  }
+
+  // STEP 4: Cancel open orders (best-effort, audit-logged inside).
+  let cancelResult = { cancelled: 0 };
+  try { cancelResult = await alpacaService.cancelAllOpenOrders(); } catch (e) {
+    await db.recordAudit({ event_type: 'KILL_SWITCH_CANCEL_FAIL', payload: { error: e.message } });
+  }
+
+  // STEP 5: Flatten everything via the established codepath (already does
+  // the broker-confirm-then-clear-local pattern + per-position audit rows).
+  // flattenAllPositions uses Alpaca's DELETE /v2/positions, not executeOrder,
+  // so the killSwitchActive guard does not block the flatten itself.
+  const holdingsBefore = await db.getHoldings();
+  await flattenAllPositions(`Kill switch: ${reason}`);
+  const holdingsAfter = await db.getHoldings();
+
+  const result = {
+    reason, actor,
+    startedAt: startedAt.toISOString(),
+    completedAt: new Date().toISOString(),
+    ordersCancelled: cancelResult.cancelled || 0,
+    positionsBefore: holdingsBefore.length,
+    positionsAfter: holdingsAfter.length,
+    flattenComplete: holdingsAfter.length === 0,
+  };
+  await db.recordAudit({ event_type: 'KILL_SWITCH_COMPLETE', payload: result });
+  try {
+    const tag = result.flattenComplete ? '✅ flatten complete' : `⚠ ${result.positionsAfter} positions still open`;
+    await discordService.sendCircuitBreakerAlert(`Kill switch finished — ${tag}, ${result.ordersCancelled} orders cancelled`);
+  } catch (_) {}
+  console.log(`[Agent] Kill switch complete:`, result);
+  return result;
 }
 
 async function resetCircuitBreaker() {
@@ -860,5 +976,6 @@ optionsActivityService.refreshBatch(WATCHLIST)
 module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, flattenAllPositions,
+  cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, WATCHLIST,
 };

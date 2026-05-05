@@ -6,8 +6,15 @@ const LIVE_URL = 'https://api.alpaca.markets';
 class AlpacaService {
   constructor() {
     this.dataUrl = 'https://data.alpaca.markets';
+    this._killSwitchActive = false;
     this.setMode(process.env.TRADING_MODE === 'live' ? 'live' : 'paper');
   }
+
+  // Set by agent.js when the kill switch is engaged. All placeOrder() calls
+  // are refused until the process restarts. Sticky by design — kill means
+  // kill, not pause.
+  setKillSwitchActive(v) { this._killSwitchActive = !!v; }
+  isKillSwitchActive() { return !!this._killSwitchActive; }
 
   setMode(mode) {
     this.mode = mode === 'live' ? 'live' : 'paper';
@@ -66,6 +73,17 @@ class AlpacaService {
   }
 
   async placeOrder({ symbol, qty, side, type = 'market', time_in_force = 'day' }) {
+    // Last-line kill-switch defense — global guard at the broker sink itself.
+    // executeOrder() in agent.js also guards, but hedgingService and any
+    // future call site that uses placeOrder directly will be caught here too.
+    // The kill-switch flag is exposed via a setter so we don't create a
+    // circular require with agent.js.
+    if (this._killSwitchActive) {
+      console.log(`[Alpaca] BLOCKED ${side} ${qty} ${symbol} — kill switch active`);
+      const err = new Error('Kill switch active — broker order refused');
+      err.code = 'KILL_SWITCH_ACTIVE';
+      throw err;
+    }
     if (!this.isConfigured()) {
       console.log(`[Mock] Would place ${side} order: ${qty} ${symbol}`);
       return { id: `mock-${Date.now()}`, symbol, qty, side, status: 'mock_filled' };
@@ -155,6 +173,19 @@ class AlpacaService {
       });
       return res.data || [];
     } catch (e) { console.error('[Alpaca] closeAllPositions error:', e.message); return []; }
+  }
+
+  // Cancel every open/working order without touching positions. Used by the
+  // kill switch and the standalone "cancel all orders" operator action.
+  async cancelAllOpenOrders() {
+    if (!this.isConfigured()) return { cancelled: 0, mock: true };
+    try {
+      const res = await axios.delete(`${this.baseUrl}/v2/orders`, {
+        headers: this.headers, timeout: 15000,
+      });
+      const list = Array.isArray(res.data) ? res.data : [];
+      return { cancelled: list.length, details: list };
+    } catch (e) { console.error('[Alpaca] cancelAllOpenOrders error:', e.message); return { cancelled: 0, error: e.message }; }
   }
 
   mockAccount() {

@@ -8,8 +8,10 @@ const WebSocket = require('ws');
 const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, flattenAllPositions,
+  cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale,
 } = require('./agent');
+const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
 const brokerService = require('./services/brokerService');
@@ -135,10 +137,14 @@ app.get('/api/state', async (req, res) => {
 
 app.post('/api/agent/start', async (req, res) => {
   try {
+    if (isKillSwitchLatched()) return res.status(409).json({ success: false, error: 'Kill switch is latched — restart the backend process to resume trading.' });
     const portfolio = await db.getPortfolio();
     if (portfolio.emergency_pause) return res.status(400).json({ success: false, error: 'Emergency pause is active. Resume first.' });
     await startAgent(); broadcastState(); res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    const code = e.code === 'KILL_SWITCH_LATCHED' ? 409 : 500;
+    res.status(code).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/agent/stop', async (req, res) => {
@@ -147,6 +153,7 @@ app.post('/api/agent/stop', async (req, res) => {
 
 app.post('/api/agent/run-now', async (req, res) => {
   try {
+    if (isKillSwitchLatched()) return res.status(409).json({ success: false, error: 'Kill switch is latched — restart the backend process to resume trading.' });
     const portfolio = await db.getPortfolio();
     if (portfolio.emergency_pause) return res.status(400).json({ success: false, error: 'Emergency pause active' });
     if (!portfolio.agent_running) await db.updatePortfolio({ agent_running: true });
@@ -166,6 +173,77 @@ app.post('/api/agent/reset-circuit-breaker', async (req, res) => {
 app.post('/api/agent/flatten', async (req, res) => {
   try { await flattenAllPositions(req.body?.reason || 'Manual flatten via dashboard'); broadcastState(); res.json({ success: true }); }
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// --- Phase 4: kill switch & operator emergency controls ---------------------
+// Cancel every open Alpaca order without touching positions. Useful when an
+// operator wants to halt new fills mid-cycle but keep current positions
+// (e.g. to take manual control before flattening).
+app.post('/api/agent/cancel-orders', async (req, res) => {
+  try {
+    const out = await cancelAllOpenOrders(req.body?.reason || 'Operator cancel-all-orders');
+    broadcastState();
+    res.json({ success: true, ...out });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Kill switch — destructive cascade. Requires operator token (already enforced
+// for all POST /api/agent/* via the global middleware) AND a body double-
+// confirmation: { confirm: "KILL", reason?: string }. The double-confirm
+// matches the existing live-mode pattern and prevents an accidental fat-finger
+// from nuking the book. Quorum, gates, sizing, and hedging logic are
+// untouched — this only halts the agent and clears positions.
+app.post('/api/agent/kill-switch', async (req, res) => {
+  try {
+    const { confirm, reason, actor } = req.body || {};
+    if (confirm !== 'KILL') {
+      return res.status(400).json({
+        success: false,
+        error: 'Kill switch requires confirm: "KILL" in the request body',
+      });
+    }
+    const out = await killSwitch({
+      reason: reason || 'Operator kill switch via dashboard',
+      actor: actor || 'operator',
+    });
+    broadcastState();
+    res.json({ success: true, result: out });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// --- Phase 4: compliance / regulatory audit reporting -----------------------
+// GET /api/audit/report?date=YYYY-MM-DD&format=json|csv
+//   Returns a structured day report: trades + risk events + blocked decisions
+//   + hash-chain verification, joined to the SIGNAL audit row that decided
+//   each trade so the model ensemble is recorded per execution. CSV is a
+//   regulator-friendly flat trade sheet with summary footer.
+// Operator-token gated (read of audit data may include strategy reasoning).
+app.get('/api/audit/report', requireOperator, async (req, res) => {
+  try {
+    const date = String(req.query.date || new Date().toISOString().slice(0, 10));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    }
+    const report = await complianceService.buildReport(date);
+    if ((req.query.format || 'json').toLowerCase() === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="audit-report-${date}.csv"`);
+      return res.send(complianceService.reportToCSV(report));
+    }
+    res.json(report);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/audit/verify[?since=YYYY-MM-DD]
+//   Walks the hash-chain forward and confirms each row_hash matches
+//   sha256(prev_hash || canonical body). Returns { ok, total, verified,
+//   legacy, brokenAt[] }. Tampering or schema drift surfaces here.
+app.get('/api/audit/verify', requireOperator, async (req, res) => {
+  try {
+    const since = req.query.since ? new Date(req.query.since + 'T00:00:00Z') : null;
+    if (since && Number.isNaN(since.getTime())) return res.status(400).json({ error: 'since must be YYYY-MM-DD' });
+    res.json(await db.verifyAuditChain({ since }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/agent/strategy/:name/toggle', async (req, res) => {
