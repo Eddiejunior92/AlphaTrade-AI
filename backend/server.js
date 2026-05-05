@@ -19,7 +19,11 @@ const sentimentService = require('./services/sentimentService');
 const premarketService = require('./services/premarketService');
 const db = require('./services/db');
 const bus = require('./services/eventBus');
-const { getWatchlist } = require('./strategies');
+const { getWatchlist, listStrategies, DEFAULT_RISK_SCALE } = require('./strategies');
+// Bound applier functions for the safety-suggestion endpoints. Imported as
+// individual functions above (not as a namespace) so the suggestion service
+// stays decoupled from the agent module.
+const _safetyApplierFns = { setRiskScale, setStrategyEnabled };
 const marketRegistry = require('./services/marketRegistry');
 const brokerRouter = require('./services/brokerRouter');
 
@@ -332,6 +336,7 @@ const scenarioSimService = require('./services/scenarioSimService');
 const llmWeightingService = require('./services/llmWeightingService');
 const causalInferenceService = require('./services/causalInferenceService');
 const counterfactualService = require('./services/counterfactualService');
+const safetySuggestionService = require('./services/safetySuggestionService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -512,6 +517,64 @@ app.get('/api/counterfactuals', async (req, res) => {
       summary,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Intelligent Safety Suggestion Layer — list pending, list recent (history),
+// trigger a re-mine, apply, reject. Every apply / reject writes an audit row
+// (SUGGEST_APPLY / SUGGEST_REJECT — short to fit varchar(16)). Apply NEVER auto-fires; the
+// user must POST explicitly. The applier dispatches via a hard-coded
+// whitelist inside the service — unknown kinds are refused before any
+// state writer runs.
+app.get('/api/safety-suggestions', async (_req, res) => {
+  try {
+    const summary = await safetySuggestionService.getDashboardSummary();
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/safety-suggestions/recent', async (req, res) => {
+  try {
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const recent = await safetySuggestionService.listRecent(limit);
+    res.json({ count: recent.length, suggestions: recent });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/safety-suggestions/refresh', requireOperator, async (_req, res) => {
+  try {
+    const portfolio = await db.getPortfolio();
+    const strategies = listStrategies(portfolio?.risk_scale || DEFAULT_RISK_SCALE)
+      .map(s => ({
+        name: s.name, label: s.label,
+        enabled: s.name === 'day' ? !!portfolio?.day_enabled
+               : s.name === 'swing' ? !!portfolio?.swing_enabled
+               : s.name === 'asx_swing' ? !!portfolio?.asx_swing_enabled
+               : false,
+      }));
+    const result = await safetySuggestionService.refresh({ force: true, portfolio, strategies });
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/safety-suggestions/:id/apply', requireOperator, async (req, res) => {
+  try {
+    const decided_by = String(req.body?.decided_by || 'user');
+    const applied = await safetySuggestionService.applySuggestion(req.params.id, {
+      decided_by,
+      applierFns: _safetyApplierFns,
+    });
+    broadcastState();
+    res.json({ success: true, applied });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/safety-suggestions/:id/reject', requireOperator, async (req, res) => {
+  try {
+    const decided_by = String(req.body?.decided_by || 'user');
+    const reason = req.body?.reason ? String(req.body.reason).slice(0, 500) : null;
+    const rejected = await safetySuggestionService.rejectSuggestion(req.params.id, { decided_by, reason });
+    res.json({ success: true, rejected });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
 });
 
 // Self-play scenario simulation introspection — per-symbol probabilistic

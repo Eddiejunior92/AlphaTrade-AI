@@ -194,6 +194,40 @@ async function ensureSchema() {
     )
   `);
 
+  // Intelligent Safety Suggestion Layer (safetySuggestionService). Each row
+  // is ONE bounded recommendation (risk-scale tier change OR strategy
+  // disable) generated from realised P&L + counterfactual evidence. status
+  // moves pending → applied | rejected | expired. NOTHING is ever applied
+  // automatically — every transition requires an explicit user POST. Hard
+  // safety rules (quorum, 85% gate floor in conservative tier, $100/day
+  // budget in conservative tier, 5% drawdown breaker, kill switch,
+  // trailing-stop ratchet) remain immutable — the suggestion surface only
+  // exposes parameters the user could already change themselves through
+  // existing audited writers (setRiskScale, setStrategyEnabled).
+  await query(`
+    CREATE TABLE IF NOT EXISTS safety_suggestions (
+      id              SERIAL PRIMARY KEY,
+      kind            TEXT NOT NULL,
+      target          TEXT NOT NULL,
+      current_value   TEXT,
+      suggested_value TEXT,
+      severity        TEXT NOT NULL DEFAULT 'medium',
+      rationale       TEXT NOT NULL,
+      evidence        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at      TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
+      decided_at      TIMESTAMPTZ,
+      decided_by      TEXT,
+      applier_result  JSONB
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS safety_suggestions_status_idx ON safety_suggestions (status, created_at DESC)`);
+  // Dedupe key: at most one PENDING suggestion per (kind, target, suggested_value)
+  // at any time — refresh just updates rationale/evidence rather than piling up.
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS safety_suggestions_pending_uniq
+               ON safety_suggestions (kind, target, suggested_value) WHERE status = 'pending'`);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`
@@ -445,7 +479,7 @@ async function verifyAuditChain({ since } = {}) {
 }
 
 module.exports = {
-  query, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
+  query, pool, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
   getHoldings, getHolding, upsertHolding, deleteHolding,
   recordTrade, getRecentTrades,
   recordAudit, getRecentAudit, verifyAuditChain,

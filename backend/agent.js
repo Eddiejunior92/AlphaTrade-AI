@@ -30,6 +30,7 @@ const macroForecastService = require('./services/macroForecastService');
 const scenarioSimService = require('./services/scenarioSimService');
 const causalInference = require('./services/causalInferenceService');
 const counterfactual = require('./services/counterfactualService');
+const safetySuggestion = require('./services/safetySuggestionService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -1510,6 +1511,37 @@ setTimeout(() => {
 setInterval(() => {
   causalInference.refresh().catch(() => {});
   counterfactual.refresh().catch(() => {});
+}, 30 * 60 * 1000);
+
+// Intelligent Safety Suggestion Layer warm-up — delayed 120s so it runs
+// AFTER the counterfactual layer (which it consumes for additional evidence)
+// has had a chance to populate its first cache. Suggestion generation never
+// applies anything automatically; it only writes pending rows to the
+// safety_suggestions table for the user to review and approve in the UI.
+async function _resolveSafetyContext() {
+  const portfolio = await db.getPortfolio().catch(() => null);
+  const scaleName = portfolio?.risk_scale || DEFAULT_RISK_SCALE;
+  const strategies = listStrategies(scaleName).map(s => ({
+    name: s.name, label: s.label,
+    enabled: s.name === 'day' ? !!portfolio?.day_enabled
+           : s.name === 'swing' ? !!portfolio?.swing_enabled
+           : s.name === 'asx_swing' ? !!portfolio?.asx_swing_enabled
+           : false,
+  }));
+  return { portfolio, strategies };
+}
+setTimeout(async () => {
+  try {
+    const ctx = await _resolveSafetyContext();
+    const r = await safetySuggestion.refresh({ force: true, ...ctx });
+    console.log(`[Safety] Startup refresh: generated ${r.generated} (inserted ${r.inserted ?? 0}, updated ${r.updated ?? 0}, expired ${r.expired ?? 0})`);
+  } catch (e) { console.error('[Safety] Startup refresh failed:', e.message); }
+}, 120_000);
+setInterval(async () => {
+  try {
+    const ctx = await _resolveSafetyContext();
+    await safetySuggestion.refresh(ctx).catch(() => {});
+  } catch (_) {}
 }, 30 * 60 * 1000);
 
 (async () => {
