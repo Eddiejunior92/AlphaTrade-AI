@@ -91,9 +91,12 @@ async function start({ getSnapshot, getRecentTrades }) {
 
   _client.on(Events.MessageCreate, async (msg) => {
     try {
-      // Ignore bot messages (incl. self) — prevents echo loops with the
-      // outbound webhook used for daily P&L and trade alerts.
+      // Ignore bot messages (incl. self) AND webhook messages — prevents
+      // echo loops with the outbound webhook used for daily P&L / trade
+      // alerts. Belt-and-suspenders: webhook posts have webhookId set even
+      // when their author isn't flagged as a bot.
       if (msg.author?.bot) return;
+      if (msg.webhookId) return;
       const isDM = msg.channel?.type === ChannelType.DM;
       const isTargetChannel = channelId && msg.channel?.id === channelId;
       if (!isDM && !isTargetChannel) return;

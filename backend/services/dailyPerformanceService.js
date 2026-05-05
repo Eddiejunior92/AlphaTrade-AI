@@ -178,7 +178,11 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
   // = $0; if/when a paid feed is wired, set DATA_FEED_COST_USD_PER_DAY).
   const llmCallCost  = Number(process.env.LLM_CALL_COST_USD) || 0.002;
   const dataDailyUSD = Number(process.env.DATA_FEED_COST_USD_PER_DAY) || 0;
-  const llmCalls     = (llm?.calls || 0) + (llm?.escalated || 0);
+  // NOTE: `ensembleEscalated` is a SUBSET of `ensembleCalls` (every escalated
+  // tick also increments ensembleCalls in agent.js — see perfMetrics around
+  // L1012). Only count `calls` here, otherwise escalated ticks are billed
+  // twice and net P&L is understated.
+  const llmCalls     = llm?.calls || 0;
   const llmCostUSD   = +(llmCalls * llmCallCost).toFixed(2);
   const totalGrossUSD = (us.net_pnl_usd || 0) + (asx.net_pnl_usd || 0);
   const totalCostsUSD = +(llmCostUSD + dataDailyUSD).toFixed(2);
