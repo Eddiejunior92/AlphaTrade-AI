@@ -1,7 +1,17 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
+import MarketFilter from './MarketFilter';
+
+// Per-market defaults — the symbol field auto-switches when the operator
+// flips the market chip so they never have to remember which tickers are
+// in which watchlist.
+const DEFAULT_SYMBOLS = {
+  ALL: 'SPY,QQQ,AAPL',
+  US:  'SPY,QQQ,AAPL',
+  ASX: 'BHP,CBA,CSL',
+};
 
 const DEFAULTS = {
-  symbols: 'SPY,QQQ,AAPL',
+  symbols: DEFAULT_SYMBOLS.ALL,
   lookbackDays: 365,
   startCash: 100000,
   slippageBps: 5,
@@ -44,12 +54,14 @@ function MiniSparkline({ points }) {
   );
 }
 
-export default function BacktestPanel() {
+export default function BacktestPanel({ marketOf }) {
   const [params, setParams] = useState(DEFAULTS);
+  const [marketScope, setMarketScope] = useState('ALL');
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [recent, setRecent] = useState([]);
+  const [recentFilter, setRecentFilter] = useState('ALL');
 
   const loadRecent = async () => {
     try { const r = await fetch('/api/backtest/recent').then(r => r.json()); setRecent(Array.isArray(r) ? r : []); } catch {}
@@ -58,11 +70,22 @@ export default function BacktestPanel() {
 
   const update = (k, v) => setParams(p => ({ ...p, [k]: v }));
 
+  // Switching market scope swaps the suggested symbols (only if the user
+  // hasn't customized away from the previous default).
+  const onScopeChange = (next) => {
+    setMarketScope(next);
+    setParams(p => {
+      const wasDefault = Object.values(DEFAULT_SYMBOLS).includes(p.symbols);
+      return wasDefault ? { ...p, symbols: DEFAULT_SYMBOLS[next] } : p;
+    });
+  };
+
   const run = async () => {
     setLoading(true); setError(''); setResult(null);
     try {
       const body = {
         symbols: params.symbols.split(',').map(s => s.trim()).filter(Boolean),
+        market: marketScope === 'ALL' ? undefined : marketScope,
         lookbackDays: +params.lookbackDays,
         startCash: +params.startCash,
         slippageBps: +params.slippageBps,
@@ -88,21 +111,54 @@ export default function BacktestPanel() {
     finally { setLoading(false); }
   };
 
+  // Derive per-run market from the run's symbols. A run is "US" if all symbols
+  // resolve to US, "ASX" if all are ASX, otherwise "MIX".
+  const marketForRun = (r) => {
+    const syms = r.symbols || [];
+    if (!syms.length || !marketOf) return 'MIX';
+    const ms = new Set(syms.map(s => marketOf(s)));
+    if (ms.size === 1) return [...ms][0];
+    return 'MIX';
+  };
+  const recentCounts = useMemo(() => {
+    const c = { US: 0, ASX: 0 };
+    for (const r of recent) {
+      const m = marketForRun(r);
+      if (m === 'US') c.US += 1;
+      else if (m === 'ASX') c.ASX += 1;
+    }
+    return c;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recent]);
+  const filteredRecent = recentFilter === 'ALL'
+    ? recent
+    : recent.filter(r => marketForRun(r) === recentFilter);
+
   const fmt = n => typeof n === 'number' ? n.toLocaleString('en-US', { maximumFractionDigits: 2 }) : '—';
   const pctColor = n => n > 0 ? 'text-[var(--green)]' : n < 0 ? 'text-[var(--red)]' : 'text-white';
 
   return (
     <div className="space-y-4">
       <div className="bg-white/5 rounded-2xl border border-white/10 p-5">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-3">
           <div>
             <h2 className="text-lg font-bold text-white">Backtest engine</h2>
             <p className="text-[11px] text-[var(--text-dim)] mt-0.5">Rules-based proxy on daily bars (RSI + trend + MACD). Slippage, commission, trailing stop, regime filter all configurable. Not a full 4-LLM replay.</p>
           </div>
-          <button onClick={run} disabled={loading}
-            className="px-4 py-2 rounded-xl bg-[var(--green)] text-black font-semibold text-sm hover:bg-[var(--green)]/80 disabled:opacity-50 disabled:cursor-not-allowed">
-            {loading ? 'Running…' : 'Run backtest'}
-          </button>
+          <div className="flex items-center gap-2">
+            <MarketFilter value={marketScope} onChange={onScopeChange} />
+            <button onClick={run} disabled={loading}
+              className="px-4 py-2 rounded-xl bg-[var(--green)] text-black font-semibold text-sm hover:bg-[var(--green)]/80 disabled:opacity-50 disabled:cursor-not-allowed">
+              {loading ? 'Running…' : 'Run backtest'}
+            </button>
+          </div>
+        </div>
+
+        <div className="text-[11px] text-[var(--text-dim)] mb-3">
+          Scope: <span className="text-white font-semibold">
+            {marketScope === 'ALL' ? 'US + ASX' : marketScope}
+          </span> · only watchlist symbols are accepted
+          {marketScope === 'ASX' && <span className="ml-1.5 opacity-70">· P&L native AUD</span>}
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -191,22 +247,36 @@ export default function BacktestPanel() {
 
       {recent.length > 0 && (
         <div className="bg-white/5 rounded-2xl border border-white/10 p-5">
-          <h3 className="text-sm font-bold text-white mb-3">Recent runs</h3>
+          <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+            <h3 className="text-sm font-bold text-white">Recent runs</h3>
+            <MarketFilter value={recentFilter} onChange={setRecentFilter} counts={recentCounts} />
+          </div>
           <div className="space-y-1.5">
-            {recent.map(r => (
-              <div key={r.id} className="flex items-center justify-between text-xs py-1.5 border-b border-white/5">
-                <div>
-                  <span className="text-white font-medium">#{r.id}</span>
-                  <span className="text-[var(--text-dim)] ml-2">{(r.symbols || []).join(', ')}</span>
-                  <span className="text-[var(--text-dim)] ml-2">{r.start_date} → {r.end_date}</span>
+            {filteredRecent.map(r => {
+              const m = marketForRun(r);
+              return (
+                <div key={r.id} className="flex items-center justify-between text-xs py-1.5 border-b border-white/5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-white font-medium">#{r.id}</span>
+                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+                      m === 'ASX' ? 'bg-[var(--purple)]/20 text-[var(--purple)]' :
+                      m === 'US'  ? 'bg-[var(--blue)]/20 text-[var(--blue)]' :
+                                    'bg-white/10 text-[var(--text-dim)]'
+                    }`}>{m}</span>
+                    <span className="text-[var(--text-dim)] ml-1">{(r.symbols || []).join(', ')}</span>
+                    <span className="text-[var(--text-dim)] ml-2">{r.start_date} → {r.end_date}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className={pctColor(r.results?.totalReturnPct)}>{r.results?.totalReturnPct}%</span>
+                    <span className="text-[var(--text-dim)]">Sharpe {r.results?.sharpe}</span>
+                    <span className="text-[var(--text-dim)]">{r.results?.nTrades} trades</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <span className={pctColor(r.results?.totalReturnPct)}>{r.results?.totalReturnPct}%</span>
-                  <span className="text-[var(--text-dim)]">Sharpe {r.results?.sharpe}</span>
-                  <span className="text-[var(--text-dim)]">{r.results?.nTrades} trades</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
+            {filteredRecent.length === 0 && (
+              <div className="text-[12px] text-[var(--text-dim)] py-2">No runs in {recentFilter}.</div>
+            )}
           </div>
         </div>
       )}

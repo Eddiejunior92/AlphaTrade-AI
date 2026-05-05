@@ -1,12 +1,15 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import MarketCard from './MarketCard';
 import ErrorBoundary from './ErrorBoundary';
-import MarketClock from './MarketClock';
+import MarketClocks from './MarketClocks';
+import MarketFilter from './MarketFilter';
+import FxBadge from './FxBadge';
 
-export default function MarketsTab() {
+export default function MarketsTab({ fx }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [filter, setFilter] = useState('ALL');
 
   const load = useCallback(async () => {
     try {
@@ -29,25 +32,35 @@ export default function MarketsTab() {
 
   const handleRefresh = () => { setRefreshing(true); load(); };
 
-  const cards = data?.cards || [];
+  const allCards = data?.cards || [];
+  const counts = useMemo(() => ({
+    US: allCards.filter(c => (c.market || 'US') === 'US').length,
+    ASX: allCards.filter(c => c.market === 'ASX').length,
+  }), [allCards]);
+  const cards = filter === 'ALL' ? allCards : allCards.filter(c => (c.market || 'US') === filter);
 
   return (
     <div className="space-y-4">
-      <MarketClock />
-      <div className="flex items-center justify-between px-1">
+      <MarketClocks />
+      {fx && <FxBadge fx={fx} />}
+
+      <div className="flex items-center justify-between gap-3 flex-wrap px-1">
         <div>
           <div className="text-base font-semibold tracking-tight">Markets</div>
           <div className="text-[11px] text-[var(--text-dim)]">
-            {cards.length} symbols · charts, AI signal, news sentiment
+            {cards.length} of {allCards.length} symbols · charts, AI signal, news sentiment
           </div>
         </div>
-        <button
-          onClick={handleRefresh}
-          disabled={refreshing}
-          className="text-[11px] font-medium px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-white/80 transition disabled:opacity-50"
-        >
-          {refreshing ? 'Refreshing…' : 'Refresh'}
-        </button>
+        <div className="flex items-center gap-2">
+          <MarketFilter value={filter} onChange={setFilter} counts={counts} />
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className="text-[11px] font-medium px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-white/80 transition disabled:opacity-50"
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
       {loading ? (
@@ -56,7 +69,7 @@ export default function MarketsTab() {
         </div>
       ) : cards.length === 0 ? (
         <div className="rounded-3xl bg-white/[0.03] border border-white/5 p-8 text-center text-sm text-[var(--text-dim)]">
-          No market data available.
+          No symbols in {filter === 'ALL' ? 'any market' : filter}.
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">

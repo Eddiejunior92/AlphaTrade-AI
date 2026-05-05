@@ -5,6 +5,10 @@
 // to produce buy/sell decisions on each bar so the user can size, sweep, and
 // compare parameter changes from the dashboard.
 const alpaca = require('./alpacaService');
+// Route bars through the broker router so ASX backtests pull from IBKR
+// instead of silently grabbing US-listed instruments with overlapping
+// tickers (e.g. BHP, RIO) from Alpaca.
+const brokerRouter = require('./brokerRouter');
 const indicators = require('./indicatorsService');
 const patterns = require('./patternService');
 const db = require('./db');
@@ -58,7 +62,7 @@ async function runBacktest(rawParams = {}) {
   const series = {};
   for (const sym of p.symbols) {
     try {
-      const bars = await alpaca.getBars(sym, '1Day', p.lookbackDays + 60);
+      const bars = await brokerRouter.getBars(sym, '1Day', p.lookbackDays + 60);
       if (!Array.isArray(bars) || bars.length < 60) continue;
       series[sym] = bars;
     } catch (e) {

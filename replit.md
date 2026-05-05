@@ -83,3 +83,17 @@ VM deployment configured via `.replit` — runs both backend and Vite preview to
 - **Audit hash-chain (Phase 4)**: `audit_log` has `prev_hash` + `row_hash` (SHA-256 of `prev_hash || event_type || symbol || decision || JSON(payload) || created_at`), written inside a transaction with `LOCK TABLE audit_log IN EXCLUSIVE MODE`. `GET /api/audit/verify` walks the chain and reports the first break (or "ok"). Tamper-evident — any row mutation invalidates every subsequent `row_hash`.
 - **Compliance reports (Phase 4)**: `GET /api/audit/report?date=YYYY-MM-DD&format=json|csv` (operator-token gated). JSON includes daily P&L, win rate, model attribution, risk events (kill switch / circuit breaker / hedge / mode changes / drawdown pause), blocked-trade reasons (quorum/gate/risk), per-trade SIGNAL attachment via two-pass strategy-aware match (strict strategy === trade.strategy preferred, falls back to any-strategy within 5-min window), hash-chain verification result. CSV is a flat regulator-relevant trade sheet.
 - **Asset-class scaffolding (Phase 4)**: `trades`, `holdings`, `audit_log` have `asset_class` column (default `'equity'`). Equities-only execution today; options/futures execution intentionally deferred (would require LLM prompt restructure, contracts×multiplier sizing, different stop-loss math, and Alpaca's separate options contract symbol schema — futures not supported by Alpaca at all).
+
+## US/ASX Market Split (May 2026)
+
+The dashboard now treats US and ASX as first-class peers everywhere:
+
+- **Header:** two market badges (🇺🇸 / 🇦🇺 OPEN/CLOSED) plus a compact AUD/USD FX pill (green=live, yellow=stale, red=missing). Stale rates make ASX risk-sizing refuse — operators see this at a glance.
+- **Home / MarketsTab:** `MarketClocks` renders the NYSE and ASX (Sydney) sessions side-by-side with DST-correct countdowns via `Intl`. Full `FxBadge` panel sits below.
+- **Per-tab market filters** (`MarketFilter` chips, `ALL/US/ASX` with live counts) on Live Signals, Reasoning, Positions, Trades, and Backtest. Each filter has its own state so scoping one section never narrows another.
+- **Holdings** are shown in NATIVE currency per row ($/A$ + market badge). Positions tab adds per-market subtotals (native + USD-equivalent via `state.fx`) so AUD never gets summed into USD.
+- **Trades + Audit** carry `market`/`currency`/`fx_rate`. The TradeLog displays the FX rate used at execution for ASX rows. `/api/trades` and `/api/audit` accept `?market=US|ASX`; platform-wide audit events without a symbol stay visible under any filter.
+- **Backtest** scope chip narrows the allowed watchlist to one market and auto-swaps default symbols (US: SPY,QQQ,AAPL; ASX: BHP,CBA,CSL). Recent runs are tagged US/ASX/MIX and filterable by chip.
+- **Backend tagging:** `/api/markets` returns combined `usWatchlist`+`asxWatchlist` and tags each card with `market`/`currency`. `/api/bars/:symbol` and `/api/sentiment/:symbol` whitelist both watchlists and route ASX through `brokerRouter` (IBKR). `agent.js` writes `market`+`currency` onto every `lastSignals` entry.
+
+All existing safety rules (single USD-equivalent daily loss budget, circuit breaker, kill switch, dual-broker order routing) are unchanged — only the presentation and filtering layers were extended.

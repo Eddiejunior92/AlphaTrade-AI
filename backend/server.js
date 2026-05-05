@@ -20,6 +20,19 @@ const premarketService = require('./services/premarketService');
 const db = require('./services/db');
 const bus = require('./services/eventBus');
 const { getWatchlist } = require('./strategies');
+const marketRegistry = require('./services/marketRegistry');
+const brokerRouter = require('./services/brokerRouter');
+
+// Combined US + ASX watchlist — used as the access whitelist for any
+// per-symbol endpoint (bars, sentiment, backtest). Recomputed per request
+// so env overrides take effect without a process restart.
+function getCombinedWatchlist() {
+  return [...new Set([
+    ...getWatchlist().map(s => s.toUpperCase()),
+    ...marketRegistry.getAsxWatchlist().map(s => s.toUpperCase()),
+  ])];
+}
+function marketOf(sym) { return marketRegistry.getSymbolInfo(sym).market; }
 
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3001;
@@ -280,12 +293,27 @@ app.post('/api/agent/trading-mode', async (req, res) => {
 
 app.get('/api/trades', async (req, res) => {
   const limit = Math.min(200, parseInt(req.query.limit) || 50);
-  res.json(await db.getRecentTrades(limit));
+  const market = String(req.query.market || '').toUpperCase();
+  let rows = await db.getRecentTrades(limit);
+  if (market === 'US' || market === 'ASX') {
+    // Prefer the row's stored `market` (recorded at trade time, even if the
+    // registry changes later); fall back to symbol lookup for legacy rows.
+    rows = rows.filter(t => (t.market || marketOf(t.symbol)) === market);
+  }
+  res.json(rows);
 });
 
 app.get('/api/audit', async (req, res) => {
   const limit = Math.min(200, parseInt(req.query.limit) || 50);
-  res.json(await db.getRecentAudit(limit));
+  const market = String(req.query.market || '').toUpperCase();
+  let rows = await db.getRecentAudit(limit);
+  if (market === 'US' || market === 'ASX') {
+    // Audit rows aren't market-tagged at the column level; derive from symbol.
+    // System-wide events without a symbol (e.g. CIRCUIT_BREAKER_TRIPPED) are
+    // kept under both filters so operators never lose sight of platform state.
+    rows = rows.filter(r => !r.symbol || marketOf(r.symbol) === market);
+  }
+  res.json(rows);
 });
 
 // --- Backtest engine ---------------------------------------------------------
@@ -311,8 +339,17 @@ app.post('/api/backtest', requireOperatorStrictGate, async (req, res) => {
   if (backtestInFlight) return res.status(429).json({ error: 'A backtest is already running. Try again in a moment.' });
   backtestInFlight = true;
   try {
-    // Constrain symbols to the watchlist (prevents arbitrary-symbol cost-DoS).
-    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    // Constrain symbols to the combined US+ASX watchlist (prevents arbitrary-
+    // symbol cost-DoS). An optional `market` filter further narrows the
+    // allowed set so the dashboard's market chips can scope a backtest.
+    // Accept market scope from either body or query string so the dashboard
+    // chip and direct API users (curl/scripts) both work.
+    const market = String(req.body?.market || req.query?.market || '').toUpperCase();
+    let allowedList = getCombinedWatchlist();
+    if (market === 'US' || market === 'ASX') {
+      allowedList = allowedList.filter(s => marketOf(s) === market);
+    }
+    const allowed = new Set(allowedList);
     const requested = Array.isArray(req.body?.symbols) ? req.body.symbols.map(s => String(s).toUpperCase()) : null;
     const symbols = requested ? requested.filter(s => allowed.has(s)) : [...allowed].slice(0, 5);
     if (!symbols.length) return res.status(400).json({ error: 'No valid symbols (must be in watchlist)' });
@@ -396,12 +433,16 @@ app.get('/api/bars/:symbol', async (req, res) => {
     const symbol = String(req.params.symbol || '').toUpperCase();
     const range = (req.query.range || '1d').toLowerCase();
     if (!['1d', '5d'].includes(range)) return res.status(400).json({ error: 'range must be 1d or 5d' });
-    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    const allowed = new Set(getCombinedWatchlist());
     if (!allowed.has(symbol)) return res.status(404).json({ error: 'Symbol not in watchlist' });
 
     const cacheKey = `${symbol}:${range}`;
     const cached = BARS_CACHE.get(cacheKey);
     if (cached && Date.now() - cached.ts < BARS_TTL_MS) return res.json(cached.data);
+
+    // Route via the broker router so ASX symbols come from IBKR. Returns the
+    // same {t,o,h,l,c,v} bar shape regardless of broker.
+    const brokerGetBars = (sym, tf, lim, opts) => brokerRouter.getBars(sym, tf, lim, opts);
 
     // IEX free feed has a ~15-min delay, so cap end at 'now - 16min' to avoid
     // SIP-only subscription errors.
@@ -412,7 +453,7 @@ app.get('/api/bars/:symbol', async (req, res) => {
       ? { timeframe: '5Min', limit: 1000, take: 78 }
       : { timeframe: '30Min', limit: 1000, take: 70 };
 
-    const allBars = await alpacaService.getBars(symbol, cfg.timeframe, cfg.limit, {
+    const allBars = await brokerGetBars(symbol, cfg.timeframe, cfg.limit, {
       start: startDate.toISOString(),
       end: endDate.toISOString(),
     });
@@ -437,7 +478,7 @@ app.get('/api/bars/:symbol', async (req, res) => {
 app.get('/api/sentiment/:symbol', async (req, res) => {
   try {
     const symbol = String(req.params.symbol || '').toUpperCase();
-    const allowed = new Set(getWatchlist().map(s => s.toUpperCase()));
+    const allowed = new Set(getCombinedWatchlist());
     if (!allowed.has(symbol)) {
       return res.status(404).json({ error: 'Symbol not in watchlist' });
     }
@@ -457,16 +498,22 @@ app.get('/api/sentiment/:symbol', async (req, res) => {
 // confidence, and news sentiment. No bars (those load lazily per-symbol).
 app.get('/api/markets', async (req, res) => {
   try {
-    const watchlist = getWatchlist();
+    // Combined US + ASX watchlist. Each card is tagged with `market`/`currency`
+    // so the dashboard can filter by market chip without re-deriving anything.
+    const usWatch = getWatchlist().map(s => s.toUpperCase());
+    const asxWatch = marketRegistry.getAsxWatchlist().map(s => s.toUpperCase());
+    const watchlist = [...new Set([...usWatch, ...asxWatch])];
     const snap = await getAgentSnapshot();
     const sigs = snap.signals || {};
     const sents = sentimentService.getAllCached();
 
-    // Latest price per symbol — single 1Min bar, parallel.
+    // Latest price per symbol — single 1Min bar via brokerRouter so ASX symbols
+    // come from IBKR. Failures (e.g. closed market, mock unavailable) just
+    // surface as price=null, never as a 500.
     const prices = await Promise.all(watchlist.map(async sym => {
       try {
-        const bars = await alpacaService.getBars(sym, '1Min', 2);
-        if (!bars.length) return [sym, null];
+        const bars = await brokerRouter.getBars(sym, '1Min', 2);
+        if (!bars?.length) return [sym, null];
         const c = bars[bars.length - 1].c;
         const prev = bars.length > 1 ? bars[bars.length - 2].c : c;
         return [sym, { price: c, changePct: prev ? +(((c - prev) / prev) * 100).toFixed(2) : 0 }];
@@ -482,21 +529,30 @@ app.get('/api/markets', async (req, res) => {
       if (!prev || new Date(s.timestamp) > new Date(prev.timestamp)) sigBySym[sym] = s;
     }
 
-    const cards = watchlist.map(sym => ({
-      symbol: sym,
-      price: priceMap[sym]?.price ?? null,
-      changePct: priceMap[sym]?.changePct ?? null,
-      signal: sigBySym[sym] ? {
-        consensus: sigBySym[sym].signal,
-        confidence: sigBySym[sym].confidence,
-        reason: sigBySym[sym].reason,
-        strategy: sigBySym[sym].strategy,
-        timestamp: sigBySym[sym].timestamp,
-      } : null,
-      sentiment: sents[sym] || null,
-    }));
+    const cards = watchlist.map(sym => {
+      const info = marketRegistry.getSymbolInfo(sym);
+      return {
+        symbol: sym,
+        market: info.market,
+        currency: info.currency,
+        price: priceMap[sym]?.price ?? null,
+        changePct: priceMap[sym]?.changePct ?? null,
+        signal: sigBySym[sym] ? {
+          consensus: sigBySym[sym].signal,
+          confidence: sigBySym[sym].confidence,
+          reason: sigBySym[sym].reason,
+          strategy: sigBySym[sym].strategy,
+          timestamp: sigBySym[sym].timestamp,
+        } : null,
+        sentiment: sents[sym] || null,
+      };
+    });
 
-    res.json({ watchlist, cards, fetchedAt: new Date().toISOString() });
+    res.json({
+      watchlist, cards,
+      usWatchlist: usWatch, asxWatchlist: asxWatch,
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

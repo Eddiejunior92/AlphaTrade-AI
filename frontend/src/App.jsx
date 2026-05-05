@@ -9,9 +9,13 @@ import VoiceChat from './components/VoiceChat';
 import Tooltip from './components/Tooltip';
 import MarketsTab from './components/MarketsTab';
 import ErrorBoundary from './components/ErrorBoundary';
-import MarketClock from './components/MarketClock';
+import MarketClocks from './components/MarketClocks';
 import PreMarketBriefing from './components/PreMarketBriefing';
 import BacktestPanel from './components/BacktestPanel';
+import MarketFilter from './components/MarketFilter';
+import FxBadge from './components/FxBadge';
+import { makeMarketOf, currencySymbolForMarket, toUsd } from './lib/markets';
+import { useMemo } from 'react';
 
 const TABS = [
   { id: 'home',      label: 'Home',      icon: '◐' },
@@ -58,6 +62,12 @@ export default function App() {
   const [modeModal, setModeModal] = useState(null); // 'paper' | 'live' | null
   const [modeError, setModeError] = useState('');
   const [modeConfirmText, setModeConfirmText] = useState('');
+  // Per-tab market filters — separate state so a user filtering Trades to ASX
+  // doesn't also narrow the Live Signals strip on Home.
+  const [signalsMarket, setSignalsMarket] = useState('ALL');
+  const [posMarket, setPosMarket] = useState('ALL');
+  const [tradesMarket, setTradesMarket] = useState('ALL');
+  const [reasonMarket, setReasonMarket] = useState('ALL');
   const {
     state, trades, audit, premarket, refreshPremarket,
     connected, liveAuditAt, loading, brokerChat,
@@ -73,6 +83,62 @@ export default function App() {
   const dailyPct = state?.dailyPnLPct || 0;
   const signals = state?.signals ? Object.values(state.signals) : [];
   const holdings = state?.holdings || [];
+  const fx = state?.fx;
+  // Single market resolver derived from the live ASX watchlist. Audit rows
+  // and any signal missing `market` go through this.
+  const marketOf = useMemo(
+    () => makeMarketOf(state?.asxWatchlist || []),
+    [state?.asxWatchlist]
+  );
+  const usMarket  = state?.markets?.US  || state?.market || { open: false };
+  const asxMarket = state?.markets?.ASX || { open: false };
+
+  // Counts for the tab filters — kept memoized so the chip count doesn't
+  // recompute on every keystroke elsewhere.
+  const signalCounts = useMemo(() => ({
+    US:  signals.filter(s => (s.market || marketOf(s.symbol)) === 'US').length,
+    ASX: signals.filter(s => (s.market || marketOf(s.symbol)) === 'ASX').length,
+  }), [signals, marketOf]);
+  const holdingCounts = useMemo(() => ({
+    US:  holdings.filter(h => (h.market || 'US') === 'US').length,
+    ASX: holdings.filter(h => h.market === 'ASX').length,
+  }), [holdings]);
+  const tradeCounts = useMemo(() => ({
+    US:  trades.filter(t => (t.market || marketOf(t.symbol)) === 'US').length,
+    ASX: trades.filter(t => (t.market || marketOf(t.symbol)) === 'ASX').length,
+  }), [trades, marketOf]);
+  const auditCounts = useMemo(() => ({
+    US:  audit.filter(r => !r.symbol || marketOf(r.symbol) === 'US').length,
+    ASX: audit.filter(r => !r.symbol || marketOf(r.symbol) === 'ASX').length,
+  }), [audit, marketOf]);
+
+  const filteredSignals = signalsMarket === 'ALL'
+    ? signals
+    : signals.filter(s => (s.market || marketOf(s.symbol)) === signalsMarket);
+  const filteredHoldings = posMarket === 'ALL'
+    ? holdings
+    : holdings.filter(h => (h.market || 'US') === posMarket);
+  const filteredTrades = tradesMarket === 'ALL'
+    ? trades
+    : trades.filter(t => (t.market || marketOf(t.symbol)) === tradesMarket);
+  const filteredAudit = reasonMarket === 'ALL'
+    ? audit
+    : audit.filter(r => !r.symbol || marketOf(r.symbol) === reasonMarket);
+
+  // Per-market totals for the Positions tab. Native is in each market's own
+  // currency; USD-equiv applies the live FX rate so the operator can compare
+  // total exposure across markets at a glance.
+  const marketTotals = useMemo(() => {
+    const out = { US: { native: 0, pnl: 0, n: 0 }, ASX: { native: 0, pnl: 0, n: 0 } };
+    for (const h of holdings) {
+      const m = h.market || 'US';
+      if (!out[m]) continue;
+      out[m].native += h.marketValue || 0;
+      out[m].pnl    += h.unrealizedPnL || 0;
+      out[m].n      += 1;
+    }
+    return out;
+  }, [holdings]);
   const isRunning = state?.running;
   const paused = state?.emergencyPause;
   const cbTripped = state?.circuitBreakerTripped;
@@ -111,14 +177,16 @@ export default function App() {
                 <span className="text-[10px] font-medium text-[var(--blue)]">·</span>
                 <span className="text-[10px] font-medium text-[var(--text-dim)]">{enabledStrategies.map(s => s.label).join(' + ') || 'No strategy'}</span>
               </div>
-              <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5">
+              <div className="text-[10px] text-[var(--text-dim)] flex items-center gap-1.5 flex-wrap">
                 <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-[var(--green)] pulse-live' : 'bg-[var(--red)]'}`} />
                 {connected ? 'Live' : 'Reconnecting…'} · Cycle #{state?.cycleCount ?? 0}
-                {state?.market && (
-                  <span className={`ml-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold ${state.market.open ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/10 text-[var(--text-dim)]'}`}>
-                    {state.market.open ? 'MKT OPEN' : 'MKT CLOSED'}
-                  </span>
-                )}
+                <span className={`ml-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold ${usMarket.open ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/10 text-[var(--text-dim)]'}`}>
+                  🇺🇸 {usMarket.open ? 'OPEN' : 'CLOSED'}
+                </span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[9px] font-bold ${asxMarket.open ? 'bg-[var(--green)]/20 text-[var(--green)]' : 'bg-white/10 text-[var(--text-dim)]'}`}>
+                  🇦🇺 {asxMarket.open ? 'OPEN' : 'CLOSED'}
+                </span>
+                {fx && <FxBadge fx={fx} compact />}
               </div>
             </div>
           </div>
@@ -216,8 +284,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Live market clock + countdown */}
-            <MarketClock />
+            {/* Live US + ASX market clocks side-by-side */}
+            <MarketClocks />
+
+            {/* FX rate — used for ASX risk sizing */}
+            {fx && <FxBadge fx={fx} />}
 
             {/* Pre-market briefing — overnight Grok research, surfaced for the open */}
             <PreMarketBriefing briefing={premarket} onRefresh={refreshPremarket} loading={loading.premarket} />
@@ -284,21 +355,34 @@ export default function App() {
                 color={mode === 'live' ? 'text-[var(--red)]' : 'text-[var(--yellow)]'}
                 sub={mode === 'live' ? 'Real money on the line' : 'Simulated, your money is safe'} />
               <StatCard label="Status" icon="🤖"
-                value={paused ? 'Paused' : isRunning ? (state?.market?.open ? 'Trading' : 'Waiting') : 'Idle'}
-                color={paused ? 'text-[var(--red)]' : isRunning ? (state?.market?.open ? 'text-[var(--green)]' : 'text-[var(--yellow)]') : 'text-[var(--text-dim)]'}
-                sub={state?.market?.open ? 'Market open' : state?.market?.nextOpen ? `Opens ${new Date(state.market.nextOpen).toLocaleString([], { hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric' })}` : 'Market closed'} />
+                value={paused ? 'Paused' : isRunning ? ((usMarket.open || asxMarket.open) ? 'Trading' : 'Waiting') : 'Idle'}
+                color={paused ? 'text-[var(--red)]' : isRunning ? ((usMarket.open || asxMarket.open) ? 'text-[var(--green)]' : 'text-[var(--yellow)]') : 'text-[var(--text-dim)]'}
+                sub={
+                  usMarket.open && asxMarket.open ? 'US + ASX open' :
+                  usMarket.open ? 'US open' :
+                  asxMarket.open ? 'ASX open' :
+                  'Both markets closed'
+                } />
             </div>
 
-            {/* Live signals */}
+            {/* Live signals — filterable by market so day-traders watching US
+                aren't distracted by ASX swing signals (and vice versa). */}
             {signals.length > 0 && (
               <section>
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
                   <h2 className="text-[15px] font-semibold tracking-tight">Live Signals</h2>
-                  <span className="text-[11px] text-[var(--text-dim)]">{signals.length} symbols</span>
+                  <div className="flex items-center gap-2">
+                    <MarketFilter value={signalsMarket} onChange={setSignalsMarket} counts={signalCounts} />
+                    <span className="text-[11px] text-[var(--text-dim)]">{filteredSignals.length} shown</span>
+                  </div>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                  {signals.slice(0, 8).map(s => <SignalCard key={`${s.strategy || 'd'}-${s.symbol}`} signal={s} />)}
-                </div>
+                {filteredSignals.length === 0 ? (
+                  <div className="glass p-4 text-center text-[12px] text-[var(--text-dim)]">No signals in {signalsMarket} yet.</div>
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                    {filteredSignals.slice(0, 8).map(s => <SignalCard key={`${s.strategy || 'd'}-${s.symbol}`} signal={s} />)}
+                  </div>
+                )}
               </section>
             )}
 
@@ -317,7 +401,7 @@ export default function App() {
 
         {tab === 'markets' && (
           <ErrorBoundary>
-            <MarketsTab />
+            <MarketsTab fx={fx} />
           </ErrorBoundary>
         )}
 
@@ -343,7 +427,7 @@ export default function App() {
         {tab === 'reason' && (
           <div className="space-y-4">
             <div className="glass-strong p-5 bg-gradient-to-br from-[var(--blue)]/10 to-transparent">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="flex items-center gap-3">
                   <div className="text-3xl">🧠</div>
                   <div>
@@ -351,18 +435,67 @@ export default function App() {
                     <div className="text-[12px] text-[var(--text-dim)]">Every decision Alpha makes streams here in real time. Each model votes independently — Alpha only acts when 3+ agree at the confidence threshold.</div>
                   </div>
                 </div>
-                <LiveBadge connected={connected} pulseAt={liveAuditAt} />
+                <div className="flex items-center gap-2">
+                  <MarketFilter value={reasonMarket} onChange={setReasonMarket} counts={auditCounts} />
+                  <LiveBadge connected={connected} pulseAt={liveAuditAt} />
+                </div>
+              </div>
+              <div className="text-[10px] text-[var(--text-dim)] mt-2">
+                Showing {filteredAudit.length} of {audit.length} entries
+                {reasonMarket !== 'ALL' && ' · platform-wide events (no symbol) are always visible'}
               </div>
             </div>
-            <ReasoningFeed entries={audit} autoScroll />
+            <ReasoningFeed entries={filteredAudit} autoScroll />
           </div>
         )}
 
         {tab === 'positions' && (
           <div className="space-y-4">
-            <h2 className="text-lg font-semibold tracking-tight">Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {holdings.length}</span></h2>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <h2 className="text-lg font-semibold tracking-tight">
+                Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredHoldings.length} of {holdings.length}</span>
+              </h2>
+              <MarketFilter value={posMarket} onChange={setPosMarket} counts={holdingCounts} />
+            </div>
+
+            {/* Per-market subtotals — native + USD-equivalent. Keeps US and ASX
+                P&L visually separated so AUD never gets added to USD. */}
+            {(holdingCounts.US > 0 || holdingCounts.ASX > 0) && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {['US', 'ASX'].map(m => {
+                  const t = marketTotals[m];
+                  if (!t.n) return null;
+                  const csym = currencySymbolForMarket(m);
+                  const usdMV = m === 'US' ? t.native : toUsd(t.native, m, fx);
+                  const isPos = t.pnl >= 0;
+                  return (
+                    <div key={m} className={`glass p-4 ${m === posMarket || posMarket === 'ALL' ? '' : 'opacity-50'}`}>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-[12px] font-semibold flex items-center gap-1.5">
+                          <span aria-hidden>{m === 'ASX' ? '🇦🇺' : '🇺🇸'}</span>
+                          {m === 'ASX' ? 'ASX (AUD)' : 'US (USD)'}
+                          <span className="text-[var(--text-dim)] font-normal">· {t.n} pos</span>
+                        </div>
+                        <div className={`text-[12px] font-semibold ${isPos ? 'text-[var(--green)]' : 'text-[var(--red)]'}`}>
+                          {isPos ? '+' : ''}{csym}{t.pnl.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="flex items-baseline justify-between">
+                        <div className="text-lg font-semibold">{csym}{t.native.toFixed(2)}</div>
+                        {m === 'ASX' && (
+                          <div className="text-[11px] text-[var(--text-dim)]">
+                            ≈ {usdMV != null ? `$${usdMV.toFixed(2)} USD` : 'FX unavailable'}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             {strategies.map(s => {
-              const sh = holdings.filter(h => h.strategy === s.name);
+              const sh = filteredHoldings.filter(h => h.strategy === s.name);
               if (!sh.length) return null;
               return (
                 <div key={s.name} className="space-y-2">
@@ -373,9 +506,13 @@ export default function App() {
                 </div>
               );
             })}
-            {!holdings.length && <div className="glass p-6 text-center text-[var(--text-dim)] text-sm">No open positions.</div>}
+            {!filteredHoldings.length && (
+              <div className="glass p-6 text-center text-[var(--text-dim)] text-sm">
+                {holdings.length === 0 ? 'No open positions.' : `No open positions in ${posMarket}.`}
+              </div>
+            )}
             {holdings.length > 0 && (
-              <Tooltip text="Sell every open position immediately at market price">
+              <Tooltip text="Sell every open position immediately at market price (both markets)">
                 <button onClick={flatten} disabled={loading.flatten} className="ios-btn ios-btn-danger w-full mt-2">
                   {loading.flatten ? 'Flattening…' : '🛑 Flatten All Positions'}
                 </button>
@@ -386,14 +523,19 @@ export default function App() {
 
         {tab === 'trades' && (
           <div className="space-y-4">
-            <h2 className="text-lg font-semibold tracking-tight">Trade History <span className="text-[var(--text-dim)] text-sm font-normal">· {trades.length}</span></h2>
-            <TradeLog trades={trades} />
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <h2 className="text-lg font-semibold tracking-tight">
+                Trade History <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredTrades.length} of {trades.length}</span>
+              </h2>
+              <MarketFilter value={tradesMarket} onChange={setTradesMarket} counts={tradeCounts} />
+            </div>
+            <TradeLog trades={filteredTrades} marketOf={marketOf} />
           </div>
         )}
 
         {tab === 'backtest' && (
           <ErrorBoundary>
-            <BacktestPanel />
+            <BacktestPanel marketOf={marketOf} />
           </ErrorBoundary>
         )}
 

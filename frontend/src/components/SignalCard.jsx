@@ -1,5 +1,9 @@
+import { currencySymbolForMarket } from '../lib/markets';
+
 export default function SignalCard({ signal }) {
   const sig = signal.signal;
+  const market = signal.market || 'US';
+  const csym = currencySymbolForMarket(market);
   const bg = sig === 'BUY' ? 'from-[var(--green)]/20 to-transparent' :
              sig === 'SELL' ? 'from-[var(--red)]/20 to-transparent' :
              'from-[var(--yellow)]/15 to-transparent';
@@ -11,8 +15,13 @@ export default function SignalCard({ signal }) {
     <div className={`glass p-4 bg-gradient-to-br ${bg}`}>
       <div className="flex items-start justify-between mb-3">
         <div>
-          <div className="font-bold text-[15px]">{signal.symbol}</div>
-          <div className="text-[11px] text-[var(--text-dim)]">${signal.price?.toFixed?.(2) || signal.price}</div>
+          <div className="font-bold text-[15px] flex items-center gap-1.5">
+            {signal.symbol}
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+              market === 'ASX' ? 'bg-[var(--purple)]/20 text-[var(--purple)]' : 'bg-[var(--blue)]/20 text-[var(--blue)]'
+            }`}>{market}</span>
+          </div>
+          <div className="text-[11px] text-[var(--text-dim)]">{csym}{signal.price?.toFixed?.(2) || signal.price}</div>
         </div>
         <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${tag}`}>{sig}</span>
       </div>

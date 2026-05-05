@@ -472,9 +472,13 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       votes: signal.votes, reason: signal.reason, strategy: sc.name },
   });
 
+  // Tag signal with market+currency so the dashboard can filter US vs ASX
+  // without re-deriving from symbol on every render.
+  const _sigInfo = marketRegistry.getSymbolInfo(symbol);
   memoryState.lastSignals[`${sc.name}:${symbol}`] = {
     symbol, strategy: sc.name, timestamp: new Date().toISOString(),
     price: latest, change: `${change}%`,
+    market: _sigInfo.market, currency: _sigInfo.currency,
     signal: signal.consensus, confidence: signal.confidence,
     votes: signal.votes, models: signal.models, reason: signal.reason,
     newsSentiment,

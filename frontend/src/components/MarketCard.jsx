@@ -31,7 +31,12 @@ function signalColor(action) {
   return '#9CA3AF';
 }
 
+// Market-aware currency prefix. ASX symbols quote in AUD, US in USD; the
+// chart/tooltip/labels all swap to A$ when the card belongs to ASX so the
+// operator never confuses the two.
 function MarketCard({ card }) {
+  const market = card.market || 'US';
+  const csym = market === 'ASX' ? 'A$' : '$';
   const [range, setRange] = useState('1d');
   const [bars, setBars] = useState([]);
   const [status, setStatus] = useState('loading'); // loading | ready | empty | error
@@ -115,16 +120,22 @@ function MarketCard({ card }) {
       timeZone: 'America/New_York', month: 'numeric', day: 'numeric',
     });
   };
-  const yTickFmt = (v) => `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
+  const yTickFmt = (v) => `${csym}${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
 
   return (
     <div className="rounded-3xl bg-white/[0.03] border border-white/5 p-4 sm:p-5 backdrop-blur-xl">
       {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div>
-          <div className="text-base font-semibold tracking-tight">{card.symbol}</div>
+          <div className="text-base font-semibold tracking-tight flex items-center gap-1.5">
+            {card.symbol}
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+              market === 'ASX' ? 'bg-[var(--purple)]/20 text-[var(--purple)]' : 'bg-[var(--blue)]/20 text-[var(--blue)]'
+            }`}>{market}</span>
+          </div>
           <div className="text-[11px] text-[var(--text-dim)]">
-            {displayPrice != null ? `$${fmtPrice(displayPrice)}` : '—'}
+            {displayPrice != null ? `${csym}${fmtPrice(displayPrice)}` : '—'}
+            <span className="ml-1 opacity-60">{card.currency || (market === 'ASX' ? 'AUD' : 'USD')}</span>
             {displayChange != null && (
               <span className={`ml-2 font-medium ${displayChange >= 0 ? 'text-[var(--green)]' : 'text-[var(--red)]'}`}>
                 {displayChange >= 0 ? '+' : ''}{displayChange}%
@@ -197,7 +208,7 @@ function MarketCard({ card }) {
                   borderRadius: 12, fontSize: 11, padding: '6px 10px', color: '#fff',
                 }}
                 labelFormatter={(v) => new Date(v).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' ET'}
-                formatter={(v) => [`$${fmtPrice(v)}`, 'Price']}
+                formatter={(v) => [`${csym}${fmtPrice(v)}`, 'Price']}
               />
               <Area
                 type="monotone" dataKey="c" stroke={lineColor} strokeWidth={1.75}
@@ -289,6 +300,8 @@ function areEqual(prev, next) {
   const a = prev.card, b = next.card;
   return (
     a.symbol === b.symbol &&
+    a.market === b.market &&
+    a.currency === b.currency &&
     a.price === b.price &&
     a.changePct === b.changePct &&
     a.signal?.timestamp === b.signal?.timestamp &&
