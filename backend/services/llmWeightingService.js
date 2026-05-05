@@ -77,6 +77,18 @@ async function loadCache(force = false) {
 //   4. Uniform 1.0 if no data anywhere (cold-start)
 // Always renormalised so the weight sum equals the model count — keeps the
 // downstream weighted vote tally on the same scale as the raw vote tally.
+// Optional dependency — feedback service. Pulled lazily to avoid a circular
+// require during module init (feedbackService doesn't import this file but
+// keeping the lazy require pattern matches the rest of the codebase).
+let _feedbackService = null;
+function _feedback() {
+  if (_feedbackService === null) {
+    try { _feedbackService = require('./feedbackService'); }
+    catch (_) { _feedbackService = false; }
+  }
+  return _feedbackService || null;
+}
+
 async function getWeights({ strategy, regime, market }) {
   const cache = await loadCache();
   const ctx = cache.all;
@@ -110,6 +122,24 @@ async function getWeights({ strategy, regime, market }) {
     }
     out[id] = { weight: winRateToWeight(wr), wr, n, source };
     sources[id] = source;
+  }
+  // FEEDBACK BIAS — apply a small bounded multiplier from the human-in-the-
+  // loop layer (per-model nudge in [0.85, 1.10] for THIS context bucket).
+  // Applied BEFORE renormalisation so the post-renorm sum still equals
+  // KNOWN_MODELS.length — i.e. user feedback only RE-BALANCES weight among
+  // the models, it can never lift the absolute weighted-confidence sum.
+  // Cold-start safe (returns all-1.0 when no calibration).
+  let feedbackBias = null;
+  try {
+    const fb = _feedback();
+    if (fb) feedbackBias = await fb.getModelBias({ strategy: strat, regime: reg, market: mkt });
+  } catch (_) { feedbackBias = null; }
+  if (feedbackBias) {
+    for (const id of KNOWN_MODELS) {
+      const b = Number.isFinite(feedbackBias[id]) ? feedbackBias[id] : 1.0;
+      out[id].feedbackBias = b;
+      out[id].weight = clamp(out[id].weight * b, WEIGHT_FLOOR, WEIGHT_CEIL);
+    }
   }
   // Renormalise so Σ weights = number of models — this keeps the weighted
   // vote tally on the same numeric scale as the raw vote count, so safety

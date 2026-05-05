@@ -339,6 +339,7 @@ const counterfactualService = require('./services/counterfactualService');
 const safetySuggestionService = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
+const feedbackService = require('./services/feedbackService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -614,6 +615,47 @@ app.post('/api/propagation/refresh', requireOperator, async (_req, res) => {
     const r = await propagationService.refresh({ force: true });
     res.json({ ok: true, ...r });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Human-in-the-Loop Feedback endpoints. POST /api/trades/:id/feedback is
+// USER-FACING (not operator-gated) — operators rate their own trades from
+// the dashboard. Read endpoints are also public; calibration is purely
+// informational and fed into the prompt block + bounded confidence
+// shrinkage factor (see feedbackService for the safety contract).
+//
+// Rate-limit: simple per-IP token bucket — caps poisoning of the calibration
+// signal by a malicious or runaway client. 30 writes/hour per IP is far above
+// any legitimate single-operator dashboard usage.
+const _feedbackRate = new Map();   // ip -> { tokens, last }
+const FEEDBACK_RATE_MAX = 30, FEEDBACK_RATE_WINDOW_MS = 60 * 60 * 1000;
+function _feedbackRateOk(ip) {
+  const now = Date.now();
+  let b = _feedbackRate.get(ip);
+  if (!b) { b = { tokens: FEEDBACK_RATE_MAX, last: now }; _feedbackRate.set(ip, b); }
+  // Refill proportionally to elapsed window.
+  const refill = (now - b.last) / FEEDBACK_RATE_WINDOW_MS * FEEDBACK_RATE_MAX;
+  b.tokens = Math.min(FEEDBACK_RATE_MAX, b.tokens + refill);
+  b.last = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+app.post('/api/trades/:id/feedback', async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (!_feedbackRateOk(ip)) return res.status(429).json({ ok: false, error: 'rate limit exceeded' });
+  try {
+    const { rating, comment } = req.body || {};
+    const out = await feedbackService.recordFeedback({ tradeId: req.params.id, rating, comment });
+    res.json({ ok: true, ...out });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+app.get('/api/feedback/recent', async (req, res) => {
+  try { res.json({ rows: await feedbackService.recentFeedback({ limit: req.query.limit }) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/feedback/calibration', async (_req, res) => {
+  try { res.json(await feedbackService.getDashboardSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Self-play scenario simulation introspection — per-symbol probabilistic

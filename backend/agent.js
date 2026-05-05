@@ -33,6 +33,7 @@ const counterfactual = require('./services/counterfactualService');
 const safetySuggestion = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
+const feedbackService = require('./services/feedbackService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -694,6 +695,16 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   // CURRENTLY in the conditioning state. Strictly informational priors.
   let propagationContext = null;
   try { propagationContext = propagationService.renderForPrompt(symbol); } catch (_) {}
+  // Human-in-the-Loop feedback — pre-rendered summary of recent USER ratings
+  // + the bounded confidence-shrinkage factor for this (strategy, regime,
+  // market) bucket. Both strictly informational/tightening; the shrinkage
+  // factor is in [0.85, 1.00] and feeds the existing min() gate so it can
+  // ONLY make the gate stricter, never relax it.
+  let feedbackContext = null, feedbackShrinkage = 1.0;
+  try {
+    feedbackContext = await feedbackService.renderForPrompt({ strategy: sc.name, regime, market: info.market });
+    feedbackShrinkage = await feedbackService.getConfidenceShrinkage({ strategy: sc.name, regime, market: info.market });
+  } catch (_) {}
 
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
@@ -719,6 +730,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // prompt blocks. Pre-rendered text or null — all strictly informational,
     // never gating.
     causalContext, counterfactualContext, experienceContext, propagationContext,
+    // Human-in-the-Loop layer: prompt summary + bounded shrinkage factor.
+    // Both can ONLY tighten the existing gate, never relax it.
+    feedbackContext, feedbackShrinkage,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them

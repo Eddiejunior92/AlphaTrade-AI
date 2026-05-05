@@ -300,6 +300,29 @@ async function ensureSchema() {
   await query(`CREATE INDEX IF NOT EXISTS propagation_insights_target_idx
                ON propagation_insights (target_market, target_sector, computed_at DESC)`);
 
+  // Human-in-the-Loop Feedback Layer (feedbackService). One row per piece
+  // of user feedback on a closed trade. `rating` is the explicit 1-5 stars
+  // (nullable when only a NL comment was given), `sentiment` is the derived
+  // bucket ('good'|'bad'|'neutral') used by mining queries, `tags` is a
+  // small array of derived keywords ('too_aggressive', 'too_late', etc.)
+  // for surfacing common patterns in the prompt block. Strictly
+  // informational — only contributes to LLM prompts + dynamic weight nudges
+  // bounded so they can ONLY tighten the existing gate.
+  await query(`
+    CREATE TABLE IF NOT EXISTS trade_feedback (
+      id          SERIAL PRIMARY KEY,
+      trade_id    INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
+      rating      INTEGER,                          -- 1..5 stars (nullable)
+      sentiment   VARCHAR(16) NOT NULL,             -- 'good' | 'bad' | 'neutral'
+      comment     TEXT,
+      tags        TEXT[] DEFAULT ARRAY[]::TEXT[],
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS trade_feedback_trade_idx ON trade_feedback (trade_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS trade_feedback_created_idx ON trade_feedback (created_at DESC)`);
+  await query(`CREATE INDEX IF NOT EXISTS trade_feedback_sentiment_idx ON trade_feedback (sentiment)`);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`
