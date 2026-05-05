@@ -20,7 +20,9 @@ export function useAgent() {
   const [state, setState] = useState(null);
   const [trades, setTrades] = useState([]);
   const [audit, setAudit] = useState([]);
-  const [premarket, setPremarket] = useState(null);
+  // Two separate briefings so the dashboard can render both cards. Either may
+  // be null if that market has never produced one (e.g. no XAI key, empty WL).
+  const [premarket, setPremarket] = useState({ us: null, asx: null });
   const [connected, setConnected] = useState(false);
   const [liveAuditAt, setLiveAuditAt] = useState(0);
   const [loading, setLoading] = useState({});
@@ -55,7 +57,10 @@ export function useAgent() {
 
   useEffect(() => {
     apiGet('/state').then(setState).catch(() => {});
-    apiGet('/premarket/latest').then(b => { if (b && !b.empty) setPremarket(b); }).catch(() => {});
+    apiGet('/premarket/latest').then(b => {
+      if (!b || b.empty) return;
+      setPremarket({ us: b.us || null, asx: b.asx || null });
+    }).catch(() => {});
     refreshLogs();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -76,7 +81,14 @@ export function useAgent() {
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'state') setState(msg.data);
-          else if (msg.type === 'premarket' && msg.data) setPremarket(msg.data);
+          else if (msg.type === 'premarket' && msg.data) {
+            // Server pushes a single market's briefing per event (with a
+            // `market` field). Slot it into the right side without disturbing
+            // the other.
+            const m = (msg.data.market || 'US').toLowerCase();
+            const key = m === 'asx' ? 'asx' : 'us';
+            setPremarket(prev => ({ ...prev, [key]: msg.data }));
+          }
           else if (msg.type === 'audit' && msg.data) {
             setAudit(prev => {
               // Dedupe by id, prepend newest, cap at 200 entries.
@@ -113,13 +125,20 @@ export function useAgent() {
     return res.json();
   }, []);
 
-  const refreshPremarket = useCallback(async () => {
-    setLoad('premarket', true);
+  // Regenerate one market's briefing. `market` is 'US' or 'ASX'. Loading flag
+  // is namespaced per market so the two refresh buttons spin independently.
+  const refreshPremarket = useCallback(async (market = 'US') => {
+    const m = String(market).toUpperCase();
+    const key = m === 'ASX' ? 'premarketAsx' : 'premarketUs';
+    setLoad(key, true);
     try {
-      const r = await apiPost('/agent/premarket-refresh');
-      if (r && r.ok) setPremarket(r);
+      const r = await apiPost(`/agent/premarket-refresh?market=${m}`);
+      if (r && r.ok) {
+        const slot = m === 'ASX' ? 'asx' : 'us';
+        setPremarket(prev => ({ ...prev, [slot]: r }));
+      }
       return r;
-    } finally { setLoad('premarket', false); }
+    } finally { setLoad(key, false); }
   }, []);
 
   return {

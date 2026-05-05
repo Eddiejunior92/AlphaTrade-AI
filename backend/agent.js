@@ -408,12 +408,10 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     }
   }
 
-  // Pre-market briefing context — US-only (uses NYSE clock). Skipped for ASX.
-  // Returns null otherwise; LLM prompt is unchanged. Never throws.
-  const premarket = isAsxSymbol ? null : await premarketService.getActiveBriefingContext(symbol, {
-    open: memoryState.marketOpen,
-    nextClose: memoryState.nextClose,
-  });
+  // Pre-market briefing context — the service picks the right briefing (US or
+  // ASX) based on the symbol and only injects during that market's first
+  // 60min (US) / 90min (ASX) post-open window. Never throws; null = no inject.
+  const premarket = await premarketService.getActiveBriefingContext(symbol);
 
   // ---- Upgrade context (informational + sizing inputs) -------------------
   // All four are best-effort; failure → null/no-op, never blocks a decision.

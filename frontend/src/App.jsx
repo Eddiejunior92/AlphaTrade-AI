@@ -290,8 +290,21 @@ export default function App() {
             {/* FX rate — used for ASX risk sizing */}
             {fx && <FxBadge fx={fx} />}
 
-            {/* Pre-market briefing — overnight Grok research, surfaced for the open */}
-            <PreMarketBriefing briefing={premarket} onRefresh={refreshPremarket} loading={loading.premarket} />
+            {/* Pre-market briefings — separate cards per market. ASX runs at
+                09:00 Sydney (1h before ASX open), US at 08:00 ET (90min
+                before NYSE open). Each refreshes independently. */}
+            <PreMarketBriefing
+              market="US"
+              briefing={premarket?.us}
+              onRefresh={() => refreshPremarket('US')}
+              loading={loading.premarketUs}
+            />
+            <PreMarketBriefing
+              market="ASX"
+              briefing={premarket?.asx}
+              onRefresh={() => refreshPremarket('ASX')}
+              loading={loading.premarketAsx}
+            />
 
             {/* Risk Scale — prominent user control */}
             <RiskScaleSelector

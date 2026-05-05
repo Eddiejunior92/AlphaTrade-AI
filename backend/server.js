@@ -558,18 +558,47 @@ app.get('/api/markets', async (req, res) => {
 
 // --- Pre-market briefing ---------------------------------------------------
 // Latest stored briefing (today or earlier). Public read, no auth.
-app.get('/api/premarket/latest', async (_req, res) => {
+// Returns BOTH market briefings in one shot ({ us, asx }) so the dashboard can
+// render them side-by-side without two round-trips. A `?market=US|ASX` query
+// param narrows to a single briefing for legacy/curl clients.
+app.get('/api/premarket/latest', async (req, res) => {
   try {
-    const briefing = await premarketService.getLatestBriefing();
+    const m = String(req.query.market || '').toUpperCase();
+    if (m === 'US' || m === 'ASX') {
+      const briefing = await premarketService.getLatestBriefing(m);
+      return res.json(briefing || { empty: true, market: m });
+    }
+    const [us, asx] = await Promise.all([
+      premarketService.getLatestBriefing('US'),
+      premarketService.getLatestBriefing('ASX'),
+    ]);
+    return res.json({ us: us || null, asx: asx || null });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Legacy single-briefing route (US-only) kept under a versioned path so any
+// outside scripts that hard-coded the v1 shape don't break silently.
+app.get('/api/premarket/latest/v1', async (_req, res) => {
+  try {
+    const briefing = await premarketService.getLatestBriefing('US');
     res.json(briefing || { empty: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Force a fresh briefing run (operator-token gated by the global POST guard).
-app.post('/api/agent/premarket-refresh', async (_req, res) => {
+// Manual regenerate. `?market=US|ASX` (default US) so the dashboard's two
+// briefing cards each get their own refresh button without colliding.
+app.post('/api/agent/premarket-refresh', async (req, res) => {
   try {
-    const result = await premarketService.runDailyBriefing(getWatchlist());
-    res.json(result);
+    const market = String(req.query.market || req.body?.market || 'US').toUpperCase();
+    if (market !== 'US' && market !== 'ASX') {
+      return res.status(400).json({ ok: false, error: 'market must be US or ASX' });
+    }
+    const watchlist = market === 'ASX'
+      ? marketRegistry.getAsxWatchlist()
+      : getWatchlist();
+    const result = await premarketService.runDailyBriefing(market, watchlist);
+    res.json({ ...result, market });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -771,10 +800,15 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] OpenRouter: ${status.openrouter ? 'YES' : 'NO'}, xAI/Grok: ${status.xai ? 'YES' : 'NO'}`);
   // Pre-market briefing: ensure schema, schedule daily 08:00 ET run, and
   // generate today's briefing now if we don't already have one.
+  // Pre-market briefings: schedule both markets independently so an outage on
+  // one (or an empty watchlist) never blocks the other. US runs at 08:00 ET,
+  // ASX at 09:00 Sydney.
   premarketService.ensureSchema()
     .then(() => {
-      premarketService.schedule(getWatchlist);
-      premarketService.bootstrapIfMissing(getWatchlist);
+      const usWl  = () => getWatchlist();
+      const asxWl = () => marketRegistry.getAsxWatchlist();
+      premarketService.scheduleAll({ us: usWl, asx: asxWl });
+      premarketService.bootstrapAll({ us: usWl, asx: asxWl });
     })
     .catch(e => console.error('[Premarket] init error:', e.message));
 });
