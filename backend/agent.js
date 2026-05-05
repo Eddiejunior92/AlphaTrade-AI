@@ -19,6 +19,7 @@ const mlAdaptive = require('./services/mlAdaptiveService');
 const regimeService = require('./services/regimeService');
 const metaLearning = require('./services/metaLearningService');
 const knowledgeGraph = require('./services/knowledgeGraphService');
+const rlExecution = require('./services/rlExecutionService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
@@ -197,6 +198,14 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     // train both heads on the realised pnl/risk ratio. Best-effort lookup;
     // silent no-op if no BUY audit row found within the last 30 days.
     recordMLOutcomeForClose({ symbol, strategy, pnl: usdPnl }).catch(() => {});
+    // RL execution layer — credit every intra-trade decision logged for this
+    // position with the realised R-multiple. Best-effort; silent no-op if no
+    // RL decisions were recorded (e.g. day strategy with no trailing stop).
+    recordRLOutcomeForClose({ symbol, strategy, pnl: usdPnl }).catch(() => {});
+    // Clear the per-position audit-debounce memo so the NEXT holding of this
+    // symbol/strategy starts with a fresh "log on first decision" memo
+    // instead of inheriting the closed trade's last action.
+    try { rlExecution.clearAuditMemo(symbol, strategy); } catch (_) {}
   }
 
   return trade;
@@ -233,14 +242,58 @@ async function recordMLOutcomeForClose({ symbol, strategy, pnl }) {
   }
 }
 
+// Pull the originating BUY's per-trade USD risk from the audit log so the RL
+// reward is in R-multiple terms (matches mlAdaptive's R scaling). Falls back
+// to the absolute pnl when risk isn't available.
+async function recordRLOutcomeForClose({ symbol, strategy, pnl }) {
+  try {
+    const { rows } = await db.query(`
+      SELECT payload FROM audit_log
+      WHERE event_type = 'TRADE_EXECUTED' AND symbol = $1
+        AND decision = 'BUY' AND payload->>'strategy' = $2
+        AND created_at >= NOW() - INTERVAL '30 days'
+      ORDER BY created_at DESC LIMIT 1
+    `, [symbol, strategy]);
+    const riskUSD = rows[0]?.payload?.ml_risk_usd || Math.max(Math.abs(pnl), 1);
+    await rlExecution.recordOutcome({ symbol, strategy, pnlUSD: pnl, riskUSD });
+  } catch (e) {
+    console.warn('[Agent] RL close-attribution failed:', e.message);
+  }
+}
+
 async function evaluateExistingPositions(strategyHoldings, lookup, stale, strategyConfig) {
   for (const h of strategyHoldings) {
     const price = lookup[h.symbol];
     if (!price || stale[h.symbol]) continue;
 
-    // Ratchet trailing stop BEFORE evaluating the (possibly updated) stop.
+    // RL execution layer — picks a bounded adjustment to trailing config based
+    // on (regime, strategy, MFE%, current PnL%). The returned `adjustedConfig`
+    // only modifies trailingStopPct/trailingActivatePct within [0.5×, 1.5×]
+    // of the strategy default (or LOCK_IN — a 0.7% tight trail armed
+    // immediately). Falls back to strategyConfig on any failure. Hard stop,
+    // daily loss budget, breaker, kill switch, and quorum all unchanged —
+    // the existing ratchet still only moves stops UP, never down.
+    let activeConfig = strategyConfig;
     if (strategyConfig?.trailingStopPct) {
-      const update = riskManager.computeTrailingUpdate({ holding: h, currentPrice: price, strategyConfig });
+      // Best-effort regime classification for state. Pulls from the cached
+      // regime layer used elsewhere in the cycle. Missing regime is fine —
+      // recommendForHolding falls back to 'normal' bucket.
+      let regime = null;
+      try {
+        const bars = await db.getRecentBars?.(h.symbol, 60).catch(() => null);
+        if (bars && bars.length) {
+          regime = regimeService.classifyRegime({ bars, indicators: null, newsSentiment: null });
+        }
+      } catch (_) {}
+      const rec = await rlExecution.recommendForHolding({
+        holding: h, currentPrice: price, regime, strategyConfig,
+      });
+      activeConfig = rec.adjustedConfig || strategyConfig;
+    }
+
+    // Ratchet trailing stop BEFORE evaluating the (possibly updated) stop.
+    if (activeConfig?.trailingStopPct) {
+      const update = riskManager.computeTrailingUpdate({ holding: h, currentPrice: price, strategyConfig: activeConfig });
       if (update) {
         await db.updateTrailing(h.symbol, h.strategy, update);
         if (update.stop_loss) {
@@ -305,6 +358,9 @@ async function flattenStrategyPositions(strategyName, reason) {
       .catch(() => {});
     // Train the ML adaptive layer on flatten outcomes too — same audit-lookup path.
     recordMLOutcomeForClose({ symbol: h.symbol, strategy: strategyName, pnl: usdPnl }).catch(() => {});
+    // RL close-attribution + memo clear — flatten is a real close.
+    recordRLOutcomeForClose({ symbol: h.symbol, strategy: strategyName, pnl: usdPnl }).catch(() => {});
+    try { rlExecution.clearAuditMemo(h.symbol, strategyName); } catch (_) {}
     closed++;
   }
   return { closed };
@@ -381,6 +437,9 @@ async function flattenAllPositions(reason = 'Manual flatten') {
       // silently dropped from the learning ledger. Both layers self-attribute
       // to the originating BUY's stored feature vector + regime.
       recordMLOutcomeForClose({ symbol: h.symbol, strategy: h.strategy, pnl: usdPnl }).catch(() => {});
+      // RL close-attribution + memo clear — emergency flatten is a real close.
+      recordRLOutcomeForClose({ symbol: h.symbol, strategy: h.strategy, pnl: usdPnl }).catch(() => {});
+      try { rlExecution.clearAuditMemo(h.symbol, h.strategy); } catch (_) {}
     }
     memoryState.lastFlatten = new Date().toISOString();
     await discordService.sendCircuitBreakerAlert(`Flatten complete — ${holdings.length} positions closed`);

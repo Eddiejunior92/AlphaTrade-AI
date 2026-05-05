@@ -89,6 +89,21 @@ async function ensureSchema() {
     )
   `);
 
+  // RL execution layer — tabular Q-table over (state, action). State =
+  // regime|strategy|mfe-bucket|pnl-bucket; action ∈ {NONE, TIGHTEN, LOOSEN,
+  // ARM_EARLY, LOCK_IN}. Trained online from realised R-multiple per closed
+  // trade. Pure execution-layer hint — quorum/gate/breaker untouched.
+  await query(`
+    CREATE TABLE IF NOT EXISTS rl_q_table (
+      state         TEXT NOT NULL,
+      action        TEXT NOT NULL,
+      q_value       DOUBLE PRECISION NOT NULL DEFAULT 0,
+      n_visits      INTEGER NOT NULL DEFAULT 0,
+      last_updated  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (state, action)
+    )
+  `);
+
   // Long-term company knowledge graph (knowledgeGraphService) — slow-moving
   // per-symbol context (sector, peers, earnings track, valuation, macro,
   // major-event timeline). Refreshed daily and on strong-news events.

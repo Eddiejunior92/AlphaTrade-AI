@@ -325,6 +325,7 @@ const adaptiveLearning = require('./services/adaptiveLearningService');
 const mlAdaptive = require('./services/mlAdaptiveService');
 const metaLearning = require('./services/metaLearningService');
 const knowledgeGraph = require('./services/knowledgeGraphService');
+const rlExecution = require('./services/rlExecutionService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -413,6 +414,13 @@ app.get('/api/knowledge', async (_req, res) => {
   try { res.json({ rows: await knowledgeGraph.listAll(), refresh_ttl_hours: knowledgeGraph.REFRESH_TTL_HOURS }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
+// RL execution layer status — Q-table cells, per-action averages, top cells
+// by visits. Read-only introspection for the dashboard / operator.
+app.get('/api/rl/execution', async (_req, res) => {
+  try { res.json(await rlExecution.getStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/knowledge/:symbol', async (req, res) => {
   try {
     const g = await knowledgeGraph.getGraph(req.params.symbol);
