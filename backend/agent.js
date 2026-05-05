@@ -50,7 +50,11 @@ const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
 
 const WATCHLIST = getWatchlist();
-const BASE_INTERVAL_SECONDS = Math.max(30, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
+// Master cycle tick. Floor lowered to 20s so the day strategy's 20s cadence
+// can actually fire on schedule — a strategy can never run faster than this
+// loop. Other strategies (swing 300s, asx_swing 300s) are gated by their own
+// intervalSeconds inside runCycle, so they're unaffected.
+const BASE_INTERVAL_SECONDS = Math.max(20, parseInt(process.env.AGENT_INTERVAL_SECONDS || '20'));
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
 // =============================================================================

@@ -28,7 +28,7 @@ const STRATEGIES = {
     market: 'US',                     // routes via Alpaca, US clock, US watchlist
     timeframe: '1Min',
     lookback: 60, // need ≥35 bars for MACD(12,26,9); 60 gives a stable EMA warmup
-    intervalSeconds: 30,
+    intervalSeconds: 20,
     // base stop/target — scaled by risk scale's stop/target multipliers
     stopLossPct: 0.005,
     takeProfitPct: 0.01,
