@@ -556,6 +556,63 @@ app.get('/api/markets', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// /api/companies — combined US + ASX universe with sector taxonomy + cached
+// fundamentals (when available). Designed to render the Companies tab without
+// any extra round-trips. Fundamentals come straight from the in-memory cache
+// the swing strategy already populates — we never *force* a Grok fetch from
+// here, so opening the tab is cheap (no upstream API calls).
+app.get('/api/companies', async (req, res) => {
+  try {
+    const { COMPANIES, SECTORS, getCompanyInfo } = require('./services/sectors');
+    const fundamentalsService = require('./services/fundamentalsService');
+
+    const usWatch = getWatchlist().map(s => s.toUpperCase());
+    const asxWatch = marketRegistry.getAsxWatchlist().map(s => s.toUpperCase());
+    const watchlist = [...new Set([...usWatch, ...asxWatch])];
+
+    // Pull whatever's already cached (no force=true). Swing-strategy symbols
+    // will have richer data; intraday-only names just get the static catalog.
+    const fundCache = typeof fundamentalsService.getCachedAll === 'function'
+      ? fundamentalsService.getCachedAll()
+      : {};
+
+    const companies = watchlist.map(sym => {
+      const info = marketRegistry.getSymbolInfo(sym);
+      const meta = getCompanyInfo(sym) || { name: sym, sector: 'Other', industry: '—', description: 'No description available.' };
+      const f = fundCache[sym] || null;
+      return {
+        symbol: sym,
+        market: info.market,
+        currency: info.currency,
+        name: meta.name,
+        sector: meta.sector,
+        industry: meta.industry,
+        description: meta.description,
+        fundamentals: f ? {
+          peRatio: f.pe_ratio ?? null,
+          epsGrowthYoyPct: f.eps_growth_yoy_pct ?? null,
+          revenueGrowthYoyPct: f.revenue_growth_yoy_pct ?? null,
+          earningsNextDate: f.earnings_next_date ?? null,
+          valuationLabel: f.valuation_label ?? null,
+          sectorStrength30dPct: f.sector_strength_30d_pct ?? null,
+          sectorStrengthLabel: f.sector_strength_label ?? null,
+          fetchedAt: f.fetchedAt ?? null,
+          stale: f.stale === true,
+        } : null,
+      };
+    });
+
+    res.json({
+      sectors: SECTORS,
+      companies,
+      counts: {
+        US: usWatch.length, ASX: asxWatch.length, total: watchlist.length,
+      },
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // --- Pre-market briefing ---------------------------------------------------
 // Latest stored briefing (today or earlier). Public read, no auth.
 // Returns BOTH market briefings in one shot ({ us, asx }) so the dashboard can

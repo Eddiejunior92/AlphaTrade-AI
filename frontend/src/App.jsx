@@ -13,19 +13,23 @@ import MarketClocks from './components/MarketClocks';
 import PreMarketBriefing from './components/PreMarketBriefing';
 import BacktestPanel from './components/BacktestPanel';
 import MarketFilter from './components/MarketFilter';
+import SectorFilter, { buildSectorCounts } from './components/SectorFilter';
+import CompaniesTab from './components/CompaniesTab';
 import FxBadge from './components/FxBadge';
 import { makeMarketOf, currencySymbolForMarket, toUsd } from './lib/markets';
+import { makeSectorOf } from './lib/sectors';
 import { useMemo } from 'react';
 
 const TABS = [
-  { id: 'home',      label: 'Home',      icon: '◐' },
-  { id: 'markets',   label: 'Markets',   icon: '📈' },
+  { id: 'home',       label: 'Home',      icon: '◐' },
+  { id: 'markets',    label: 'Markets',   icon: '📈' },
+  { id: 'companies',  label: 'Companies', icon: '🏢' },
   { id: 'strategies', label: 'Strategies', icon: '⚡' },
-  { id: 'reason',    label: 'Reasoning', icon: '🧠' },
-  { id: 'positions', label: 'Positions', icon: '📊' },
-  { id: 'trades',    label: 'Trades',    icon: '📜' },
-  { id: 'backtest',  label: 'Backtest',  icon: '🔬' },
-  { id: 'settings',  label: 'Settings',  icon: '⚙' },
+  { id: 'reason',     label: 'Reasoning', icon: '🧠' },
+  { id: 'positions',  label: 'Positions', icon: '📊' },
+  { id: 'trades',     label: 'Trades',    icon: '📜' },
+  { id: 'backtest',   label: 'Backtest',  icon: '🔬' },
+  { id: 'settings',   label: 'Settings',  icon: '⚙' },
 ];
 
 function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }
@@ -68,6 +72,26 @@ export default function App() {
   const [posMarket, setPosMarket] = useState('ALL');
   const [tradesMarket, setTradesMarket] = useState('ALL');
   const [reasonMarket, setReasonMarket] = useState('ALL');
+  // Sector filters mirror the market filters — separate state per surface so
+  // a user pinning Positions to "Healthcare" doesn't also narrow live signals.
+  const [signalsSector, setSignalsSector] = useState('ALL');
+  const [posSector, setPosSector] = useState('ALL');
+  // Companies catalog — fetched once on mount, shared with every surface that
+  // needs symbol→sector lookup (signals, positions, etc.). Cheap because the
+  // endpoint just merges a static map with the existing fundamentals cache.
+  const [companies, setCompanies] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/companies').then(r => r.json()).then(j => {
+      if (!cancelled) setCompanies(j?.companies || []);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const sectorOf = useMemo(() => makeSectorOf(companies), [companies]);
+  // When the user clicks "Markets" on a Company card we set this to the
+  // ticker; MarketsTab consumes it (then clears via onConsumed) to scroll to
+  // and briefly highlight the matching card.
+  const [focusSymbol, setFocusSymbol] = useState(null);
   const {
     state, trades, audit, premarket, refreshPremarket,
     connected, liveAuditAt, loading, brokerChat,
@@ -112,18 +136,38 @@ export default function App() {
     ASX: audit.filter(r => !r.symbol || marketOf(r.symbol) === 'ASX').length,
   }), [audit, marketOf]);
 
-  const filteredSignals = signalsMarket === 'ALL'
-    ? signals
-    : signals.filter(s => (s.market || marketOf(s.symbol)) === signalsMarket);
-  const filteredHoldings = posMarket === 'ALL'
-    ? holdings
-    : holdings.filter(h => (h.market || 'US') === posMarket);
+  const filteredSignals = signals.filter(s => {
+    const m = s.market || marketOf(s.symbol);
+    if (signalsMarket !== 'ALL' && m !== signalsMarket) return false;
+    if (signalsSector !== 'ALL' && sectorOf(s.symbol) !== signalsSector) return false;
+    return true;
+  });
+  const filteredHoldings = holdings.filter(h => {
+    const m = h.market || 'US';
+    if (posMarket !== 'ALL' && m !== posMarket) return false;
+    if (posSector !== 'ALL' && sectorOf(h.symbol) !== posSector) return false;
+    return true;
+  });
   const filteredTrades = tradesMarket === 'ALL'
     ? trades
     : trades.filter(t => (t.market || marketOf(t.symbol)) === tradesMarket);
   const filteredAudit = reasonMarket === 'ALL'
     ? audit
     : audit.filter(r => !r.symbol || marketOf(r.symbol) === reasonMarket);
+
+  // Sector chip counts. Apply the *market* filter first so the sector counts
+  // shown on a chip row reflect what's actually selectable under the current
+  // market scope.
+  const signalsSectorCounts = useMemo(() => {
+    const scoped = signalsMarket === 'ALL' ? signals
+      : signals.filter(s => (s.market || marketOf(s.symbol)) === signalsMarket);
+    return buildSectorCounts(scoped, s => sectorOf(s.symbol));
+  }, [signals, signalsMarket, marketOf, sectorOf]);
+  const posSectorCounts = useMemo(() => {
+    const scoped = posMarket === 'ALL' ? holdings
+      : holdings.filter(h => (h.market || 'US') === posMarket);
+    return buildSectorCounts(scoped, h => sectorOf(h.symbol));
+  }, [holdings, posMarket, sectorOf]);
 
   // Per-market totals for the Positions tab. Native is in each market's own
   // currency; USD-equiv applies the live FX rate so the operator can compare
@@ -384,8 +428,9 @@ export default function App() {
               <section>
                 <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
                   <h2 className="text-[15px] font-semibold tracking-tight">Live Signals</h2>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <MarketFilter value={signalsMarket} onChange={setSignalsMarket} counts={signalCounts} />
+                    <SectorFilter value={signalsSector} onChange={setSignalsSector} counts={signalsSectorCounts} />
                     <span className="text-[11px] text-[var(--text-dim)]">{filteredSignals.length} shown</span>
                   </div>
                 </div>
@@ -414,7 +459,19 @@ export default function App() {
 
         {tab === 'markets' && (
           <ErrorBoundary>
-            <MarketsTab fx={fx} />
+            <MarketsTab fx={fx} sectorOf={sectorOf}
+              focusSymbol={focusSymbol}
+              onFocusConsumed={() => setFocusSymbol(null)} />
+          </ErrorBoundary>
+        )}
+
+        {tab === 'companies' && (
+          <ErrorBoundary>
+            <CompaniesTab
+              companies={companies}
+              onJumpToMarkets={(sym) => { setFocusSymbol(sym); setTab('markets'); }}
+              onJumpToBriefing={() => setTab('home')}
+            />
           </ErrorBoundary>
         )}
 
@@ -468,7 +525,10 @@ export default function App() {
               <h2 className="text-lg font-semibold tracking-tight">
                 Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredHoldings.length} of {holdings.length}</span>
               </h2>
-              <MarketFilter value={posMarket} onChange={setPosMarket} counts={holdingCounts} />
+              <div className="flex items-center gap-2 flex-wrap">
+                <MarketFilter value={posMarket} onChange={setPosMarket} counts={holdingCounts} />
+                <SectorFilter value={posSector} onChange={setPosSector} counts={posSectorCounts} />
+              </div>
             </div>
 
             {/* Per-market subtotals — native + USD-equivalent. Keeps US and ASX
@@ -679,10 +739,12 @@ export default function App() {
             <Tooltip key={t.id} text={
               t.id === 'home' ? 'Dashboard overview' :
               t.id === 'markets' ? 'Live charts, AI signals, news sentiment per stock' :
+              t.id === 'companies' ? 'Browse every stock by sector with description + fundamentals' :
               t.id === 'strategies' ? 'Toggle day & swing strategies' :
               t.id === 'reason' ? "See Alpha's reasoning live" :
               t.id === 'positions' ? 'Your open positions' :
               t.id === 'trades' ? 'Trade history' :
+              t.id === 'backtest' ? 'Backtest strategies on historical data' :
               'Settings, funds, mode toggle'
             }>
               <button onClick={() => setTab(t.id)}

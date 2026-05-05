@@ -155,4 +155,14 @@ function getCached(symbol) {
   return { ...entry.data, cached: true, ageMs: Date.now() - entry.ts };
 }
 
-module.exports = { getFundamentals, getFundamentalsBatch, getCached };
+// Snapshot of the entire in-memory fundamentals cache. Used by /api/companies
+// to render the Companies tab without forcing any upstream API calls.
+function getCachedAll() {
+  const out = {};
+  for (const [sym, entry] of cache.entries()) {
+    out[sym] = { ...entry.data, cached: true, ageMs: Date.now() - entry.ts };
+  }
+  return out;
+}
+
+module.exports = { getFundamentals, getFundamentalsBatch, getCached, getCachedAll };
