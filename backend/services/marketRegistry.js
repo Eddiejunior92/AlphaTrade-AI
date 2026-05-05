@@ -6,17 +6,38 @@
 // the agent has ~15 places that need to ask "is this symbol US or ASX?" and
 // each lookup must give the same answer. A single map prevents drift.
 
+// Expanded ASX universe — 27 large-cap names spanning the major XJO sectors:
+// Financials (CBA/WBC/NAB/ANZ/MQG), Materials & Mining (BHP/RIO/FMG/S32/PLS/MIN/JHX),
+// Healthcare (CSL/RMD/COH), Tech & Online (REA/XRO/CPU), Consumer (WOW/WES/ALL),
+// Industrials/Logistics (TCL/BXB/GMG), Energy (STO/ORG/WDS).
 const ASX_WATCHLIST_DEFAULT = [
   'CBA',  // Commonwealth Bank — largest bank, ~$200B mcap
+  'WBC',  // Westpac — big-four bank
+  'NAB',  // National Australia Bank — big-four bank
+  'ANZ',  // ANZ Banking Group — big-four bank
   'BHP',  // BHP Group — diversified miner, dual-listed (ASX primary)
-  'CSL',  // CSL Limited — biotech / blood plasma
-  'MQG',  // Macquarie Group — investment bank
-  'WES',  // Wesfarmers — Bunnings/Kmart conglomerate
   'RIO',  // Rio Tinto — iron ore + copper
   'FMG',  // Fortescue — pure-play iron ore
-  'TLS',  // Telstra — telco
+  'S32',  // South32 — diversified miner (alumina, manganese, coal)
+  'PLS',  // Pilbara Minerals — lithium pure-play
+  'MIN',  // Mineral Resources — lithium + iron ore + mining services
+  'CSL',  // CSL Limited — biotech / blood plasma
+  'RMD',  // ResMed — sleep apnea devices
+  'COH',  // Cochlear — hearing implants
+  'MQG',  // Macquarie Group — investment bank
+  'GMG',  // Goodman Group — industrial REIT (logistics)
+  'REA',  // REA Group — realestate.com.au
+  'XRO',  // Xero — cloud accounting software
   'WOW',  // Woolworths Group — supermarkets
-  'ANZ',  // ANZ Banking Group — big-four bank
+  'WES',  // Wesfarmers — Bunnings/Kmart conglomerate
+  'TCL',  // Transurban — toll-road operator
+  'ALL',  // Aristocrat Leisure — gaming machines / online gaming
+  'JHX',  // James Hardie — fibre-cement building products
+  'BXB',  // Brambles — pallet pooling (CHEP)
+  'CPU',  // Computershare — share registry / financial services tech
+  'STO',  // Santos — oil & gas
+  'ORG',  // Origin Energy — utility + LNG
+  'WDS',  // Woodside Energy — LNG / oil & gas major
 ];
 
 function getAsxWatchlist() {
