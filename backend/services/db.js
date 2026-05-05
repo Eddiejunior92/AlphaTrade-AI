@@ -76,6 +76,19 @@ async function ensureSchema() {
     )
   `);
 
+  // ML adaptive layer (mlAdaptiveService) — persistent online-learned weights
+  // for the logistic + linear heads that calibrate confidence and nudge
+  // sizing within the [0.85, 1.15] band. Single row, JSONB blob.
+  await query(`
+    CREATE TABLE IF NOT EXISTS ml_adaptive_weights (
+      name        TEXT PRIMARY KEY,
+      weights     JSONB NOT NULL,
+      n_updates   INTEGER NOT NULL DEFAULT 0,
+      metrics     JSONB,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

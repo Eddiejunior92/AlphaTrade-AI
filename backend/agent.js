@@ -15,6 +15,7 @@ const indicatorsService = require('./services/indicatorsService');
 const intradayService = require('./services/intradayService');
 const historicalIntel = require('./services/historicalIntelligenceService');
 const adaptiveLearning = require('./services/adaptiveLearningService');
+const mlAdaptive = require('./services/mlAdaptiveService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
@@ -96,8 +97,14 @@ async function buildPriceLookup(holdings) {
 // then converted to USD using the close-time FX rate, which is the
 // correct economic treatment (FX moves between entry and exit are part of
 // the position's true return).
+// `mlFeatures` and `riskUSD` are optional — populated only on BUY calls so
+// that close-time mlAdaptive.recordOutcome() can replay the exact decision-
+// time feature vector against the realised P&L. Both are stashed in the
+// TRADE_EXECUTED audit payload, then looked up at SELL time keyed on
+// (symbol, strategy).
 async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_profit,
-                              reason, strategy, market, currency, fxToUsd }) {
+                              reason, strategy, market, currency, fxToUsd,
+                              mlFeatures, riskUSD }) {
   market   = market   || marketRegistry.getSymbolInfo(symbol).market;
   currency = currency || marketRegistry.getSymbolInfo(symbol).currency;
   fxToUsd  = Number.isFinite(fxToUsd) ? fxToUsd
@@ -164,7 +171,9 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     event_type: 'TRADE_EXECUTED', symbol, decision: side,
     confidence: signal?.confidence, models: signal?.models,
     payload: { qty, price, stop_loss, take_profit, pnl: usdPnl, native_pnl: nativePnl,
-               reason, strategy, market, currency, fx_rate: fxToUsd },
+               reason, strategy, market, currency, fx_rate: fxToUsd,
+               // Persist ML metadata on BUY so the SELL path can train on it.
+               ...(side === 'BUY' && mlFeatures ? { ml_features: mlFeatures, ml_risk_usd: riskUSD } : {}) },
   });
 
   const ccyTag = currency === 'USD' ? '$' : `${currency} `;
@@ -178,9 +187,38 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
   if (side === 'SELL' && usdPnl !== null && Number.isFinite(usdPnl)) {
     adaptiveLearning.recordOutcome({ symbol, strategy, pnl: usdPnl, closedAt: new Date() })
       .catch(() => {});
+    // ML adaptive layer — replay the originating BUY's feature vector and
+    // train both heads on the realised pnl/risk ratio. Best-effort lookup;
+    // silent no-op if no BUY audit row found within the last 30 days.
+    recordMLOutcomeForClose({ symbol, strategy, pnl: usdPnl }).catch(() => {});
   }
 
   return trade;
+}
+
+// Look up the originating BUY's ML feature vector + per-trade USD risk from
+// the audit log and forward the realised P&L to mlAdaptiveService for
+// online training. Pure best-effort — never throws.
+async function recordMLOutcomeForClose({ symbol, strategy, pnl }) {
+  try {
+    const { rows } = await db.query(`
+      SELECT payload FROM audit_log
+      WHERE event_type = 'TRADE_EXECUTED' AND symbol = $1
+        AND decision = 'BUY'
+        AND payload->>'strategy' = $2
+        AND created_at >= NOW() - INTERVAL '30 days'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [symbol, strategy]);
+    const p = rows[0]?.payload;
+    const features = p?.ml_features;
+    const riskUSD = p?.ml_risk_usd;
+    if (Array.isArray(features) && features.length) {
+      await mlAdaptive.recordOutcome({ features, pnl, riskUSD });
+    }
+  } catch (e) {
+    console.warn(`[Agent] ML close-attribution failed for ${symbol}/${strategy}:`, e.message);
+  }
 }
 
 async function evaluateExistingPositions(strategyHoldings, lookup, stale, strategyConfig) {
@@ -253,6 +291,8 @@ async function flattenStrategyPositions(strategyName, reason) {
                  market: h.market || 'US', currency, fx_rate: fxToUsd } });
     adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: strategyName, pnl: usdPnl, closedAt: new Date() })
       .catch(() => {});
+    // Train the ML adaptive layer on flatten outcomes too — same audit-lookup path.
+    recordMLOutcomeForClose({ symbol: h.symbol, strategy: strategyName, pnl: usdPnl }).catch(() => {});
     closed++;
   }
   return { closed };
@@ -462,12 +502,24 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, earningsSignal,
   });
 
+  // Pre-compute ML features here too so the SIGNAL audit always carries them
+  // (even for HOLD/SELL signals) — that lets close-time recordOutcome replay
+  // the *exact* feature vector the model would have predicted on at entry.
+  let _mlFeaturesForAudit = null;
+  try {
+    _mlFeaturesForAudit = mlAdaptive.extractFeatures({
+      signal, newsSentiment, indicators,
+      strategyName: sc.name, market: info.market,
+    });
+  } catch (_) {}
+
   await db.recordAudit({
     event_type: 'SIGNAL', symbol, decision: signal.consensus, confidence: signal.confidence,
     models: signal.models,
     payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals, intraday,
       historicalAvailable: !!historical,
-      votes: signal.votes, reason: signal.reason, strategy: sc.name },
+      votes: signal.votes, reason: signal.reason, strategy: sc.name,
+      ml_features: _mlFeaturesForAudit },
   });
 
   // Tag signal with market+currency so the dashboard can filter US vs ASX
@@ -490,7 +542,21 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // USD-equivalent which we convert back to AUD for both the broker
     // order and the holdings table (holdings store NATIVE so the
     // broker-level stop/take comparisons match how the symbol is quoted).
-    const dynamicWithUpgrades = { ...(dynamic || {}), adaptiveMult, portfolioMult };
+    // ML adaptive layer — predicts P(win) and an R-multiple from the same
+    // decision context the LLMs saw, then maps the R-multiple to a sizing
+    // multiplier in [0.85, 1.15]. During cold-start (n_updates < MIN_TRAIN)
+    // mlMult=1.0 so the agent runs identically to before.
+    let mlPrediction = { mlMult: 1.0, pWin: null, rPred: null, trained: false };
+    let mlFeatures = null;
+    try {
+      mlFeatures = mlAdaptive.extractFeatures({
+        signal, newsSentiment, indicators,
+        strategyName: sc.name, market: info.market,
+      });
+      mlPrediction = await mlAdaptive.predict(mlFeatures);
+    } catch (_) { /* swallow — never block trading */ }
+
+    const dynamicWithUpgrades = { ...(dynamic || {}), adaptiveMult, portfolioMult, mlMult: mlPrediction.mlMult };
     const eval_ = await riskManager.evaluateBuy({
       symbol, signal, price: latestUsd, equity, cash, holdings,
       strategyConfig: sc, dynamic: dynamicWithUpgrades,
@@ -501,6 +567,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // For US (fxToUsd === 1) this is a no-op.
       const nativeStop = eval_.stop_loss   / fxToUsd;
       const nativeTake = eval_.take_profit / fxToUsd;
+      const mlTag = mlPrediction.trained
+        ? ` | ml mult=${mlPrediction.mlMult.toFixed(2)} pWin=${(mlPrediction.pWin * 100).toFixed(0)}%`
+        : '';
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal,
@@ -508,9 +577,12 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
         take_profit: parseFloat(nativeTake.toFixed(4)),
         reason: `${signal.reason} | risk $${eval_.riskUSD}` +
           (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : '') +
+          mlTag +
           (info.currency !== 'USD' ? ` | fx ${info.currency}/USD=${fxToUsd.toFixed(4)}` : ''),
         strategy: sc.name,
         market: info.market, currency: info.currency, fxToUsd,
+        // ML metadata — persisted on BUY audit, replayed at SELL for online training.
+        mlFeatures, riskUSD: eval_.riskUSD,
       });
     } else {
       await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',

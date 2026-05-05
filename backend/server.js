@@ -322,6 +322,7 @@ app.get('/api/audit', async (req, res) => {
 // GET  /api/backtest/:id     — full run incl. equity curve + trades
 const backtestService = require('./services/backtestService');
 const adaptiveLearning = require('./services/adaptiveLearningService');
+const mlAdaptive = require('./services/mlAdaptiveService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -385,6 +386,14 @@ app.get('/api/backtest/:id', async (req, res) => {
 });
 
 // --- Adaptive learning + portfolio risk read endpoints ----------------------
+// ML adaptive layer status — online-learned weights, training count, and
+// calibration metrics (Brier score for the pWin head, RMSE for the R-multiple
+// head). Read-only; safe for the dashboard to poll.
+app.get('/api/adaptive/ml', async (_req, res) => {
+  try { res.json(await mlAdaptive.getStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/adaptive/performance', async (_req, res) => {
   try { res.json(await adaptiveLearning.getDashboardSummary()); }
   catch (e) { res.status(500).json({ error: e.message }); }

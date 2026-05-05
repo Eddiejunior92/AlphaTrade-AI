@@ -159,8 +159,13 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // confidence gate, daily caps, or circuit breaker.
   const adaptiveMult  = Number.isFinite(dyn.adaptiveMult)  ? dyn.adaptiveMult  : 1.0;
   const portfolioMult = Number.isFinite(dyn.portfolioMult) ? dyn.portfolioMult : 1.0;
+  // ML adaptive multiplier from mlAdaptiveService.predict(). Clamped at the
+  // source to [0.85, 1.15] — a tighter band than legacy adaptiveMult so the
+  // composite stack can never expand the existing safety envelope. Defaults
+  // to 1.0 when the model is in cold-start or the prediction is unavailable.
+  const mlMult = Number.isFinite(dyn.mlMult) ? Math.max(0.85, Math.min(1.15, dyn.mlMult)) : 1.0;
   const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
-  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult).toFixed(2);
+  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult).toFixed(2);
 
   const qtyByRisk = Math.floor(adjustedRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
@@ -195,6 +200,7 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
       compoundMult: dyn.compoundMult,
       adaptiveMult,
       portfolioMult,
+      mlMult,
     },
   };
 }
