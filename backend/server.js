@@ -327,6 +327,7 @@ const metaLearning = require('./services/metaLearningService');
 const knowledgeGraph = require('./services/knowledgeGraphService');
 const rlExecution = require('./services/rlExecutionService');
 const optionsFlowService = require('./services/optionsFlowService');
+const macroForecastService = require('./services/macroForecastService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -436,6 +437,18 @@ app.get('/api/options-flow/:symbol', async (req, res) => {
     const cached = optionsFlowService.getCachedRaw(symbol);
     if (!cached) return res.status(404).json({ error: 'no_cached_flow', hint: 'cache warms ~60s after boot, then refreshes every 30 min during US market hours' });
     res.json({ ...cached, prompt: optionsFlowService.renderForPrompt(cached) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Macro-forecast introspection — current cross-asset regime + 24-48h forecast
+// + the safety-preserving adjustments the agent is applying. Global (no
+// symbol param). Returns the raw cached snapshot with a _stale flag so the
+// dashboard can surface freshness; the prompt path uses TTL-enforced reads.
+app.get('/api/macro-forecast', async (_req, res) => {
+  try {
+    const cached = macroForecastService.getCachedRaw();
+    if (!cached) return res.status(404).json({ error: 'no_macro_forecast', hint: 'warms ~75s after boot, refreshes every 60 min during US market hours' });
+    res.json({ ...cached, prompt: macroForecastService.renderForPrompt(cached) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

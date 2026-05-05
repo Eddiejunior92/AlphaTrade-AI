@@ -25,6 +25,8 @@ const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
 const optionsActivityService = require('./services/optionsActivityService');
 const optionsFlowService = require('./services/optionsFlowService');
+const macroFactorService = require('./services/macroFactorService');
+const macroForecastService = require('./services/macroForecastService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -598,6 +600,26 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     } catch (_) {}
   }
 
+  // Macro-forecast block — cross-asset regime classification + 24-48h
+  // forecast. Cache-only here so per-symbol cycles never block on the macro
+  // refresh. Applies to BOTH US and ASX symbols (cross-asset signals are
+  // global). Adjustments are wired into the riskManager via dynamic.macroAdjust
+  // below — they can ONLY tighten the gate / shrink size, never the reverse.
+  let macroForecast = null;
+  let macroAdjustForRisk = null;
+  try {
+    const fc = macroForecastService.getCached();
+    if (fc) {
+      macroForecast = macroForecastService.renderForPrompt(fc);
+      macroAdjustForRisk = {
+        confidenceBoost: fc.adjust?.confidenceBoost || 0,
+        sizeMult:        fc.adjust?.sizeMult || 1.0,
+        regime:          fc.current?.regime,
+        forecastRegime:  fc.forecast?.regime,
+      };
+    }
+  } catch (_) {}
+
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
   let earningsSignal = null;
@@ -614,7 +636,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
-    regimeContext, knowledgeContext,
+    regimeContext, knowledgeContext, macroForecast,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -677,6 +699,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       adaptiveMult, portfolioMult,
       mlMult: mlPrediction.mlMult,
       regimeAdjust,    // riskManager applies the gate-tightening + sizing mult
+      // Macro-forecast layer — additively tightens the confidence gate AND
+      // shrinks size. Hard-clamped in riskManager: boost ≥ 0, sizeMult ≤ 1.0.
+      macroAdjust: macroAdjustForRisk || undefined,
     };
     const eval_ = await riskManager.evaluateBuy({
       symbol, signal, price: latestUsd, equity, cash, holdings,
@@ -694,6 +719,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       const regimeTag = regime ? ` | regime=${regime.primary}` +
         (regimeAdjust.confidenceBoost ? ` (+${(regimeAdjust.confidenceBoost*100).toFixed(0)}pp gate)` : '') +
         (regimeAdjust.regimeMult !== 1 ? ` ×${regimeAdjust.regimeMult.toFixed(2)} size` : '') : '';
+      const macroTag = macroAdjustForRisk ? ` | macro=${macroAdjustForRisk.regime}→${macroAdjustForRisk.forecastRegime}` +
+        (macroAdjustForRisk.confidenceBoost ? ` (+${(macroAdjustForRisk.confidenceBoost*100).toFixed(1)}pp gate)` : '') +
+        (macroAdjustForRisk.sizeMult < 1 ? ` ×${macroAdjustForRisk.sizeMult.toFixed(2)} size` : '') : '';
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal,
@@ -701,7 +729,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
         take_profit: parseFloat(nativeTake.toFixed(4)),
         reason: `${signal.reason} | risk $${eval_.riskUSD}` +
           (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : '') +
-          mlTag + regimeTag +
+          mlTag + regimeTag + macroTag +
           (info.currency !== 'USD' ? ` | fx ${info.currency}/USD=${fxToUsd.toFixed(4)}` : ''),
         strategy: sc.name,
         market: info.market, currency: info.currency, fxToUsd,
@@ -1179,6 +1207,21 @@ function scheduleOptionsFlowRefresh() {
   }, 30 * 60 * 1000);
 }
 
+// --- Macro-forecast refresh -----------------------------------------------
+// Cross-asset factor snapshot is refreshed every 60 minutes during US market
+// hours. Macro signals move on the daily timescale, so an hourly cadence is
+// plenty — and it lets the snapshot always reflect the most recent close.
+let macroForecastHandle = null;
+function scheduleMacroForecastRefresh() {
+  if (macroForecastHandle) clearInterval(macroForecastHandle);
+  macroForecastHandle = setInterval(async () => {
+    if (!memoryState.marketOpen) return;
+    try {
+      await macroForecastService.getForecast();
+    } catch (e) { console.error('[Macro] Refresh failed:', e.message); }
+  }, 60 * 60 * 1000);
+}
+
 // --- Long-term knowledge graph — daily refresh ----------------------------
 // Runs once per day at ~08:00 UTC (~03:00-04:00 ET, well before US open and
 // after Sydney close). Pulls cached fundamentals + sentiment per symbol and
@@ -1376,6 +1419,19 @@ setTimeout(() => {
     .catch(e => console.error('[OptionsFlow] Startup refresh failed:', e.message));
 }, 60_000);
 scheduleOptionsFlowRefresh();
+
+// Macro-forecast warm-up — delayed 75s so the daily-bar API isn't slammed at
+// boot alongside the options-flow refresh. Runs once at startup, then the
+// interval scheduler takes over.
+setTimeout(() => {
+  macroForecastService.getForecast()
+    .then(d => {
+      const r = d?.current?.regime, f = d?.forecast?.regime, c = d?.forecast?.confidence;
+      console.log(`[Macro] Startup forecast: now=${r} → 24-48h=${f} (conf ${(c * 100).toFixed(0)}%)`);
+    })
+    .catch(e => console.error('[Macro] Startup forecast failed:', e.message));
+}, 75_000);
+scheduleMacroForecastRefresh();
 
 (async () => {
   try {

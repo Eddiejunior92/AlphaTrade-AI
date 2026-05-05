@@ -146,7 +146,11 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // boost is sanitized & non-negative inside checkQuorum.
   const dynForGate = dynamic || {};
   const regimeBoost = Math.max(0, Number(dynForGate.regimeAdjust?.confidenceBoost) || 0);
-  const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost });
+  // Macro-forecast layer can ALSO tighten the gate (additively with regime).
+  // Source clamps boost to ≤5pp; we re-floor at 0 here as defence-in-depth so
+  // a buggy upstream value can never RELAX the threshold.
+  const macroBoost = Math.max(0, Number(dynForGate.macroAdjust?.confidenceBoost) || 0);
+  const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost + macroBoost });
   if (!q.ok) return { allow: false, reason: q.reason };
   // Reject averaging-in: if symbol already held in this strategy, force a new
   // sell-or-hold cycle before re-entering. Avoids local-state corruption from
@@ -180,8 +184,13 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // META_MIN_SAMPLES yet (cold-start = identity).
   const regimeMult = Number.isFinite(dyn.regimeAdjust?.regimeMult)
     ? Math.max(0.85, Math.min(1.10, dyn.regimeAdjust.regimeMult)) : 1.0;
+  // Macro-forecast sizing nudge. Hard ceiling of 1.0 — macro can ONLY shrink
+  // size, never amplify. Floor at 0.7. This is the strongest tightener in
+  // the stack because cross-asset stress is the broadest risk signal we have.
+  const macroMult = Number.isFinite(dyn.macroAdjust?.sizeMult)
+    ? Math.max(0.70, Math.min(1.00, dyn.macroAdjust.sizeMult)) : 1.0;
   const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
-  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult * regimeMult).toFixed(2);
+  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult * regimeMult * macroMult).toFixed(2);
 
   const qtyByRisk = Math.floor(adjustedRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
@@ -220,6 +229,10 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
       regimeMult,
       regimeBoost,
       regime: dyn.regimeAdjust?.regime || null,
+      macroMult,
+      macroBoost,
+      macroRegime: dyn.macroAdjust?.regime || null,
+      macroForecast: dyn.macroAdjust?.forecastRegime || null,
     },
   };
 }
