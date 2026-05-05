@@ -36,7 +36,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
@@ -55,11 +55,15 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // risk-posture hints. Strictly informational; quorum/gate/sizing/breaker are
   // enforced by the agent + risk manager, never by the LLM.
   const macroBlock = macroForecast ? `\n${macroForecast}\n` : '';
+  // Self-play Monte-Carlo scenario sim — probability-weighted 1-3d outlook
+  // built from regime + macro + IV + recent price action. Strictly
+  // informational; does not vote, size, or gate anything.
+  const simBlock = scenarioSim ? `\n${scenarioSim}\n` : '';
   // Long-term knowledge-graph block — slow-moving per-symbol context
   // (sector peers, earnings track, valuation, macro, major events).
   // Informational; never overrides quorum/gate/sizing.
   const knowledgeBlock = knowledgeContext ? `\n${knowledgeContext}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${knowledgeBlock}`;
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${knowledgeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -313,9 +317,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

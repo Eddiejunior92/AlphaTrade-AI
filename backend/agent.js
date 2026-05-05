@@ -27,6 +27,7 @@ const optionsActivityService = require('./services/optionsActivityService');
 const optionsFlowService = require('./services/optionsFlowService');
 const macroFactorService = require('./services/macroFactorService');
 const macroForecastService = require('./services/macroForecastService');
+const scenarioSimService = require('./services/scenarioSimService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -620,6 +621,27 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     }
   } catch (_) {}
 
+  // Self-play Monte-Carlo scenario sim — fuses recent bars + indicators +
+  // regime + macro forecast + IV (when available) into a probability-weighted
+  // 1-3d outlook. Pure JS; cached per-symbol on lastBarT so re-runs in the
+  // same minute hit cache. Strictly informational — never votes / sizes /
+  // gates anything; quorum + breaker + kill switch retain full veto power.
+  let scenarioSim = null;
+  try {
+    const macroSnap = macroForecastService.getCached();
+    const flowSnap = !isAsxSymbol ? optionsFlowService.getCached(symbol) : null;
+    // barsPerDay heuristic from strategy cadence: day=1Min (~390 US/360 ASX),
+    // swing=15Min (~26). Stops/targets pulled from the live strategy config.
+    const barsPerDay = sc.cadenceSeconds && sc.cadenceSeconds >= 300 ? 26 : 390;
+    const sim = scenarioSimService.simulate({
+      symbol, bars, indicators,
+      regime, macroForecast: macroSnap, optionsFlow: flowSnap,
+      barsPerDay,
+      stopLossPct: sc.stopLossPct, takeProfitPct: sc.takeProfitPct,
+    });
+    if (sim?.ok) scenarioSim = scenarioSimService.renderForPrompt(sim);
+  } catch (_) {}
+
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
   let earningsSignal = null;
@@ -636,7 +658,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
-    regimeContext, knowledgeContext, macroForecast,
+    regimeContext, knowledgeContext, macroForecast, scenarioSim,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them

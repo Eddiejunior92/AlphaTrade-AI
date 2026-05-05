@@ -328,6 +328,7 @@ const knowledgeGraph = require('./services/knowledgeGraphService');
 const rlExecution = require('./services/rlExecutionService');
 const optionsFlowService = require('./services/optionsFlowService');
 const macroForecastService = require('./services/macroForecastService');
+const scenarioSimService = require('./services/scenarioSimService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -449,6 +450,20 @@ app.get('/api/macro-forecast', async (_req, res) => {
     const cached = macroForecastService.getCachedRaw();
     if (!cached) return res.status(404).json({ error: 'no_macro_forecast', hint: 'warms ~75s after boot, refreshes every 60 min during US market hours' });
     res.json({ ...cached, prompt: macroForecastService.renderForPrompt(cached) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Self-play scenario simulation introspection — per-symbol probabilistic
+// 1-3d outlook (Monte-Carlo paths combining regime + macro + IV + recent
+// price action). Read-only; rejects non-watchlist symbols.
+app.get('/api/scenario-sim/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allow = new Set(getCombinedWatchlist());
+    if (!allow.has(symbol)) return res.status(403).json({ error: 'symbol_not_in_watchlist' });
+    const cached = scenarioSimService.getCachedRaw(symbol);
+    if (!cached) return res.status(404).json({ error: 'no_cached_sim', hint: 'cached on the next per-symbol cycle (60s for day strategy, 300s for swing)' });
+    res.json({ ...cached, prompt: scenarioSimService.renderForPrompt(cached) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
