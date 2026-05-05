@@ -36,8 +36,12 @@ export default function ReasoningFeed({ entries = [], compact = false, autoScrol
       </div>
     );
   }
+  // Compact mode (Home preview) keeps an inner scroll container so the
+  // dashboard layout stays bounded. Full-page mode lets the page scroll
+  // naturally — an inner overflow container here would trap scroll events
+  // and prevent the user from reaching the rest of the feed.
   return (
-    <div ref={scrollRef} className={`space-y-3 ${compact ? 'max-h-[420px]' : 'max-h-[70vh]'} overflow-y-auto pr-1`}>
+    <div ref={scrollRef} className={`space-y-3 ${compact ? 'max-h-[420px] overflow-y-auto pr-1' : ''}`}>
       {entries.map(e => {
         const meta = EVENT_META[e.event_type] || { color: 'var(--text-dim)', icon: '·', label: e.event_type };
         const time = new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
