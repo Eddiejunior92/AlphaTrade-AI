@@ -1409,7 +1409,11 @@ async function runCycle() {
     const strategies = [
       { sc: applyRiskScale(STRATEGIES.day, scaleName),       enabled: portfolio.day_enabled,        marketOpen: clock.is_open, clock },
       { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock },
-      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null },
+      // ASX gated by env-var master switch (ASX_ENABLED). When disabled,
+      // marketRegistry.isAsxOpen() returns false anyway → strategy is never
+      // eligible. Belt-and-braces: also clamp `enabled` so the audit row
+      // makes the disablement obvious in /api/state.
+      { sc: applyRiskScale(STRATEGIES.asx_swing, scaleName), enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null },
     ];
     // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
     // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
@@ -2127,6 +2131,7 @@ async function getAgentSnapshot() {
     },
     fx: fxService.getStatus(),
     asxWatchlist: marketRegistry.getAsxWatchlist(),
+    asxEnabled: marketRegistry.isAsxEnabled(),
     holdings: holdings.map(h => {
       // Per-holding values are reported in the symbol's NATIVE currency
       // (USD for US, AUD for ASX). The UI shows `currency` so users can

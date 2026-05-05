@@ -420,7 +420,15 @@ function schedule(getUsWatchlist) {
 
 function scheduleAll({ us, asx }) {
   if (us) scheduleMarket('US', us);
-  if (asx) scheduleMarket('ASX', asx);
+  // ASX scheduling is hard-gated by the master kill-switch (ASX_ENABLED env).
+  // When disabled we never call scheduleMarket('ASX', …) — no setTimeout
+  // armed, no daily "Next briefing scheduled" log noise, no risk of a stale
+  // schedule firing if someone toggles the watchlist by hand.
+  if (asx) {
+    const { isAsxEnabled } = require('./marketRegistry');
+    if (isAsxEnabled()) scheduleMarket('ASX', asx);
+    else console.log('[Premarket:ASX] Skipped scheduling — ASX_ENABLED=false');
+  }
 }
 
 async function bootstrapMarketIfMissing(market, getWatchlistForMarket) {
@@ -449,7 +457,12 @@ function bootstrapIfMissing(getUsWatchlist) {
 
 function bootstrapAll({ us, asx }) {
   if (us) bootstrapMarketIfMissing('US', us);
-  if (asx) bootstrapMarketIfMissing('ASX', asx);
+  // Same hard gate as scheduleAll — no boot-time Grok call for an ASX
+  // briefing the dashboard wouldn't show anyway.
+  if (asx) {
+    const { isAsxEnabled } = require('./marketRegistry');
+    if (isAsxEnabled()) bootstrapMarketIfMissing('ASX', asx);
+  }
 }
 
 module.exports = {

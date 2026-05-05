@@ -4,12 +4,19 @@
 //
 // `counts` is optional `{ US: number, ASX: number }`; when present the chip
 // shows the count so empty markets don't look broken — they just say "0".
-export default function MarketFilter({ value = 'ALL', onChange, counts, className = '' }) {
-  const opts = [
-    { id: 'ALL', label: 'All',  flag: '🌐' },
-    { id: 'US',  label: 'US',   flag: '🇺🇸' },
-    { id: 'ASX', label: 'ASX',  flag: '🇦🇺' },
-  ];
+export default function MarketFilter({ value = 'ALL', onChange, counts, className = '', asxEnabled = false }) {
+  // When ASX is the master-switched OFF, the filter collapses to a single
+  // "US" view — no "All" / "ASX" chips because there's no second market to
+  // compare against. Keeps the chrome from looking broken or redundant.
+  const opts = asxEnabled
+    ? [
+        { id: 'ALL', label: 'All',  flag: '🌐' },
+        { id: 'US',  label: 'US',   flag: '🇺🇸' },
+        { id: 'ASX', label: 'ASX',  flag: '🇦🇺' },
+      ]
+    : [
+        { id: 'ALL', label: 'US',   flag: '🇺🇸' },
+      ];
   const total = counts ? (counts.US || 0) + (counts.ASX || 0) : null;
   return (
     <div className={`inline-flex items-center gap-1 p-0.5 rounded-2xl bg-white/5 border border-white/5 ${className}`}>

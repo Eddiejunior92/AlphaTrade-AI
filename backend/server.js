@@ -1281,6 +1281,11 @@ app.post('/api/agent/premarket-refresh', async (req, res) => {
     if (market !== 'US' && market !== 'ASX') {
       return res.status(400).json({ ok: false, error: 'market must be US or ASX' });
     }
+    // Reject manual ASX briefing refreshes when the master switch is off — no
+    // upstream Grok call burned for a market the dashboard isn't even showing.
+    if (market === 'ASX' && !marketRegistry.isAsxEnabled()) {
+      return res.status(409).json({ ok: false, error: 'ASX disabled (set ASX_ENABLED=true to re-enable)' });
+    }
     const watchlist = market === 'ASX'
       ? marketRegistry.getAsxWatchlist()
       : getWatchlist();

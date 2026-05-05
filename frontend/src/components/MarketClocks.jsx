@@ -71,7 +71,7 @@ function formatHMS(ms) {
   return `${m}m ${String(s).padStart(2, '0')}s`;
 }
 
-const MARKETS = [
+const ALL_MARKETS = [
   { id: 'US',  name: 'US',  flag: '🇺🇸', tz: 'America/New_York',  openMin: 9 * 60 + 30, closeMin: 16 * 60, sub: 'NYSE · Nasdaq · 09:30–16:00 ET',  tzShort: 'ET'  },
   { id: 'ASX', name: 'ASX', flag: '🇦🇺', tz: 'Australia/Sydney', openMin: 10 * 60,     closeMin: 16 * 60, sub: 'ASX · 10:00–16:00 Sydney',         tzShort: 'AEST/AEDT' },
 ];
@@ -108,16 +108,19 @@ function MarketPanel({ m, now }) {
   );
 }
 
-export default function MarketClocks({ compact = false }) {
+export default function MarketClocks({ compact = false, asxEnabled = false }) {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
 
+  // Filter out ASX when the master switch is off — solo US clock renders full-width.
+  const MARKETS = asxEnabled ? ALL_MARKETS : ALL_MARKETS.filter(m => m.id !== 'ASX');
+
   if (compact) {
     return (
-      <div className="grid grid-cols-2 gap-2">
+      <div className={`grid ${MARKETS.length === 1 ? 'grid-cols-1' : 'grid-cols-2'} gap-2`}>
         {MARKETS.map(m => {
           const { isOpen, label, ms } = statusFor({ now, tz: m.tz, openMin: m.openMin, closeMin: m.closeMin });
           return (
@@ -140,7 +143,7 @@ export default function MarketClocks({ compact = false }) {
         <div className="text-[12px] font-semibold tracking-tight">Market Sessions</div>
         <div className="text-[10px] text-[var(--text-dim)]">live · all times local to each market</div>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 sm:gap-3">
+      <div className={`grid grid-cols-1 ${MARKETS.length === 1 ? '' : 'sm:grid-cols-2'} gap-2 sm:gap-3`}>
         {MARKETS.map(m => <MarketPanel key={m.id} m={m} now={now} />)}
       </div>
     </div>

@@ -40,7 +40,27 @@ const ASX_WATCHLIST_DEFAULT = [
   'WDS',  // Woodside Energy — LNG / oil & gas major
 ];
 
+// ============================================================================
+// ASX MASTER KILL-SWITCH — `ASX_ENABLED` env var.
+//
+// Default: DISABLED (US-only paper trading). Set `ASX_ENABLED=true` to bring
+// ASX back online without any code changes — the registry, watchlist, market
+// hours, briefings, frontend clocks/filters/sections all light up again on
+// the next backend restart.
+//
+// When disabled this registry behaves as if ASX simply doesn't exist:
+//   • getAsxWatchlist() returns [] (empty universe → no symbols routed to ASX)
+//   • isAsxOpen() returns false (ASX strategy never becomes eligible to run)
+//   • nextAsxOpen() returns null (frontend hides the "opens in" countdown)
+//   • getSymbolInfo() falls through to the US default for everything
+// ============================================================================
+function isAsxEnabled() {
+  const raw = (process.env.ASX_ENABLED || '').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
 function getAsxWatchlist() {
+  if (!isAsxEnabled()) return [];
   const fromEnv = (process.env.WATCHLIST_ASX || '').split(',').map(s => s.trim()).filter(Boolean);
   return fromEnv.length ? fromEnv : ASX_WATCHLIST_DEFAULT;
 }
@@ -87,6 +107,7 @@ function currencyFor(symbol) { return getSymbolInfo(symbol).currency; }
 // will simply reject the order, which the IBKR mock/real client handles
 // gracefully (logged + audit-tagged, no cascade).
 function isAsxOpen(now = new Date()) {
+  if (!isAsxEnabled()) return false;
   const parts = new Intl.DateTimeFormat('en-AU', {
     timeZone: 'Australia/Sydney',
     weekday: 'short',
@@ -105,6 +126,7 @@ function isAsxOpen(now = new Date()) {
 // weekday). Used by the dashboard + cycle scheduler so the operator can see
 // when ASX trading resumes.
 function nextAsxOpen(now = new Date()) {
+  if (!isAsxEnabled()) return null;
   // Walk forward up to 7 days; on each candidate day compute 10:00 Sydney
   // and check if it's after `now` and not weekend.
   for (let i = 0; i < 7; i++) {
@@ -136,5 +158,5 @@ function nextAsxOpen(now = new Date()) {
 
 module.exports = {
   getAsxWatchlist, getSymbolInfo, isAsx, isUs, brokerFor, currencyFor,
-  isAsxOpen, nextAsxOpen,
+  isAsxOpen, nextAsxOpen, isAsxEnabled,
 };

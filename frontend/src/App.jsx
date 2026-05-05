@@ -379,27 +379,30 @@ export default function App() {
               </div>
             </div>
 
-            {/* Live US + ASX market clocks side-by-side */}
-            <MarketClocks />
+            {/* Live market clocks. ASX panel renders only when master switch
+                (ASX_ENABLED env) is on — otherwise solo full-width US clock. */}
+            <MarketClocks asxEnabled={!!state?.asxEnabled} />
 
-            {/* FX rate — used for ASX risk sizing */}
-            {fx && <FxBadge fx={fx} />}
+            {/* FX rate — only relevant for ASX risk sizing. Hide when ASX is off. */}
+            {fx && state?.asxEnabled && <FxBadge fx={fx} />}
 
             {/* Pre-market briefings — separate cards per market. ASX runs at
                 09:00 Sydney (1h before ASX open), US at 08:00 ET (90min
-                before NYSE open). Each refreshes independently. */}
+                before NYSE open). ASX card hidden when master switch is off. */}
             <PreMarketBriefing
               market="US"
               briefing={premarket?.us}
               onRefresh={() => refreshPremarket('US')}
               loading={loading.premarketUs}
             />
-            <PreMarketBriefing
-              market="ASX"
-              briefing={premarket?.asx}
-              onRefresh={() => refreshPremarket('ASX')}
-              loading={loading.premarketAsx}
-            />
+            {state?.asxEnabled && (
+              <PreMarketBriefing
+                market="ASX"
+                briefing={premarket?.asx}
+                onRefresh={() => refreshPremarket('ASX')}
+                loading={loading.premarketAsx}
+              />
+            )}
 
             {/* Risk Scale — prominent user control */}
             <RiskScaleSelector
@@ -497,7 +500,7 @@ export default function App() {
                 <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
                   <h2 className="text-[15px] font-semibold tracking-tight">Live Signals</h2>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <MarketFilter value={signalsMarket} onChange={setSignalsMarket} counts={signalCounts} />
+                    <MarketFilter value={signalsMarket} onChange={setSignalsMarket} counts={signalCounts} asxEnabled={!!state?.asxEnabled} />
                     <SectorFilter value={signalsSector} onChange={setSignalsSector} counts={signalsSectorCounts} />
                     <span className="text-[11px] text-[var(--text-dim)]">{filteredSignals.length} shown</span>
                   </div>
@@ -574,7 +577,7 @@ export default function App() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <MarketFilter value={reasonMarket} onChange={setReasonMarket} counts={auditCounts} />
+                  <MarketFilter value={reasonMarket} onChange={setReasonMarket} counts={auditCounts} asxEnabled={!!state?.asxEnabled} />
                   <LiveBadge connected={connected} pulseAt={liveAuditAt} />
                 </div>
               </div>
@@ -594,14 +597,16 @@ export default function App() {
                 Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredHoldings.length} of {holdings.length}</span>
               </h2>
               <div className="flex items-center gap-2 flex-wrap">
-                <MarketFilter value={posMarket} onChange={setPosMarket} counts={holdingCounts} />
+                <MarketFilter value={posMarket} onChange={setPosMarket} counts={holdingCounts} asxEnabled={!!state?.asxEnabled} />
                 <SectorFilter value={posSector} onChange={setPosSector} counts={posSectorCounts} />
               </div>
             </div>
 
             {/* Per-market subtotals — native + USD-equivalent. Keeps US and ASX
-                P&L visually separated so AUD never gets added to USD. */}
-            {(holdingCounts.US > 0 || holdingCounts.ASX > 0) && (
+                P&L visually separated so AUD never gets added to USD. Only
+                renders when ASX master switch is on (otherwise it's just a
+                redundant "US (USD)" tile that duplicates the equity card). */}
+            {state?.asxEnabled && (holdingCounts.US > 0 || holdingCounts.ASX > 0) && (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {['US', 'ASX'].map(m => {
                   const t = marketTotals[m];
@@ -668,7 +673,7 @@ export default function App() {
               <h2 className="text-lg font-semibold tracking-tight">
                 Trade History <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredTrades.length} of {trades.length}</span>
               </h2>
-              <MarketFilter value={tradesMarket} onChange={setTradesMarket} counts={tradeCounts} />
+              <MarketFilter value={tradesMarket} onChange={setTradesMarket} counts={tradeCounts} asxEnabled={!!state?.asxEnabled} />
             </div>
             <TradeLog trades={filteredTrades} marketOf={marketOf} />
           </div>
