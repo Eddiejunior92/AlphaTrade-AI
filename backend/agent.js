@@ -32,6 +32,7 @@ const causalInference = require('./services/causalInferenceService');
 const counterfactual = require('./services/counterfactualService');
 const safetySuggestion = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
+const propagationService = require('./services/propagationService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -688,6 +689,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     }, { k: 5, minSim: 0.6 });
     experienceContext = memoryService.renderForPrompt(matches);
   } catch (_) {}
+  // Cross-Market & Sector Propagation — top-K active propagation edges for
+  // the symbol's (market × sector) bucket where the source bucket is
+  // CURRENTLY in the conditioning state. Strictly informational priors.
+  let propagationContext = null;
+  try { propagationContext = propagationService.renderForPrompt(symbol); } catch (_) {}
 
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
@@ -709,9 +715,10 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // Dynamic-weighting + meta-reasoner context. Both are strictly
     // informational; raw quorum + confidence gate retain full veto.
     regime, market: info.market,
-    // Causal + counterfactual + experience-replay prompt blocks. Pre-rendered
-    // text or null — all strictly informational, never gating.
-    causalContext, counterfactualContext, experienceContext,
+    // Causal + counterfactual + experience-replay + cross-market propagation
+    // prompt blocks. Pre-rendered text or null — all strictly informational,
+    // never gating.
+    causalContext, counterfactualContext, experienceContext, propagationContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -1586,6 +1593,22 @@ setTimeout(async () => {
 }, 150_000);
 setInterval(() => {
   memoryService.backfill().catch(() => {});
+}, 30 * 60 * 1000);
+
+// Cross-Market & Sector Propagation warm-up. Mines propagation edges from
+// closed trades + recent SIGNAL audits, computes the current per-bucket
+// pulse, and persists actionable edges to propagation_insights. Strictly
+// informational; cannot affect the trading loop. Failures are logged and
+// swallowed.
+setTimeout(async () => {
+  try {
+    const r = await propagationService.refresh({ force: true });
+    if (r?.error) console.error('[Propagation] Startup refresh failed:', r.error);
+    else console.log(`[Propagation] Startup refresh: ${r?.inserted ?? 0} edges, ${r?.pulseBuckets ?? 0} pulse buckets, scanned ${r?.closedTradesScanned ?? 0} closed trades`);
+  } catch (e) { console.error('[Propagation] Startup refresh failed:', e.message); }
+}, 180_000);
+setInterval(() => {
+  propagationService.refresh().catch(() => {});
 }, 30 * 60 * 1000);
 
 (async () => {

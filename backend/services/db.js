@@ -271,6 +271,35 @@ async function ensureSchema() {
   await query(`CREATE INDEX IF NOT EXISTS trade_memory_symbol_idx ON trade_memory (symbol)`);
   await query(`CREATE INDEX IF NOT EXISTS trade_memory_created_idx ON trade_memory (created_at DESC)`);
 
+  // Cross-Market & Sector Propagation Layer (propagationService). Stores
+  // mined conditional-outcome edges of the form: "when SOURCE (market×sector)
+  // was in STATE during the 24h before entry, TARGET (market×sector) trades
+  // had win-rate W and avg P&L P over N samples, lift L vs target baseline."
+  // One row per (target × source × source_state) combination. Re-computed
+  // every refresh — the partial UNIQUE index lets us upsert in place.
+  // Strictly informational: this layer only writes its own table and only
+  // contributes to LLM prompts; never gates trades or alters risk knobs.
+  await query(`
+    CREATE TABLE IF NOT EXISTS propagation_insights (
+      id              SERIAL PRIMARY KEY,
+      target_market   VARCHAR(8)  NOT NULL,
+      target_sector   VARCHAR(32) NOT NULL,
+      source_market   VARCHAR(8)  NOT NULL,
+      source_sector   VARCHAR(32) NOT NULL,
+      source_state    VARCHAR(16) NOT NULL,           -- 'bullish' | 'bearish' | 'neutral'
+      target_winrate  NUMERIC(6,4) NOT NULL,          -- 0..1
+      target_avg_pnl  NUMERIC(14,4) NOT NULL,         -- USD
+      target_baseline_winrate NUMERIC(6,4) NOT NULL,  -- baseline for the target bucket
+      lift_pp         NUMERIC(6,2) NOT NULL,          -- (winrate - baseline) * 100
+      n_samples       INTEGER NOT NULL,
+      computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS propagation_insights_uniq
+               ON propagation_insights (target_market, target_sector, source_market, source_sector, source_state)`);
+  await query(`CREATE INDEX IF NOT EXISTS propagation_insights_target_idx
+               ON propagation_insights (target_market, target_sector, computed_at DESC)`);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

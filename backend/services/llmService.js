@@ -38,7 +38,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext, experienceContext }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext, experienceContext, propagationContext }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
@@ -84,11 +84,15 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // context. Strictly informational priors; raw quorum + confidence gate
   // retain full veto power.
   const expBlock = experienceContext ? `\n${experienceContext}\n` : '';
+  // Cross-Market & Sector Propagation block — top-K active propagation edges
+  // for the symbol's (market × sector) bucket where the source bucket is
+  // CURRENTLY in the conditioning state. Strictly informational priors.
+  const propBlock = propagationContext ? `\n${propagationContext}\n` : '';
   // Long-term knowledge-graph block — slow-moving per-symbol context
   // (sector peers, earnings track, valuation, macro, major events).
   // Informational; never overrides quorum/gate/sizing.
   const knowledgeBlock = knowledgeContext ? `\n${knowledgeContext}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${causalBlock}${cfBlock}${expBlock}${knowledgeBlock}`;
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${causalBlock}${cfBlock}${expBlock}${propBlock}${knowledgeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -342,7 +346,7 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext, experienceContext, propagationContext }) {
   // ---------------------------------------------------------------------
   // STEP 1 — Resolve dynamic per-model weights for this (strategy, regime,
   // market) context. Cold-start safe (uniform 1.0). Failures degrade to
@@ -366,7 +370,7 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
   // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
   // ---------------------------------------------------------------------
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

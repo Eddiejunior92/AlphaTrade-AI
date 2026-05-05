@@ -338,6 +338,7 @@ const causalInferenceService = require('./services/causalInferenceService');
 const counterfactualService = require('./services/counterfactualService');
 const safetySuggestionService = require('./services/safetySuggestionService');
 const memoryService = require('./services/memoryService');
+const propagationService = require('./services/propagationService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -597,6 +598,20 @@ app.get('/api/memory', async (req, res) => {
 app.post('/api/memory/refresh', requireOperator, async (_req, res) => {
   try {
     const r = await memoryService.backfill({ force: true });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cross-Market & Sector Propagation introspection. Read-only summary of
+// current per-bucket pulses + top mined propagation edges. Operator-gated
+// POST /refresh forces a full re-mine.
+app.get('/api/propagation', async (_req, res) => {
+  try { res.json(await propagationService.getDashboardSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/propagation/refresh', requireOperator, async (_req, res) => {
+  try {
+    const r = await propagationService.refresh({ force: true });
     res.json({ ok: true, ...r });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
