@@ -235,5 +235,13 @@ export function useAgent() {
         return r;
       } finally { setLoad('recoveryBuffer', false); }
     },
+    setDayCadence: async (seconds) => {
+      setLoad('dayCadence', true);
+      try {
+        const r = await apiPost('/agent/day-cadence', { seconds: parseInt(seconds, 10) });
+        await refreshLogs();
+        return r;
+      } finally { setLoad('dayCadence', false); }
+    },
   };
 }

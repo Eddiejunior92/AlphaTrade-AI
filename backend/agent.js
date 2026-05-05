@@ -52,11 +52,16 @@ const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
 
 const WATCHLIST = getWatchlist();
-// Master cycle tick. Floor lowered to 20s so the day strategy's 20s cadence
-// can actually fire on schedule — a strategy can never run faster than this
-// loop. Other strategies (swing 300s, asx_swing 300s) are gated by their own
-// intervalSeconds inside runCycle, so they're unaffected.
-const BASE_INTERVAL_SECONDS = Math.max(20, parseInt(process.env.AGENT_INTERVAL_SECONDS || '20'));
+// Master cycle tick. Floor lowered to 5s to match DAY_CADENCE_MIN so the
+// operator-tunable day cadence can actually fire at its fastest preset (15s
+// or even 5s) without quantizing up to a coarser loop tick. A strategy can
+// never run faster than this master loop. Other strategies (swing 300s,
+// asx_swing 300s) are gated by their own intervalSeconds inside runCycle,
+// so faster ticks just mean a cheap eligibility check returns false more
+// often — no extra LLM calls, no extra trades, no extra risk.
+// Default tick stays 20s; only lowered if AGENT_INTERVAL_SECONDS env is set
+// or if the operator picks a sub-20s day cadence (handled implicitly here).
+const BASE_INTERVAL_SECONDS = Math.max(5, parseInt(process.env.AGENT_INTERVAL_SECONDS || '20'));
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
 // =============================================================================
@@ -1406,8 +1411,18 @@ async function runCycle() {
     // open. ASX swing runs on Sydney hours; US day/swing on NYSE hours.
     // The clock arg passed to runStrategy is null for ASX (no
     // forceFlatten-before-close logic applies — ASX swing holds overnight).
+    // Day-strategy interval is operator-tunable via portfolio.day_trading_cadence_seconds.
+    // Read live each cycle so a dashboard change takes effect on the very
+    // next eligibility check (no restart). Falls back to the strategy's own
+    // default if the column is unset/invalid. Quorum, confidence gate,
+    // dip-buy filter, recovery buffer remain unchanged — this only controls
+    // scheduler pacing.
+    const dayCadenceLive = Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
+      ? parseInt(portfolio.day_trading_cadence_seconds)
+      : DAY_CADENCE_DEFAULT;
+    const dayScaled = applyRiskScale(STRATEGIES.day, scaleName);
     const strategies = [
-      { sc: applyRiskScale(STRATEGIES.day, scaleName),       enabled: portfolio.day_enabled,        marketOpen: clock.is_open, clock },
+      { sc: { ...dayScaled, intervalSeconds: dayCadenceLive }, enabled: portfolio.day_enabled,      marketOpen: clock.is_open, clock },
       { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock },
       // ASX gated by env-var master switch (ASX_ENABLED). When disabled,
       // marketRegistry.isAsxOpen() returns false anyway → strategy is never
@@ -1747,6 +1762,38 @@ async function setRiskScale(scaleName) {
 const RECOVERY_BUFFER_MIN = 0;
 const RECOVERY_BUFFER_MAX = 3600;
 const RECOVERY_BUFFER_DEFAULT = 75;
+
+// Day-trading cycle cadence — operator-tunable interval (seconds) between
+// day-strategy ticks. Mirrors the recovery-buffer pattern: stored on the
+// portfolio row, read live each cycle so an operator change takes effect on
+// the very next eligibility check (no restart). Bounded [5, 600]:
+//   • lower bound 5s — Alpaca's free bar API is comfortable at ~10 req/s
+//     across the 30-symbol US watchlist; faster than 5s risks rate-limit
+//     ceilings and produces no meaningful new information on 1-Min bars.
+//   • upper bound 600s — beyond 10 minutes the day strategy stops being a
+//     "day" strategy in any useful sense; the swing strategy already covers
+//     that horizon at 300s.
+// Quorum, confidence gate, dip-buy filter, recovery buffer, daily loss
+// budget, drawdown breaker, kill switch and sizing math are completely
+// untouched by this knob — it controls scheduler pacing only.
+const DAY_CADENCE_MIN = 5;
+const DAY_CADENCE_MAX = 600;
+const DAY_CADENCE_DEFAULT = 60;
+async function setDayCadence(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < DAY_CADENCE_MIN || n > DAY_CADENCE_MAX) {
+    throw new Error(`day_trading_cadence_seconds must be an integer in [${DAY_CADENCE_MIN}, ${DAY_CADENCE_MAX}]`);
+  }
+  const prevPort = await db.getPortfolio();
+  const prev = prevPort?.day_trading_cadence_seconds ?? DAY_CADENCE_DEFAULT;
+  await db.updatePortfolio({ day_trading_cadence_seconds: n });
+  await db.recordAudit({
+    event_type: 'DAY_CADENCE_CHANGED',
+    payload: { from: prev, to: n, min: DAY_CADENCE_MIN, max: DAY_CADENCE_MAX },
+  });
+  console.log(`[Agent] Day-trading cadence: ${prev}s → ${n}s`);
+  return { prev, current: n };
+}
 async function setRecoveryBuffer(seconds) {
   const n = Number(seconds);
   if (!Number.isFinite(n) || !Number.isInteger(n) || n < RECOVERY_BUFFER_MIN || n > RECOVERY_BUFFER_MAX) {
@@ -2169,6 +2216,16 @@ async function getAgentSnapshot() {
       envVar: 'DAY_TRADING_DIP_REQUIREMENT_STRICTNESS',
       appliesTo: 'day',
     },
+    dayCadence: {
+      seconds: Number.isFinite(parseInt(portfolio?.day_trading_cadence_seconds))
+        ? parseInt(portfolio.day_trading_cadence_seconds)
+        : DAY_CADENCE_DEFAULT,
+      min: DAY_CADENCE_MIN,
+      max: DAY_CADENCE_MAX,
+      default: DAY_CADENCE_DEFAULT,
+      presets: [15, 20, 30, 60, 90, 120],
+      appliesTo: 'day',
+    },
     recoveryBuffer: {
       seconds: Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
         ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
@@ -2475,7 +2532,7 @@ module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, WATCHLIST,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence, WATCHLIST,
   // Exposed for the /api/risk-capacity endpoint so it can compute on-demand
   // pre-warmup. Read-only USD price-lookup builder; identical logic to the
   // per-cycle path. Does NOT touch trading state.

@@ -9,7 +9,7 @@ const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
 } = require('./agent');
 const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
@@ -312,6 +312,19 @@ app.post('/api/agent/recovery-buffer', requireOperator, async (req, res) => {
   try {
     const { seconds } = req.body || {};
     const r = await setRecoveryBuffer(seconds);
+    broadcastState();
+    res.json({ success: true, ...r });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Day-trading cycle cadence — operator-tunable interval (seconds) between
+// day-strategy ticks. Operator-gated; bounded validation lives in the agent
+// setter ([5, 600] integer seconds). Broadcasts new state so the dashboard
+// updates without a manual refresh.
+app.post('/api/agent/day-cadence', requireOperator, async (req, res) => {
+  try {
+    const { seconds } = req.body || {};
+    const r = await setDayCadence(seconds);
     broadcastState();
     res.json({ success: true, ...r });
   } catch (e) { res.status(400).json({ success: false, error: e.message }); }

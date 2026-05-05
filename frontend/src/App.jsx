@@ -99,7 +99,7 @@ export default function App() {
     connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
-    toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer,
+    toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
     authStatus, setOperatorToken, getStoredOperatorToken,
     setBreakerAutoReset,
   } = useAgent();
@@ -418,6 +418,15 @@ export default function App() {
               recoveryBuffer={state?.recoveryBuffer}
               onChange={setRecoveryBuffer}
               loading={loading.recoveryBuffer}
+            />
+
+            {/* Day-trading cycle cadence — operator-tunable interval between
+                day-strategy ticks. Pacing only; quorum/confidence/dip-buy/
+                recovery-buffer all unchanged. */}
+            <DayCadenceControl
+              dayCadence={state?.dayCadence}
+              onChange={setDayCadence}
+              loading={loading.dayCadence}
             />
 
             {/* Dynamic Sizing — compounding × confidence × performance */}
@@ -1226,6 +1235,100 @@ function RecoveryBufferControl({ recoveryBuffer, onChange, loading }) {
           </div>
           {err && <div className="text-[10px] text-[var(--red)] mt-1">{err}</div>}
         </div>
+      </div>
+    </section>
+  );
+}
+
+// Day-trading cycle cadence control. Mirrors RecoveryBufferControl —
+// bounds + presets come from /api/state (`dayCadence.{min,max,default,presets}`)
+// so the UI can never submit an out-of-range value the backend would reject.
+// Preset chips give one-click access to the requested cadences (15/20/30/60/
+// 90/120s); the numeric input still allows any value in [min, max] for
+// fine-tuning. Apply enables only when the draft differs from live AND is
+// in-range, preventing accidental no-op writes.
+function DayCadenceControl({ dayCadence, onChange, loading }) {
+  const live = Number.isFinite(parseInt(dayCadence?.seconds))
+    ? parseInt(dayCadence.seconds)
+    : (dayCadence?.default ?? 60);
+  const min  = dayCadence?.min ?? 5;
+  const max  = dayCadence?.max ?? 600;
+  const def  = dayCadence?.default ?? 60;
+  const presets = Array.isArray(dayCadence?.presets) && dayCadence.presets.length
+    ? dayCadence.presets
+    : [15, 20, 30, 60, 90, 120];
+  const [draft, setDraft] = useState(String(live));
+  const [err, setErr] = useState('');
+  useEffect(() => { setDraft(String(live)); }, [live]);
+  const n = parseInt(draft, 10);
+  const valid = Number.isFinite(n) && n >= min && n <= max;
+  const dirty = valid && n !== live;
+  const apply = async (override) => {
+    setErr('');
+    const target = Number.isFinite(override) ? override : n;
+    if (!Number.isFinite(target) || target < min || target > max) { setErr(`Must be ${min}–${max}`); return; }
+    if (target === live) return;
+    const r = await onChange(target);
+    if (!r?.success) setErr(r?.error || 'Failed');
+  };
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
+          Day-Trading Cycle Cadence
+        </div>
+        <div className="text-[10px] text-[var(--text-dim)]">
+          Day strategy only · {min}–{max}s · default {def}s
+        </div>
+      </div>
+      <div className="glass p-3 sm:p-4 border border-white/5">
+        <div className="text-[10px] text-[var(--text-dim)] mb-2">
+          How often the day strategy ticks (faster = more chances per minute, but
+          more API calls). Live: <span className="text-[var(--text)] font-semibold">{live}s</span>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap mb-2">
+          {presets.map(p => {
+            const active = p === live;
+            return (
+              <button
+                key={p}
+                onClick={() => apply(p)}
+                disabled={loading || active}
+                className={`text-[11px] font-semibold px-2.5 py-1 rounded-xl border transition-colors ${
+                  active
+                    ? 'bg-[var(--blue)]/25 border-[var(--blue)]/50 text-[var(--blue)] cursor-default'
+                    : 'bg-white/5 border-white/10 text-[var(--text-dim)] hover:text-white hover:border-white/30'
+                }`}
+              >{p}s</button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="number" min={min} max={max} step={5} value={draft}
+            onChange={e => setDraft(e.target.value)}
+            disabled={loading}
+            className="w-24 bg-black/30 border border-white/10 rounded px-2 py-1 text-sm text-[var(--text)] focus:outline-none focus:border-[var(--blue)]/60"
+          />
+          <span className="text-[11px] text-[var(--text-dim)]">seconds</span>
+          <button
+            onClick={() => apply()}
+            disabled={!dirty || loading}
+            className={`text-[11px] font-semibold px-3 py-1 rounded transition-colors ${
+              dirty && !loading
+                ? 'bg-[var(--blue)]/20 text-[var(--blue)] border border-[var(--blue)]/40 hover:bg-[var(--blue)]/30'
+                : 'bg-white/5 text-[var(--text-dim)] border border-white/10 cursor-not-allowed'
+            }`}
+          >{loading ? '…' : 'Apply'}</button>
+          {live !== def && (
+            <button
+              onClick={() => apply(def)}
+              disabled={loading}
+              className="text-[10px] text-[var(--text-dim)] hover:text-[var(--text)] underline"
+            >reset to {def}s</button>
+          )}
+        </div>
+        {err && <div className="text-[10px] text-[var(--red)] mt-1">{err}</div>}
       </div>
     </section>
   );
