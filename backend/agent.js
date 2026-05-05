@@ -71,6 +71,7 @@ const perfMetrics = {
   strategyDurationsMs: {},  // { day:[…], swing:[…], asx_swing:[…] } — last 60 each
   ensembleCalls: 0,         // calls that actually went to llmService
   ensembleSkipped: 0,       // skip-cache reuse count (HOLD passthroughs)
+  ensembleQuietSkipped: 0,  // quiet-market shortcut hits (no LLM call at all)
   ensembleEscalated: 0,     // calls that included the premium tier
   watchdogResets: 0,
   startedAt: Date.now(),
@@ -99,9 +100,24 @@ function _pushBounded(arr, val, cap = 60) { arr.push(val); if (arr.length > cap)
 // budget, the circuit breaker, the kill switch, and riskManager sizing are
 // ALL UNCHANGED. requiredValid scales proportionally with pool size inside
 // llmService so the gate never gets easier to clear.
-const LLM_SKIP_TTL_MS = parseInt(process.env.LLM_SKIP_TTL_SECONDS || '60') * 1000;
-const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '15');
+// AGGRESSIVE COST-CUT DEFAULTS (round 2):
+//   • SKIP_TTL 60s → 120s  — quiet HOLDs reused for up to 2 minutes
+//   • SKIP_PRICE_BPS 15 → 35 — allow 0.35% drift before forcing fresh LLM
+// Both still env-overridable; both only apply to flat-position day cycles
+// where the previous decision was HOLD. BUY/SELL signals and held positions
+// always re-evaluate fresh on the next tick.
+const LLM_SKIP_TTL_MS = parseInt(process.env.LLM_SKIP_TTL_SECONDS || '120') * 1000;
+const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '35');
 const _llmSkipCache = new Map(); // `${strategy}:${symbol}` → { signal, ts, price }
+
+// Quiet-market shortcut thresholds. When the tape is genuinely sleepy on a
+// flat name, we don't need the LLM at all — emit a synthetic HOLD with the
+// same shape as a real signal. Tunable via env so the user can tighten if
+// they ever see entries being missed.
+const QUIET_NEWS_ABS_MAX = parseFloat(process.env.LLM_QUIET_NEWS_ABS_MAX || '0.15');
+const QUIET_REGIMES = (process.env.LLM_QUIET_REGIMES || 'normal,mean_reverting')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const QUIET_SHORTCUT_ENABLED = String(process.env.LLM_QUIET_SHORTCUT || 'true').toLowerCase() !== 'false';
 
 function computeRoutingReasons({ holding, strategyName, regime, intraday, newsSentiment, patterns }) {
   const reasons = [];
@@ -110,19 +126,74 @@ function computeRoutingReasons({ holding, strategyName, regime, intraday, newsSe
   if (strategyName && strategyName !== 'day') reasons.push(`strategy:${strategyName}`);
   // regime is an object {primary, tags, confidence, metrics} from
   // regimeService.classifyRegime — pull the primary label string. Defensive
-  // handling: accept either a string (legacy) or an object.
+  // handling: accept either a string (legacy) or an object. Round 2: dropped
+  // `low_liquidity` from the escalation set — quiet illiquid names rarely
+  // benefit from the premium tier and consume disproportionate cost.
   const regimePrimary = typeof regime === 'string' ? regime : regime?.primary;
-  if (regimePrimary === 'high_vol' || regimePrimary === 'news_driven' || regimePrimary === 'low_liquidity') {
+  if (regimePrimary === 'high_vol' || regimePrimary === 'news_driven') {
     reasons.push(`regime:${regimePrimary}`);
   }
-  if (intraday?.dipBuy?.score >= 4) reasons.push('strong_dip_buy');
+  // Round 2: tightened thresholds so only TOP-decile setups get the premium
+  // tier. dipBuy is on a 0-5 scale; only the maximum score escalates now.
+  // News abs raised 0.5 → 0.7 (decisive headlines only).
+  if (intraday?.dipBuy?.score >= 5) reasons.push('strong_dip_buy');
   if (intraday?.profitTake) reasons.push('profit_take_setup');
   const newsScore = Number(newsSentiment?.score);
-  if (Number.isFinite(newsScore) && Math.abs(newsScore) >= 0.5) reasons.push('strong_news');
+  if (Number.isFinite(newsScore) && Math.abs(newsScore) >= 0.7) reasons.push('strong_news');
   if (patterns?.breakout && patterns.breakout !== 'none' && patterns.breakout !== 'inside') {
     reasons.push(`breakout:${patterns.breakout}`);
   }
   return reasons;
+}
+
+// Quiet-market shortcut: when the day-strategy tape is genuinely sleepy on a
+// flat name, return a synthetic HOLD without calling any LLM. This is a
+// pure cost optimisation — HOLD = no trade either way, so trading behaviour
+// is identical to what the ensemble would have produced for the same inputs.
+//
+// All conditions must hold:
+//   • day strategy + no open position
+//   • not flagged for escalation (no holding/regime/setup/news/breakout)
+//   • regime.primary in {normal, mean_reverting}  (low-vol / range-bound)
+//   • |newsSentiment.score| < QUIET_NEWS_ABS_MAX  (effectively neutral)
+//   • no breakout pattern, no profit-take setup, no dip-buy score
+//
+// Returns null when conditions are not met → caller proceeds with the
+// existing skip-cache + ensemble path. When triggered, increments
+// perfMetrics.ensembleQuietSkipped and emits a tagged audit row.
+function tryQuietMarketShortcut({ strategyName, holding, escalate, regime, newsSentiment, patterns, intraday }) {
+  if (!QUIET_SHORTCUT_ENABLED) return null;
+  if (strategyName !== 'day' || holding || escalate) return null;
+  const regimePrimary = typeof regime === 'string' ? regime : regime?.primary;
+  if (!QUIET_REGIMES.includes(regimePrimary)) return null;
+  // Require a FINITE neutral score. Missing sentiment is treated as
+  // "unknown, not neutral" → fall through to the cheap-tier LLM call so we
+  // don't synthesize HOLD blindly during data gaps.
+  const newsScore = Number(newsSentiment?.score);
+  if (!Number.isFinite(newsScore) || Math.abs(newsScore) >= QUIET_NEWS_ABS_MAX) return null;
+  if (patterns?.breakout && patterns.breakout !== 'none' && patterns.breakout !== 'inside') return null;
+  if (intraday?.profitTake) return null;
+  if (intraday?.dipBuy?.score && intraday.dipBuy.score > 0) return null;
+  return {
+    consensus: 'HOLD',
+    confidence: 0,
+    agreement: 1,
+    agreementCount: 0,
+    validCount: 0,
+    totalModels: 0,
+    votes: { BUY: 0, SELL: 0, HOLD: 0 },
+    models: [],
+    reason: `[quiet-market] regime=${regimePrimary}, news=${Number.isFinite(newsScore) ? newsScore.toFixed(2) : 'n/a'}, no setup/breakout — synthetic HOLD (no LLM call)`,
+    pool: [],
+    escalated: false,
+    routingReason: 'quiet_market_shortcut',
+    rawConfidence: 0,
+    weightedConsensus: 'HOLD',
+    weightedConfidence: 0,
+    weights: null,
+    meta: null,
+    _skippedQuietMarket: true,
+  };
 }
 
 // [Upgrade #4 / Scale & Speed] Execution mutex.
@@ -894,7 +965,14 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     priceDriftBps < LLM_SKIP_PRICE_BPS
   );
 
-  if (canSkip) {
+  // Quiet-market shortcut runs BEFORE the skip-cache check — it doesn't
+  // need a prior cached signal, just a sleepy regime + neutral news + no
+  // setup. Catches the long tail of names that aren't in cache yet.
+  const quietSignal = tryQuietMarketShortcut({ strategyName: sc.name, holding, escalate, regime, newsSentiment, patterns, intraday });
+  if (quietSignal) {
+    perfMetrics.ensembleQuietSkipped++;
+    signal = quietSignal;
+  } else if (canSkip) {
     perfMetrics.ensembleSkipped++;
     signal = {
       ...skipCached.signal,
@@ -981,6 +1059,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       llm_escalated: !!signal.escalated,
       llm_routing_reason: signal.routingReason || routingReason,
       llm_skipped_from_cache: !!signal._skippedFromCache,
+      llm_skipped_quiet_market: !!signal._skippedQuietMarket,
       llm_cache_age_ms: signal._cacheAgeMs || null },
   });
 
