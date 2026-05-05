@@ -171,6 +171,18 @@ async function generateCandidates({ portfolio, strategies }) {
 async function persistCandidates(candidates) {
   let inserted = 0, updated = 0;
   for (const c of candidates) {
+    // Skip no-op or unappliable candidates BEFORE inserting — defense in
+    // depth so we never persist rows the apply gate would later reject.
+    if (c.current_value === c.suggested_value) {
+      console.warn(`[Safety] skipping no-op candidate ${c.kind}/${c.target} (value=${c.suggested_value})`);
+      continue;
+    }
+    const kind = KINDS[c.kind];
+    if (!kind || !kind.allowed_values.includes(c.suggested_value)
+        || (kind.allowed_targets !== '*' && !kind.allowed_targets.includes(c.target))) {
+      console.warn(`[Safety] skipping unappliable candidate ${c.kind}/${c.target}=${c.suggested_value} (not in allowlist)`);
+      continue;
+    }
     try {
       const { rows } = await db.query(`
         INSERT INTO safety_suggestions
@@ -227,7 +239,34 @@ async function listPending() {
       CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
       created_at DESC
   `);
-  return rows;
+  // Filter out rows that can never be applied — e.g. stale rows from older
+  // code versions whose suggested_value is no longer in the allowlist, or
+  // no-op rows where current_value === suggested_value. Auto-reject them so
+  // the dashboard never offers an "Apply" button that's guaranteed to 400.
+  const valid = [];
+  const stale = [];
+  for (const r of rows) {
+    const kind = KINDS[r.kind];
+    const noop = r.current_value && r.suggested_value && r.current_value === r.suggested_value;
+    const okKind   = !!kind;
+    const okTarget = okKind && (kind.allowed_targets === '*' || kind.allowed_targets.includes(r.target));
+    const okValue  = okKind && kind.allowed_values.includes(r.suggested_value);
+    if (okKind && okTarget && okValue && !noop) valid.push(r);
+    else stale.push({ id: r.id, reason: noop ? 'noop' : !okKind ? 'unknown_kind' : !okTarget ? 'bad_target' : 'value_not_allowed' });
+  }
+  if (stale.length) {
+    const ids = stale.map(s => s.id);
+    try {
+      await db.query(
+        `UPDATE safety_suggestions SET status='rejected', decided_at=NOW(),
+         decided_by='system-auto-reject', applier_result=$2::jsonb
+         WHERE id = ANY($1::int[]) AND status='pending'`,
+        [ids, JSON.stringify({ reason: 'unappliable on read', detail: stale })]
+      );
+      console.warn(`[Safety] auto-rejected ${stale.length} unappliable pending row(s):`, stale);
+    } catch (e) { console.warn('[Safety] auto-reject sweep failed:', e.message); }
+  }
+  return valid;
 }
 
 async function listRecent(limit = 20) {
