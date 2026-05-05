@@ -1,10 +1,16 @@
-// Default 15-symbol high-liquidity watchlist. Override with env WATCHLIST=...
-// Mix of mega-cap tech, semis, broad-market ETFs, financials, and consumer.
+// Default 30-symbol high-liquidity US watchlist. Override with env WATCHLIST=...
+// Spans the major S&P sectors so the agent isn't lopsided into one regime:
+// Mega-cap Tech, Semis, Financials/Payments, Consumer (Disc + Staples),
+// Healthcare/Pharma, Energy, plus broad-market ETFs as macro anchors.
 const DEFAULT_WATCHLIST = [
-  'AAPL', 'NVDA', 'MSFT', 'AMZN', 'META',     // mega-cap tech
-  'GOOGL', 'TSLA', 'AMD', 'AVGO', 'NFLX',     // tech / semis / streaming
-  'JPM', 'BAC', 'COST',                        // financials + consumer staple
-  'SPY', 'QQQ',                                // broad-market ETFs
+  'AAPL', 'NVDA', 'MSFT', 'AMZN', 'META',      // mega-cap tech
+  'GOOGL', 'TSLA', 'AMD', 'AVGO', 'NFLX',      // tech / streaming
+  'JPM', 'BAC', 'GS', 'V',                      // financials / payments
+  'COST', 'WMT', 'HD', 'MCD',                   // consumer (staples + discretionary)
+  'JNJ', 'PFE', 'LLY', 'UNH',                   // healthcare / pharma / managed care
+  'XOM', 'CVX',                                 // energy majors
+  'INTC', 'MU', 'QCOM', 'TSM',                  // semis (foundry + memory + mobile)
+  'SPY', 'QQQ',                                 // broad-market ETFs (macro anchors)
 ];
 
 // Base strategy templates. Per-trade risk numbers, confidence gates, and
