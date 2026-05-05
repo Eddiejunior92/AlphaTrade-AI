@@ -141,6 +141,20 @@ async function getWeights({ strategy, regime, market }) {
       out[id].weight = clamp(out[id].weight * b, WEIGHT_FLOOR, WEIGHT_CEIL);
     }
   }
+  // Continuous online-learning nudge — applied BEFORE the master clamp +
+  // renorm below so the existing safety invariants (WEIGHT_FLOOR/CEIL and
+  // Σ=N) remain the final authority. The continuous-learning layer's own
+  // bounds are TIGHTER ([0.95, 1.05]) than this master clamp, so even an
+  // unbounded run-away nudge can never breach the existing invariant.
+  try {
+    const continuousLearning = require('./continuousLearningService');
+    for (const id of KNOWN_MODELS) {
+      if (!out[id]) continue;
+      const delta = continuousLearning.getWeightDelta({ modelId: id, strategy: strat, regime: reg, market: mkt });
+      out[id].onlineLearningDelta = delta;
+      out[id].weight = clamp(out[id].weight * delta, WEIGHT_FLOOR, WEIGHT_CEIL);
+    }
+  } catch (_) { /* swallow — learning layer is non-critical */ }
   // Renormalise so Σ weights = number of models — this keeps the weighted
   // vote tally on the same numeric scale as the raw vote count, so safety
   // floors / agreement counts that any code reads downstream don't drift.

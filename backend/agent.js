@@ -20,6 +20,7 @@ const regimeService = require('./services/regimeService');
 const metaLearning = require('./services/metaLearningService');
 const knowledgeGraph = require('./services/knowledgeGraphService');
 const rlExecution = require('./services/rlExecutionService');
+const continuousLearning = require('./services/continuousLearningService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
@@ -1053,6 +1054,30 @@ async function runCycle() {
         await hedgingService.evaluateAndAlert(allHForHedge, { autoHedge });
       }
     } catch (e) { console.error('[Hedge] Tick error:', e.message); }
+
+    // Continuous online learning — per-bar tick. Folds realized 1-bar
+    // returns into per-(model, ctx) calibration buffers and applies tiny
+    // SGD updates to weight-deltas + threshold-deltas. Best-effort, never
+    // throws. Strictly additive — cannot affect quorum, gates, or risk.
+    // Reuses the cycle's already-fetched usdFullLookup (USD-equivalent
+    // live prices for every symbol the cycle touched) so we don't double
+    // up on broker quote calls.
+    try {
+      const allHForLearn = await db.getHoldings();
+      if (allHForLearn.length > 0) {
+        const priceLookup = {};
+        for (const h of allHForLearn) {
+          const px = usdFullLookup?.[h.symbol];
+          if (Number.isFinite(px)) priceLookup[h.symbol] = { price: Number(px) };
+        }
+        await continuousLearning.onBarTick({
+          holdings: allHForLearn,
+          priceLookup,
+          regime: portfolio.last_regime || 'unknown',
+          market: 'US',
+        });
+      }
+    } catch (e) { console.error('[ContinuousLearning] tick swallowed:', e.message); }
 
     memoryState.lastError = null;
     console.log(`[Agent] Cycle ${memoryState.cycleCount} complete`);

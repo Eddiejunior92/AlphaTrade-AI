@@ -482,6 +482,18 @@ app.get('/api/llm-weights', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Continuous online learning dashboard. Live per-bar calibration metrics:
+// per-model brier score + ECE, calibration curves (predicted-bin vs observed
+// frequency), current weight-delta state, regime-threshold drift, tick
+// counters. Strictly read-only. The underlying layer cannot bypass any
+// existing safety check — see continuousLearningService.js header.
+app.get('/api/continuous-learning/dashboard', async (_req, res) => {
+  try {
+    const continuousLearning = require('./services/continuousLearningService');
+    res.json(await continuousLearning.getDashboard());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Causal-inference graph introspection. Returns the per-(strategy, regime,
 // market) graph of feature → outcome edges (lift on win-rate, sample sizes,
 // confidence tier, spurious filter). Read-only.

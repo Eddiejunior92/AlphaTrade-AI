@@ -21,11 +21,23 @@
 // layer also requires a min sample count per (regime, strategy) before any
 // adjustment kicks in, so noisy classifications self-cancel anyway.
 
-const HIGH_VOL_ATR_PCT = 2.5;
+const HIGH_VOL_ATR_PCT_BASE = 2.5;
 const LOW_LIQ_VOL_RATIO = 0.70;
 const NEWS_SCORE_ABS = 0.50;
 const TREND_RSI_UP = 55;
 const TREND_RSI_DN = 45;
+
+// Continuous-online-learning adjusts HIGH_VOL_ATR_PCT within ±15% of the
+// hardcoded base. Hard floor + ceiling enforced here so any future drift
+// cannot escape safety bounds. Falls back to base on any error.
+function HIGH_VOL_ATR_PCT() {
+  try {
+    const cl = require('./continuousLearningService');
+    const mult = cl.getThresholdDelta('HIGH_VOL_ATR_PCT');
+    const adjusted = HIGH_VOL_ATR_PCT_BASE * mult;
+    return Math.max(2.0, Math.min(3.5, adjusted));   // hard floor/ceiling
+  } catch (_) { return HIGH_VOL_ATR_PCT_BASE; }
+}
 
 function emaSeries(values, period) {
   if (!values || values.length < period) return null;
@@ -54,7 +66,7 @@ function classifyRegime({ bars, indicators, newsSentiment }) {
   // --- 1. High-vol takes priority — risk dynamics shift first ---------------
   const atrPct = Number(indicators?.volatility?.atrPct);
   if (Number.isFinite(atrPct)) {
-    if (atrPct >= HIGH_VOL_ATR_PCT || indicators?.volatility?.label === 'high') {
+    if (atrPct >= HIGH_VOL_ATR_PCT() || indicators?.volatility?.label === 'high') {
       primary = 'high_vol'; confidence = Math.min(1, atrPct / 4); tags.push('high_vol');
     }
   }
