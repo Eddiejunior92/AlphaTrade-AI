@@ -47,6 +47,13 @@ const FEATURE_NAMES = [
   'vol_atr_pct',        // (atrPct - 2) / 4  ∈ ~[-1,1]  (mean ATR ≈ 2%)
   'is_swing',           // 1 if swing, 0 if day
   'is_asx',             // 1 if ASX, 0 if US
+  // --- Regime one-hot (4 dims, mutually-exclusive flags). Adding these to
+  // the ML adaptive feature schema bumps the persisted vector length, which
+  // the load() path will detect and cold-start from automatically.
+  'is_high_vol',
+  'is_trending',
+  'is_mean_revert',
+  'is_news_driven',
 ];
 const N_FEATURES = FEATURE_NAMES.length;
 
@@ -176,7 +183,7 @@ function dot(w, x) {
 // Builds the feature vector from whatever decision context is available.
 // Missing pieces (e.g. unavailable indicators) collapse to neutral values so
 // the model degrades gracefully rather than crashing or biasing predictions.
-function extractFeatures({ signal, newsSentiment, indicators, strategyName, market }) {
+function extractFeatures({ signal, newsSentiment, indicators, strategyName, market, regime }) {
   const x = new Array(N_FEATURES).fill(0);
   x[0] = 1;                                                           // bias
   x[1] = clamp(Number(signal?.confidence) || 0, 0, 1);                 // llm_confidence
@@ -198,6 +205,13 @@ function extractFeatures({ signal, newsSentiment, indicators, strategyName, mark
   }
   x[11] = strategyName === 'swing' ? 1 : 0;
   x[12] = market === 'ASX' ? 1 : 0;
+  // Regime one-hot (indices 13..16). Inline import to avoid a circular
+  // dependency between this service and any future regime consumer.
+  const p = regime?.primary || 'normal';
+  x[13] = p === 'high_vol' ? 1 : 0;
+  x[14] = (p === 'trending_up' || p === 'trending_down') ? 1 : 0;
+  x[15] = p === 'mean_reverting' ? 1 : 0;
+  x[16] = p === 'news_driven' ? 1 : 0;
   return x;
 }
 

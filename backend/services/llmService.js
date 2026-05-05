@@ -36,14 +36,18 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal, regimeContext }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
   const flowLine = orderFlow?.description ? `\n${orderFlow.description}\n` : '';
   const optsLine = optionsActivity ? `\n${optionsActivity}\n` : '';
   const earnLine = earningsSignal ? `\n${earningsSignal}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${earnLine}`;
+  // Regime classification block — informational. Tells the LLM what tape
+  // we're in (high-vol/trending/news-driven/etc.) and whether the meta layer
+  // has tightened gates. Never directs a vote — quorum still rules.
+  const regimeBlock = regimeContext ? `\n${regimeContext}\n` : '';
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${earnLine}${regimeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -297,9 +301,9 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal, regimeContext }) {
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, earningsSignal, regimeContext }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

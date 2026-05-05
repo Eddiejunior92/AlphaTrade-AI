@@ -323,6 +323,7 @@ app.get('/api/audit', async (req, res) => {
 const backtestService = require('./services/backtestService');
 const adaptiveLearning = require('./services/adaptiveLearningService');
 const mlAdaptive = require('./services/mlAdaptiveService');
+const metaLearning = require('./services/metaLearningService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -391,6 +392,14 @@ app.get('/api/backtest/:id', async (req, res) => {
 // head). Read-only; safe for the dashboard to poll.
 app.get('/api/adaptive/ml', async (_req, res) => {
   try { res.json(await mlAdaptive.getStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Regime-aware meta-learning track record — per-regime per-strategy closed
+// trade counts, win rate, and avg R-multiple. Drives the conf-gate
+// tightening + sizing nudge applied inside riskManager.evaluateBuy.
+app.get('/api/regime/performance', async (_req, res) => {
+  try { res.json(await metaLearning.getDashboardSummary()); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -16,6 +16,8 @@ const intradayService = require('./services/intradayService');
 const historicalIntel = require('./services/historicalIntelligenceService');
 const adaptiveLearning = require('./services/adaptiveLearningService');
 const mlAdaptive = require('./services/mlAdaptiveService');
+const regimeService = require('./services/regimeService');
+const metaLearning = require('./services/metaLearningService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
@@ -104,7 +106,7 @@ async function buildPriceLookup(holdings) {
 // (symbol, strategy).
 async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_profit,
                               reason, strategy, market, currency, fxToUsd,
-                              mlFeatures, riskUSD }) {
+                              mlFeatures, riskUSD, regime }) {
   market   = market   || marketRegistry.getSymbolInfo(symbol).market;
   currency = currency || marketRegistry.getSymbolInfo(symbol).currency;
   fxToUsd  = Number.isFinite(fxToUsd) ? fxToUsd
@@ -172,8 +174,11 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     confidence: signal?.confidence, models: signal?.models,
     payload: { qty, price, stop_loss, take_profit, pnl: usdPnl, native_pnl: nativePnl,
                reason, strategy, market, currency, fx_rate: fxToUsd,
-               // Persist ML metadata on BUY so the SELL path can train on it.
-               ...(side === 'BUY' && mlFeatures ? { ml_features: mlFeatures, ml_risk_usd: riskUSD } : {}) },
+               // Persist ML + regime metadata on BUY so the SELL path can
+               // train both the mlAdaptive and metaLearning layers on
+               // the exact decision-time context.
+               ...(side === 'BUY' && mlFeatures ? { ml_features: mlFeatures, ml_risk_usd: riskUSD } : {}),
+               ...(side === 'BUY' && regime ? { regime } : {}) },
   });
 
   const ccyTag = currency === 'USD' ? '$' : `${currency} `;
@@ -213,11 +218,17 @@ async function recordMLOutcomeForClose({ symbol, strategy, pnl }) {
     const p = rows[0]?.payload;
     const features = p?.ml_features;
     const riskUSD = p?.ml_risk_usd;
+    const regime  = p?.regime;
     if (Array.isArray(features) && features.length) {
       await mlAdaptive.recordOutcome({ features, pnl, riskUSD });
     }
+    // Train the regime meta-learning layer on every close. If the originating
+    // BUY pre-dates the regime layer (older audit row, no `regime` payload),
+    // metaLearning attributes the trade to the 'normal' bucket — the safe
+    // default — rather than dropping the sample.
+    await metaLearning.recordOutcome({ regime, strategy, pnl, riskUSD });
   } catch (e) {
-    console.warn(`[Agent] ML close-attribution failed for ${symbol}/${strategy}:`, e.message);
+    console.warn(`[Agent] ML/meta close-attribution failed for ${symbol}/${strategy}:`, e.message);
   }
 }
 
@@ -364,6 +375,11 @@ async function flattenAllPositions(reason = 'Manual flatten') {
                    market: h.market || 'US', currency, fx_rate: fxToUsd } });
       adaptiveLearning.recordOutcome({ symbol: h.symbol, strategy: h.strategy, pnl: usdPnl, closedAt: new Date() })
         .catch(() => {});
+      // Force-flattens are real closes too — train the ML adaptive + regime
+      // meta layers on them so circuit-breaker / kill-switch trades aren't
+      // silently dropped from the learning ledger. Both layers self-attribute
+      // to the originating BUY's stored feature vector + regime.
+      recordMLOutcomeForClose({ symbol: h.symbol, strategy: h.strategy, pnl: usdPnl }).catch(() => {});
     }
     memoryState.lastFlatten = new Date().toISOString();
     await discordService.sendCircuitBreakerAlert(`Flatten complete — ${holdings.length} positions closed`);
@@ -472,6 +488,23 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   let adaptiveMult = 1.0;
   try { adaptiveMult = await adaptiveLearning.getSizingMultiplier(symbol, sc.name); } catch (_) {}
 
+  // --- Regime-aware meta-learning -----------------------------------------
+  // Classify the current tape (high-vol / trending / mean-reverting / news /
+  // low-liquidity / normal) from the indicators + bars + sentiment we already
+  // have, then look up the per-regime track record to derive:
+  //   • confidenceBoost (≥0) — TIGHTENS the quorum gate inside riskManager
+  //   • regimeMult ∈ [0.85, 1.10] — sizing nudge stacked alongside mlMult
+  // Both default to neutral until META_MIN_SAMPLES (=8) closes per bucket.
+  let regime = null;
+  let regimeAdjust = { regime: 'normal', confidenceBoost: 0, regimeMult: 1.0, basis: { n: 0 } };
+  try {
+    regime = regimeService.classifyRegime({ bars, indicators, newsSentiment });
+    regimeAdjust = await metaLearning.getAdjustments(regime, sc.name);
+  } catch (_) {}
+  const regimeContext = regime
+    ? regimeService.getPromptBlock(regime, regimeAdjust)
+    : null;
+
   let orderFlow = null;
   try { orderFlow = orderFlowService.analyzeOrderFlow(bars); } catch (_) {}
 
@@ -500,6 +533,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, earningsSignal,
+    regimeContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -509,7 +543,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   try {
     _mlFeaturesForAudit = mlAdaptive.extractFeatures({
       signal, newsSentiment, indicators,
-      strategyName: sc.name, market: info.market,
+      strategyName: sc.name, market: info.market, regime,
     });
   } catch (_) {}
 
@@ -519,7 +553,8 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     payload: { priceData, sentiment, newsSentiment, indicators, patterns, fundamentals, intraday,
       historicalAvailable: !!historical,
       votes: signal.votes, reason: signal.reason, strategy: sc.name,
-      ml_features: _mlFeaturesForAudit },
+      ml_features: _mlFeaturesForAudit,
+      regime, regime_adjust: regimeAdjust },
   });
 
   // Tag signal with market+currency so the dashboard can filter US vs ASX
@@ -551,12 +586,17 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     try {
       mlFeatures = mlAdaptive.extractFeatures({
         signal, newsSentiment, indicators,
-        strategyName: sc.name, market: info.market,
+        strategyName: sc.name, market: info.market, regime,
       });
       mlPrediction = await mlAdaptive.predict(mlFeatures);
     } catch (_) { /* swallow — never block trading */ }
 
-    const dynamicWithUpgrades = { ...(dynamic || {}), adaptiveMult, portfolioMult, mlMult: mlPrediction.mlMult };
+    const dynamicWithUpgrades = {
+      ...(dynamic || {}),
+      adaptiveMult, portfolioMult,
+      mlMult: mlPrediction.mlMult,
+      regimeAdjust,    // riskManager applies the gate-tightening + sizing mult
+    };
     const eval_ = await riskManager.evaluateBuy({
       symbol, signal, price: latestUsd, equity, cash, holdings,
       strategyConfig: sc, dynamic: dynamicWithUpgrades,
@@ -570,6 +610,9 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       const mlTag = mlPrediction.trained
         ? ` | ml mult=${mlPrediction.mlMult.toFixed(2)} pWin=${(mlPrediction.pWin * 100).toFixed(0)}%`
         : '';
+      const regimeTag = regime ? ` | regime=${regime.primary}` +
+        (regimeAdjust.confidenceBoost ? ` (+${(regimeAdjust.confidenceBoost*100).toFixed(0)}pp gate)` : '') +
+        (regimeAdjust.regimeMult !== 1 ? ` ×${regimeAdjust.regimeMult.toFixed(2)} size` : '') : '';
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal,
@@ -577,12 +620,12 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
         take_profit: parseFloat(nativeTake.toFixed(4)),
         reason: `${signal.reason} | risk $${eval_.riskUSD}` +
           (sz.compoundMult ? ` (×${sz.compoundMult.toFixed(2)} growth·perf, ${(sz.confFraction*100).toFixed(0)}% conf-band)` : '') +
-          mlTag +
+          mlTag + regimeTag +
           (info.currency !== 'USD' ? ` | fx ${info.currency}/USD=${fxToUsd.toFixed(4)}` : ''),
         strategy: sc.name,
         market: info.market, currency: info.currency, fxToUsd,
-        // ML metadata — persisted on BUY audit, replayed at SELL for online training.
-        mlFeatures, riskUSD: eval_.riskUSD,
+        // ML + regime metadata — persisted on BUY audit, replayed at SELL for online training.
+        mlFeatures, riskUSD: eval_.riskUSD, regime,
       });
     } else {
       await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',

@@ -89,6 +89,23 @@ async function ensureSchema() {
     )
   `);
 
+  // Regime-aware meta-learning layer (metaLearningService) — per-regime,
+  // per-strategy closed-trade rollup. Drives the regime-conditional
+  // confidence-threshold tightening and sizing nudge.
+  await query(`
+    CREATE TABLE IF NOT EXISTS regime_performance (
+      regime     TEXT NOT NULL,
+      strategy   TEXT NOT NULL,
+      n_trades   INTEGER NOT NULL DEFAULT 0,
+      n_wins     INTEGER NOT NULL DEFAULT 0,
+      gross_pnl  NUMERIC(14,4) NOT NULL DEFAULT 0,
+      sum_r      NUMERIC(10,4) NOT NULL DEFAULT 0,
+      n_with_r   INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (regime, strategy)
+    )
+  `);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

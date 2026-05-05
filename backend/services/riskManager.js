@@ -66,9 +66,16 @@ async function checkCircuitBreaker(equity) {
   return { tripped: portfolio.circuit_breaker, drawdown, lossUSD };
 }
 
-function checkQuorum(signal, sc) {
-  if (signal.confidence < sc.confidenceThreshold) {
-    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(sc.confidenceThreshold * 100)}% gate` };
+function checkQuorum(signal, sc, opts = {}) {
+  // Regime meta layer can ONLY tighten — never lower — the confidence gate.
+  // We take max(base, base + boost) with boost ≥ 0 enforced at the source
+  // (metaLearningService returns boost in [0, 0.10]). This double-defense
+  // means a buggy upstream value can't accidentally relax safety.
+  const boost = Math.max(0, Number(opts.confidenceBoost) || 0);
+  const effectiveThreshold = sc.confidenceThreshold + boost;
+  if (signal.confidence < effectiveThreshold) {
+    const tag = boost > 0 ? ` (regime +${(boost * 100).toFixed(0)}pp)` : '';
+    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(effectiveThreshold * 100).toFixed(1)}% gate${tag}` };
   }
   const agreement = signal.agreementCount ?? 0;
   if (agreement < sc.minDirectionalAgreement) {
@@ -135,7 +142,11 @@ function computeTargetRisk({ scale, signal, dynamic }) {
 async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, strategyConfig, dynamic }) {
   const sc = strategyConfig;
   if (signal.consensus !== 'BUY') return { allow: false, reason: 'Not a BUY signal' };
-  const q = checkQuorum(signal, sc);
+  // Regime meta layer can tighten the confidence threshold by up to +10pp.
+  // boost is sanitized & non-negative inside checkQuorum.
+  const dynForGate = dynamic || {};
+  const regimeBoost = Math.max(0, Number(dynForGate.regimeAdjust?.confidenceBoost) || 0);
+  const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost });
   if (!q.ok) return { allow: false, reason: q.reason };
   // Reject averaging-in: if symbol already held in this strategy, force a new
   // sell-or-hold cycle before re-entering. Avoids local-state corruption from
@@ -164,8 +175,13 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // composite stack can never expand the existing safety envelope. Defaults
   // to 1.0 when the model is in cold-start or the prediction is unavailable.
   const mlMult = Number.isFinite(dyn.mlMult) ? Math.max(0.85, Math.min(1.15, dyn.mlMult)) : 1.0;
+  // Regime-aware sizing nudge. Asymmetric clamp [0.85, 1.10] — easier to
+  // shrink than to grow. Defaults to 1.0 when regime stats haven't met
+  // META_MIN_SAMPLES yet (cold-start = identity).
+  const regimeMult = Number.isFinite(dyn.regimeAdjust?.regimeMult)
+    ? Math.max(0.85, Math.min(1.10, dyn.regimeAdjust.regimeMult)) : 1.0;
   const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
-  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult).toFixed(2);
+  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult * regimeMult).toFixed(2);
 
   const qtyByRisk = Math.floor(adjustedRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
@@ -201,6 +217,9 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
       adaptiveMult,
       portfolioMult,
       mlMult,
+      regimeMult,
+      regimeBoost,
+      regime: dyn.regimeAdjust?.regime || null,
     },
   };
 }
