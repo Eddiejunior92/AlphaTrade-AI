@@ -324,6 +324,7 @@ const backtestService = require('./services/backtestService');
 const adaptiveLearning = require('./services/adaptiveLearningService');
 const mlAdaptive = require('./services/mlAdaptiveService');
 const metaLearning = require('./services/metaLearningService');
+const knowledgeGraph = require('./services/knowledgeGraphService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -401,6 +402,23 @@ app.get('/api/adaptive/ml', async (_req, res) => {
 app.get('/api/regime/performance', async (_req, res) => {
   try { res.json(await metaLearning.getDashboardSummary()); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Long-term company knowledge graph — slow-moving per-symbol context blob
+// (sector + peers, earnings track, valuation, macro, major-event timeline).
+//   GET /api/knowledge          → list of all symbols + freshness
+//   GET /api/knowledge/:symbol  → full graph + rendered prompt summary
+// Read-only; safe for the dashboard to poll.
+app.get('/api/knowledge', async (_req, res) => {
+  try { res.json({ rows: await knowledgeGraph.listAll(), refresh_ttl_hours: knowledgeGraph.REFRESH_TTL_HOURS }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/knowledge/:symbol', async (req, res) => {
+  try {
+    const g = await knowledgeGraph.getGraph(req.params.symbol);
+    if (!g) return res.status(404).json({ error: 'not_found' });
+    res.json(g);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/adaptive/performance', async (_req, res) => {

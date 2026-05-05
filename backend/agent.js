@@ -18,6 +18,7 @@ const adaptiveLearning = require('./services/adaptiveLearningService');
 const mlAdaptive = require('./services/mlAdaptiveService');
 const regimeService = require('./services/regimeService');
 const metaLearning = require('./services/metaLearningService');
+const knowledgeGraph = require('./services/knowledgeGraphService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
@@ -505,6 +506,14 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     ? regimeService.getPromptBlock(regime, regimeAdjust)
     : null;
 
+  // --- Long-term knowledge graph -----------------------------------------
+  // Pre-rendered per-symbol summary maintained by knowledgeGraphService —
+  // sector context, peer set, earnings track, valuation, macro backdrop,
+  // and a curated major-event timeline. Refreshed daily + on strong news.
+  // Pure DB read here; never blocks trading on failure.
+  let knowledgeContext = null;
+  try { knowledgeContext = await knowledgeGraph.getPromptBlock(symbol); } catch (_) {}
+
   let orderFlow = null;
   try { orderFlow = orderFlowService.analyzeOrderFlow(bars); } catch (_) {}
 
@@ -533,7 +542,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
     adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, earningsSignal,
-    regimeContext,
+    regimeContext, knowledgeContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -1065,6 +1074,29 @@ function scheduleOptionsActivityRefresh() {
   }, 30 * 60 * 1000);
 }
 
+// --- Long-term knowledge graph — daily refresh ----------------------------
+// Runs once per day at ~08:00 UTC (~03:00-04:00 ET, well before US open and
+// after Sydney close). Pulls cached fundamentals + sentiment per symbol and
+// writes a refreshed per-symbol blob + pre-rendered prompt summary into
+// company_knowledge. The refresh itself is best-effort and bounded to 2x
+// concurrent LLM calls — never blocks trading on failure.
+let kgDailyHandle = null;
+function scheduleDailyKnowledgeGraph() {
+  if (kgDailyHandle) clearTimeout(kgDailyHandle);
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(8, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  kgDailyHandle = setTimeout(async () => {
+    try {
+      const r = await knowledgeGraph.refreshAll({ concurrency: 2 });
+      console.log(`[KG] Daily refresh: ok=${r.ok}/${r.total} errs=${r.err}`);
+    } catch (e) { console.error('[KG] Daily refresh failed:', e.message); }
+    scheduleDailyKnowledgeGraph();
+  }, next - now);
+  console.log(`[KG] Next daily refresh in ${Math.round((next - now) / 60000)} min`);
+}
+
 let intelDailyHandle = null;
 function scheduleDailyIntelligence() {
   if (intelDailyHandle) clearTimeout(intelDailyHandle);
@@ -1212,6 +1244,15 @@ scheduleDailyReset();
 scheduleDailyIntelligence();
 scheduleAdaptiveRecompute();
 scheduleOptionsActivityRefresh();
+scheduleDailyKnowledgeGraph();
+// Boot-time non-blocking warm-up — kicks off the first refresh once the
+// fundamentals + sentiment caches start landing. Skips symbols that are
+// already fresh (TTL gate inside refreshSymbol).
+setTimeout(() => {
+  knowledgeGraph.refreshAll({ concurrency: 2 })
+    .then(r => console.log(`[KG] Boot warm-up: ok=${r.ok}/${r.total} errs=${r.err}`))
+    .catch(e => console.error('[KG] Boot warm-up failed:', e.message));
+}, 30_000);
 // Warm adaptive cache + options activity once at startup so the first cycle
 // has fresh context. Both are best-effort and never block boot.
 adaptiveLearning.recomputeFromHistory()

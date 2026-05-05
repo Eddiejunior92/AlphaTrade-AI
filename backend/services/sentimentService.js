@@ -79,6 +79,17 @@ function touchCache(sym, entry) {
     if (oldest === undefined) break;
     cache.delete(oldest);
   }
+  // Strong-news event trigger for the long-term knowledge graph. When the
+  // blended sentiment score is decisively bullish or bearish, mark the
+  // symbol stale so the KG picks it up on the next refresh pass instead of
+  // waiting up to 22h. Lazy-required to avoid a circular import at boot.
+  try {
+    const score = Number(entry?.data?.score);
+    if (Number.isFinite(score) && Math.abs(score) >= 0.5) {
+      const kg = require('./knowledgeGraphService');
+      kg.markStale(sym, `sentiment ${score >= 0 ? '+' : ''}${score.toFixed(2)}`).catch(() => {});
+    }
+  } catch (_) { /* swallow — never break sentiment writes */ }
 }
 
 function defaultPayload(symbol, reason) {

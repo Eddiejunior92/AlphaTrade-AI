@@ -89,6 +89,23 @@ async function ensureSchema() {
     )
   `);
 
+  // Long-term company knowledge graph (knowledgeGraphService) — slow-moving
+  // per-symbol context (sector, peers, earnings track, valuation, macro,
+  // major-event timeline). Refreshed daily and on strong-news events.
+  await query(`
+    CREATE TABLE IF NOT EXISTS company_knowledge (
+      symbol           TEXT PRIMARY KEY,
+      market           TEXT,
+      sector           TEXT,
+      data             JSONB NOT NULL DEFAULT '{}'::jsonb,
+      summary          TEXT,
+      stale_flag       BOOLEAN NOT NULL DEFAULT FALSE,
+      stale_reason     TEXT,
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      next_refresh_at  TIMESTAMPTZ
+    )
+  `);
+
   // Regime-aware meta-learning layer (metaLearningService) — per-regime,
   // per-strategy closed-trade rollup. Drives the regime-conditional
   // confidence-threshold tightening and sizing nudge.
