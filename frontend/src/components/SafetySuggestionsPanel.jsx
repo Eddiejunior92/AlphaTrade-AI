@@ -50,10 +50,20 @@ export default function SafetySuggestionsPanel() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Operator-token header — required by /api/safety-suggestions/{refresh,apply,reject}.
+  // Token stored in localStorage by the Settings panel; same key used across
+  // the dashboard (StrategyProposalsPanel mirrors this).
+  const authHeaders = () => {
+    try {
+      const t = localStorage.getItem('operator_token') || '';
+      return t ? { 'x-operator-token': t } : {};
+    } catch { return {}; }
+  };
+
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      await fetch('/api/safety-suggestions/refresh', { method: 'POST' });
+      await fetch('/api/safety-suggestions/refresh', { method: 'POST', headers: authHeaders() });
       await load();
     } catch (e) { setError(e.message); }
     finally { setRefreshing(false); }
@@ -64,7 +74,7 @@ export default function SafetySuggestionsPanel() {
     setLoading(l => ({ ...l, [id]: 'apply' }));
     try {
       const r = await fetch(`/api/safety-suggestions/${id}/apply`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ decided_by: 'dashboard' }),
       });
       const j = await r.json();
@@ -78,7 +88,7 @@ export default function SafetySuggestionsPanel() {
     setLoading(l => ({ ...l, [id]: 'reject' }));
     try {
       const r = await fetch(`/api/safety-suggestions/${id}/reject`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ decided_by: 'dashboard' }),
       });
       const j = await r.json();

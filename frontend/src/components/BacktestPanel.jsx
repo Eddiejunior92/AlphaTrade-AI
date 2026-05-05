@@ -98,9 +98,16 @@ export default function BacktestPanel({ marketOf }) {
         maxPositionPct: +params.maxPositionPct / 100,
         requireUptrend: !!params.requireUptrend,
       };
+      // /api/backtest is operator-gated (requireOperatorStrictGate). Pull the
+      // token from localStorage — same key used by Settings + every other panel.
+      let opToken = '';
+      try { opToken = localStorage.getItem('operator_token') || ''; } catch {}
       const res = await fetch('/api/backtest', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(opToken ? { 'x-operator-token': opToken } : {}),
+        },
         body: JSON.stringify(body),
       });
       const data = await res.json();

@@ -1,7 +1,21 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 const API = '/api';
-const TOKEN_STORAGE_KEY = 'alphatrade.operatorToken';
+// Shared with StrategyProposalsPanel/SafetySuggestionsPanel — keep this key
+// stable so the token saved in Settings is visible to every component.
+const TOKEN_STORAGE_KEY = 'operator_token';
+const LEGACY_TOKEN_KEY = 'alphatrade.operatorToken';
+
+// One-time migration — earlier in the breaker hardening I introduced a
+// different localStorage key. Migrate it to the unified key so users don't
+// have to re-enter their token. Safe to call on every load.
+try {
+  const legacy = localStorage.getItem(LEGACY_TOKEN_KEY);
+  if (legacy && !localStorage.getItem(TOKEN_STORAGE_KEY)) {
+    localStorage.setItem(TOKEN_STORAGE_KEY, legacy);
+  }
+  if (legacy) localStorage.removeItem(LEGACY_TOKEN_KEY);
+} catch {}
 
 export function getStoredOperatorToken() {
   try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ''; } catch { return ''; }
