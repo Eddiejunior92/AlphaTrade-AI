@@ -9,7 +9,7 @@ const {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer,
 } = require('./agent');
 const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
@@ -301,6 +301,19 @@ app.post('/api/agent/risk-scale', async (req, res) => {
     await setRiskScale(scale);
     broadcastState();
     res.json({ success: true, scale });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
+// Day-trading recovery buffer — operator-tunable cooldown on same-symbol
+// re-entries after a close. Operator-gated; bounded validation lives in the
+// agent setter ([0, 3600] integer seconds). Broadcasts new state so the
+// dashboard updates without a manual refresh.
+app.post('/api/agent/recovery-buffer', requireOperator, async (req, res) => {
+  try {
+    const { seconds } = req.body || {};
+    const r = await setRecoveryBuffer(seconds);
+    broadcastState();
+    res.json({ success: true, ...r });
   } catch (e) { res.status(400).json({ success: false, error: e.message }); }
 });
 

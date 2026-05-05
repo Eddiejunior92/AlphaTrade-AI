@@ -99,7 +99,7 @@ export default function App() {
     connected, liveAuditAt, loading, brokerChat,
     startAgent, stopAgent, runNow,
     emergencyPause, resume, resetCircuitBreaker, flatten,
-    toggleStrategy, setTradingMode, setRiskScale,
+    toggleStrategy, setTradingMode, setRiskScale, setRecoveryBuffer,
     authStatus, setOperatorToken, getStoredOperatorToken,
     setBreakerAutoReset,
   } = useAgent();
@@ -407,6 +407,14 @@ export default function App() {
               current={riskScale?.current}
               loading={loading}
               onChange={setRiskScale}
+            />
+
+            {/* Day-trading recovery buffer — operator-tunable cooldown
+                between same-symbol re-entries on the day strategy. */}
+            <RecoveryBufferControl
+              recoveryBuffer={state?.recoveryBuffer}
+              onChange={setRecoveryBuffer}
+              loading={loading.recoveryBuffer}
             />
 
             {/* Dynamic Sizing — compounding × confidence × performance */}
@@ -1138,6 +1146,81 @@ function RiskScaleSelector({ scales, current, loading, onChange }) {
             </Tooltip>
           );
         })}
+      </div>
+    </section>
+  );
+}
+
+// Day-trading recovery buffer control. Numeric input + Apply button. Bounds
+// come from /api/state (recoveryBuffer.{min,max,default}). The component
+// stays in sync with the live setting whenever the dashboard re-renders so
+// an external change (e.g. another operator) is reflected here too. The
+// Apply button only enables when the local draft differs from the live
+// value AND falls within bounds — guards against accidental no-op writes
+// and out-of-range submits before the backend even sees them.
+function RecoveryBufferControl({ recoveryBuffer, onChange, loading }) {
+  const live = Number.isFinite(parseInt(recoveryBuffer?.seconds))
+    ? parseInt(recoveryBuffer.seconds)
+    : (recoveryBuffer?.default ?? 75);
+  const min  = recoveryBuffer?.min ?? 0;
+  const max  = recoveryBuffer?.max ?? 3600;
+  const def  = recoveryBuffer?.default ?? 75;
+  const [draft, setDraft] = useState(String(live));
+  const [err, setErr] = useState('');
+  // Re-sync whenever the live value changes (and we're not actively editing
+  // a different value the user already typed).
+  useEffect(() => { setDraft(String(live)); }, [live]);
+  const n = parseInt(draft, 10);
+  const valid = Number.isFinite(n) && n >= min && n <= max;
+  const dirty = valid && n !== live;
+  const apply = async () => {
+    setErr('');
+    if (!valid) { setErr(`Must be ${min}–${max}`); return; }
+    const r = await onChange(n);
+    if (!r?.success) setErr(r?.error || 'Failed');
+  };
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 px-1">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
+          Day-Trading Recovery Buffer
+        </div>
+        <div className="text-[10px] text-[var(--text-dim)]">
+          Day strategy only · {min}–{max}s · default {def}s
+        </div>
+      </div>
+      <div className="glass p-3 sm:p-4 border border-white/5 flex items-center gap-3 flex-wrap">
+        <div className="flex-1 min-w-[160px]">
+          <div className="text-[10px] text-[var(--text-dim)] mb-1">
+            Min seconds between same-symbol re-entries after a close. Live: <span className="text-[var(--text)] font-semibold">{live}s</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="number" min={min} max={max} step={5} value={draft}
+              onChange={e => setDraft(e.target.value)}
+              disabled={loading}
+              className="w-24 bg-black/30 border border-white/10 rounded px-2 py-1 text-sm text-[var(--text)] focus:outline-none focus:border-[var(--blue)]/60"
+            />
+            <span className="text-[11px] text-[var(--text-dim)]">seconds</span>
+            <button
+              onClick={apply}
+              disabled={!dirty || loading}
+              className={`text-[11px] font-semibold px-3 py-1 rounded transition-colors ${
+                dirty && !loading
+                  ? 'bg-[var(--blue)]/20 text-[var(--blue)] border border-[var(--blue)]/40 hover:bg-[var(--blue)]/30'
+                  : 'bg-white/5 text-[var(--text-dim)] border border-white/10 cursor-not-allowed'
+              }`}
+            >{loading ? '…' : 'Apply'}</button>
+            {live !== def && (
+              <button
+                onClick={() => { setDraft(String(def)); }}
+                disabled={loading}
+                className="text-[10px] text-[var(--text-dim)] hover:text-[var(--text)] underline"
+              >reset to {def}s</button>
+            )}
+          </div>
+          {err && <div className="text-[10px] text-[var(--red)] mt-1">{err}</div>}
+        </div>
       </div>
     </section>
   );

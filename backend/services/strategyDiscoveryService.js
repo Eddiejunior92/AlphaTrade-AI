@@ -500,24 +500,175 @@ async function getActiveOverlays() {
   return rows;
 }
 
+// =============================================================================
+// Recovery-buffer analysis — mines closed day-strategy trades, joins each to
+// its entry-time TRADE_EXECUTED audit row to recover the buffer that was
+// active at decision time, buckets by regime × buffer-band, and surfaces
+// recommendations when an alternative band's avg R clearly beats the band
+// the operator's current setting falls into.
+//
+// SAFETY CONTRACT: read-only. Produces RECOMMENDATIONS only — never mutates
+// the live buffer. Operator must explicitly accept any change via the
+// existing POST /api/agent/recovery-buffer endpoint.
+// =============================================================================
+const BUFFER_BANDS = [
+  { name: '0-60s',     min: 0,    max: 60   },
+  { name: '60-120s',   min: 60,   max: 120  },
+  { name: '120-300s',  min: 120,  max: 300  },
+  { name: '300-900s',  min: 300,  max: 900  },
+  { name: '900s+',     min: 900,  max: Infinity },
+];
+const MIN_BUCKET_TRADES_FOR_BUFFER = 8;   // need ≥8 closed trades in a band before we trust its avg-R
+const MIN_R_DELTA_FOR_SUGGESTION   = 0.20; // suggest only when an alt band beats the current by ≥0.20R
+const BUFFER_LOOKBACK_DAYS         = 30;
+
+function _bandFor(seconds) {
+  return BUFFER_BANDS.find(b => seconds >= b.min && seconds < b.max) || BUFFER_BANDS[BUFFER_BANDS.length - 1];
+}
+
+async function analyzeBufferPerformance(currentBufferSeconds = 75) {
+  // Pull closed day trades joined to their entry audit row (which carries the
+  // recovery_buffer_seconds we stamped at BUY time). Limit to 30 days so the
+  // analysis tracks recent regime behavior, not ancient history.
+  let rows;
+  try {
+    // Parameterised lookback (defensive — even though BUFFER_LOOKBACK_DAYS is
+    // currently a hardcoded constant, never interpolate into SQL on principle).
+    // The lateral join also includes a 7-day floor on entry-audit lookback so
+    // a long-held position whose original BUY happened months ago doesn't get
+    // attributed to the wrong (much older) buffer setting — guards against
+    // duplicate-BUY / split-fill audit edge cases flagged in code review.
+    const r = await db.query(`
+      SELECT
+        tm.regime,
+        tm.pnl_usd::float                                       AS pnl,
+        tm.entry_price::float                                   AS entry_price,
+        tm.qty::float                                           AS qty,
+        (a.payload->>'recovery_buffer_seconds')::int            AS buffer_at_entry
+      FROM trade_memory tm
+      LEFT JOIN LATERAL (
+        SELECT payload FROM audit_log
+         WHERE event_type='TRADE_EXECUTED' AND decision='BUY'
+           AND symbol = tm.symbol
+           AND payload->>'strategy' = 'day'
+           AND created_at <= tm.created_at
+           AND created_at >= tm.created_at - INTERVAL '7 days'
+         ORDER BY created_at DESC LIMIT 1
+      ) a ON TRUE
+      WHERE tm.strategy = 'day'
+        AND tm.created_at >= NOW() - ($1::int * INTERVAL '1 day')
+        AND a.payload IS NOT NULL
+        AND (a.payload->>'recovery_buffer_seconds') IS NOT NULL
+    `, [BUFFER_LOOKBACK_DAYS]);
+    rows = r.rows;
+  } catch (e) {
+    return { ok: false, reason: e.message, suggestions: [], buckets: [] };
+  }
+
+  if (!rows.length) {
+    return {
+      ok: true, sampleSize: 0, suggestions: [], buckets: [],
+      lookbackDays: BUFFER_LOOKBACK_DAYS,
+      currentSeconds: currentBufferSeconds,
+      currentBand: _bandFor(currentBufferSeconds).name,
+    };
+  }
+
+  // Group by (regime, band). Avg R uses the same 1%-notional proxy as the
+  // daily-perf service: R = pnl / (entry_price * qty * 0.01).
+  const grouped = new Map(); // key = `${regime}|${band.name}` → {sum_r, n, sum_pnl}
+  for (const row of rows) {
+    if (!Number.isFinite(row.entry_price) || !Number.isFinite(row.qty) || row.entry_price <= 0 || row.qty <= 0) continue;
+    const r = row.pnl / (row.entry_price * row.qty * 0.01);
+    const regime = row.regime || 'unknown';
+    const band = _bandFor(row.buffer_at_entry || 0);
+    const key = `${regime}|${band.name}`;
+    if (!grouped.has(key)) grouped.set(key, { regime, band: band.name, sum_r: 0, sum_pnl: 0, n: 0 });
+    const g = grouped.get(key);
+    g.sum_r += r; g.sum_pnl += row.pnl; g.n += 1;
+  }
+  const buckets = Array.from(grouped.values())
+    .map(g => ({ regime: g.regime, band: g.band, n: g.n, avg_r: +(g.sum_r / g.n).toFixed(3), total_pnl_usd: +g.sum_pnl.toFixed(2) }))
+    .sort((a, b) => a.regime.localeCompare(b.regime) || a.band.localeCompare(b.band));
+
+  // For each regime, find the best band (≥ MIN_BUCKET_TRADES_FOR_BUFFER) and
+  // compare it to the band the operator's CURRENT setting falls into.
+  const currentBand = _bandFor(currentBufferSeconds);
+  const byRegime = new Map();
+  for (const b of buckets) {
+    if (!byRegime.has(b.regime)) byRegime.set(b.regime, []);
+    byRegime.get(b.regime).push(b);
+  }
+  const suggestions = [];
+  for (const [regime, regimeBuckets] of byRegime) {
+    const eligible = regimeBuckets.filter(b => b.n >= MIN_BUCKET_TRADES_FOR_BUFFER);
+    if (eligible.length < 2) continue;
+    const best    = eligible.reduce((a, b) => b.avg_r > a.avg_r ? b : a);
+    const current = regimeBuckets.find(b => b.band === currentBand.name);
+    if (!current || current.n < MIN_BUCKET_TRADES_FOR_BUFFER) continue;
+    if (best.band === current.band) continue;
+    const delta = best.avg_r - current.avg_r;
+    if (delta < MIN_R_DELTA_FOR_SUGGESTION) continue;
+    // Suggest the midpoint of the winning band as a concrete value.
+    const winningBand = BUFFER_BANDS.find(b => b.name === best.band);
+    const suggestedSeconds = winningBand.max === Infinity ? 1200 : Math.round((winningBand.min + winningBand.max) / 2);
+    suggestions.push({
+      regime,
+      currentSeconds: currentBufferSeconds,
+      currentBand: current.band,
+      currentAvgR: current.avg_r,
+      currentSampleSize: current.n,
+      suggestedSeconds,
+      suggestedBand: best.band,
+      suggestedAvgR: best.avg_r,
+      suggestedSampleSize: best.n,
+      deltaR: +delta.toFixed(3),
+      headline: `In ${regime} regime, ${best.band} buffer improved avg R by +${delta.toFixed(2)} over current ${current.band} — suggest ${currentBufferSeconds}s → ${suggestedSeconds}s`,
+    });
+  }
+  suggestions.sort((a, b) => b.deltaR - a.deltaR);
+
+  return {
+    ok: true,
+    sampleSize: rows.length,
+    lookbackDays: BUFFER_LOOKBACK_DAYS,
+    minTradesPerBand: MIN_BUCKET_TRADES_FOR_BUFFER,
+    minDeltaR: MIN_R_DELTA_FOR_SUGGESTION,
+    currentSeconds: currentBufferSeconds,
+    currentBand: currentBand.name,
+    buckets,
+    suggestions,
+  };
+}
+
 async function getDashboardSummary() {
-  const [pending, applied, overlays] = await Promise.all([
+  const [pending, applied, overlays, portfolio] = await Promise.all([
     getProposals({ status: 'pending' }),
     getProposals({ status: 'applied', limit: 20 }),
     getActiveOverlays(),
+    db.getPortfolio().catch(() => null),
   ]);
+  const currentBuffer = Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
+    ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
+    : 75;
+  // Best-effort — buffer analysis must never fail the discovery summary.
+  let bufferAnalysis = { ok: false, suggestions: [], buckets: [] };
+  try { bufferAnalysis = await analyzeBufferPerformance(currentBuffer); }
+  catch (e) { bufferAnalysis = { ok: false, reason: e.message, suggestions: [], buckets: [] }; }
   return {
     pendingCount: pending.length, pending,
     appliedCount: applied.length,
     overlays,
     nextRefreshAt: _refreshAttemptedAt + REFRESH_TTL_MS,
     refreshIntervalMs: REFRESH_TTL_MS,
+    bufferAnalysis,
   };
 }
 
 module.exports = {
   refresh, getProposals, applyProposal, dismissProposal, revokeOverlay,
   checkOverlays, getActiveOverlays, getDashboardSummary,
+  analyzeBufferPerformance,
   _internal: {
     _generateVariationPopulation, _runVariation, _predicateFromDef,
     _signalToAuditShape, _loadActiveOverlays,

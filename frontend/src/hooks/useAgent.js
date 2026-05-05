@@ -227,5 +227,13 @@ export function useAgent() {
         return r;
       } finally { setLoad(`risk:${scale}`, false); }
     },
+    setRecoveryBuffer: async (seconds) => {
+      setLoad('recoveryBuffer', true);
+      try {
+        const r = await apiPost('/agent/recovery-buffer', { seconds: parseInt(seconds, 10) });
+        await refreshLogs();
+        return r;
+      } finally { setLoad('recoveryBuffer', false); }
+    },
   };
 }

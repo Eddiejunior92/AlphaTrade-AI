@@ -361,11 +361,26 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
     market, currency, fx_rate: fxToUsd,
   });
 
+  // Stamp the active recovery buffer on every BUY audit row. This is what
+  // the strategy-discovery layer mines later to recommend tuning the buffer
+  // per regime. Best-effort: a DB hiccup here just leaves the field absent
+  // (the discovery layer skips rows missing the field). Only meaningful on
+  // day-strategy BUYs but written for all so the audit shape stays uniform.
+  let _activeBuffer = null;
+  if (side === 'BUY') {
+    try {
+      const _p = await db.getPortfolio();
+      _activeBuffer = Number.isFinite(parseInt(_p?.day_trading_recovery_buffer_seconds))
+        ? parseInt(_p.day_trading_recovery_buffer_seconds)
+        : RECOVERY_BUFFER_DEFAULT;
+    } catch (_) { /* swallow — never block execution */ }
+  }
   await db.recordAudit({
     event_type: 'TRADE_EXECUTED', symbol, decision: side,
     confidence: signal?.confidence, models: signal?.models,
     payload: { qty, price, stop_loss, take_profit, pnl: usdPnl, native_pnl: nativePnl,
                reason, strategy, market, currency, fx_rate: fxToUsd,
+               ...(side === 'BUY' && _activeBuffer != null ? { recovery_buffer_seconds: _activeBuffer } : {}),
                // Persist ML + regime metadata on BUY so the SELL path can
                // train both the mlAdaptive and metaLearning layers on
                // the exact decision-time context.
@@ -1077,6 +1092,37 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
+    // -----------------------------------------------------------------------
+    // Day-trading recovery buffer — operator-tunable cooldown on same-symbol
+    // re-entries. Only applies to strategy='day' (swing & asx_swing trade on
+    // 15-Min bars where re-entry pacing is implicit). Reads the live setting
+    // from `portfolio.day_trading_recovery_buffer_seconds` so an operator
+    // change takes effect on the next cycle without restart. The buffer is
+    // STRICTLY ADDITIVE — when it fires the BUY is downgraded to HOLD via
+    // TRADE_REJECTED audit; it can never upgrade HOLD→BUY, lift confidence,
+    // bypass quorum, or relax any safety rail.
+    if (sc.name === 'day') {
+      const bufferSec = Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
+        ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
+        : RECOVERY_BUFFER_DEFAULT;
+      if (bufferSec > 0) {
+        const sinceClose = await _secondsSinceLastClose(symbol, sc.name);
+        if (sinceClose != null && sinceClose < bufferSec) {
+          await db.recordAudit({
+            event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+            confidence: signal.confidence,
+            payload: {
+              reason: 'recovery_buffer',
+              strategy: sc.name, market: info.market,
+              recovery_buffer_seconds: bufferSec,
+              seconds_since_last_close: sinceClose,
+            },
+          });
+          return;
+        }
+      }
+    }
+
     // Risk sizing happens entirely in USD-equivalent — that keeps the
     // single daily-loss budget and circuit breaker valid across markets.
     // For ASX, we feed the AUD price multiplied by the FX rate; the qty
@@ -1656,6 +1702,45 @@ async function setRiskScale(scaleName) {
   console.log(`[Agent] Risk scale: ${prev} → ${scaleName}`);
 }
 
+// Day-trading recovery buffer setter. Bounded to [0, 3600] seconds so an
+// operator can never lock the day strategy out for more than an hour or
+// flip it accidentally negative. Audited like every other policy change.
+const RECOVERY_BUFFER_MIN = 0;
+const RECOVERY_BUFFER_MAX = 3600;
+const RECOVERY_BUFFER_DEFAULT = 75;
+async function setRecoveryBuffer(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < RECOVERY_BUFFER_MIN || n > RECOVERY_BUFFER_MAX) {
+    throw new Error(`day_trading_recovery_buffer_seconds must be an integer in [${RECOVERY_BUFFER_MIN}, ${RECOVERY_BUFFER_MAX}]`);
+  }
+  const prevPort = await db.getPortfolio();
+  const prev = prevPort?.day_trading_recovery_buffer_seconds ?? RECOVERY_BUFFER_DEFAULT;
+  await db.updatePortfolio({ day_trading_recovery_buffer_seconds: n });
+  await db.recordAudit({
+    event_type: 'RECOVERY_BUFFER_CHANGED',
+    payload: { from: prev, to: n, min: RECOVERY_BUFFER_MIN, max: RECOVERY_BUFFER_MAX },
+  });
+  console.log(`[Agent] Day-trading recovery buffer: ${prev}s → ${n}s`);
+  return { prev, current: n };
+}
+
+// Look up the most recent close (trade_memory row) for a (symbol, strategy)
+// pair and return seconds elapsed. Returns null when there is no prior close
+// — i.e. the cooldown does not apply to a fresh symbol. Best-effort: any DB
+// error returns null so the gate fails OPEN (safer to allow than to wedge).
+async function _secondsSinceLastClose(symbol, strategy) {
+  try {
+    const { rows } = await db.query(
+      `SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::int AS secs
+         FROM trade_memory
+        WHERE symbol = $1 AND strategy = $2
+        ORDER BY created_at DESC LIMIT 1`,
+      [symbol, strategy]
+    );
+    return rows[0]?.secs ?? null;
+  } catch (_) { return null; }
+}
+
 async function setStrategyEnabled(strategyName, enabled) {
   const field = strategyName === 'day'       ? 'day_enabled'
               : strategyName === 'swing'     ? 'swing_enabled'
@@ -2038,6 +2123,15 @@ async function getAgentSnapshot() {
       effectiveBand,
     },
     riskScales: listRiskScales(),
+    recoveryBuffer: {
+      seconds: Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
+        ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
+        : RECOVERY_BUFFER_DEFAULT,
+      min: RECOVERY_BUFFER_MIN,
+      max: RECOVERY_BUFFER_MAX,
+      default: RECOVERY_BUFFER_DEFAULT,
+      appliesTo: 'day',
+    },
     strategies,
     providers: llmService.getProviderStatus(),
     watchlist: WATCHLIST,
@@ -2335,7 +2429,7 @@ module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
-  setStrategyEnabled, setTradingMode, setRiskScale, WATCHLIST,
+  setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, WATCHLIST,
   // Exposed for the /api/risk-capacity endpoint so it can compute on-demand
   // pre-warmup. Read-only USD price-lookup builder; identical logic to the
   // per-cycle path. Does NOT touch trading state.

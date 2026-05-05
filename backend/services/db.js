@@ -31,6 +31,13 @@ async function ensureSchema() {
   // every day without operator intervention; live operators must explicitly
   // reset via the dashboard.
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS auto_breaker_reset BOOLEAN NOT NULL DEFAULT TRUE`);
+  // Day-trading recovery buffer: minimum seconds between a position close
+  // (stop-out, take-profit, or manual flatten) and the next BUY for the SAME
+  // (symbol, strategy='day') pair. Prevents the agent from rage-re-entering a
+  // symbol that just chopped it. Operator-tunable; 75 s is a sane default
+  // that's wide enough to absorb a typical 1-Min flush and tight enough to
+  // not miss valid second-leg setups. Range guarded in setRecoveryBuffer.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS day_trading_recovery_buffer_seconds INTEGER NOT NULL DEFAULT 75`);
   // Trailing-stop tracking: highest price seen since entry, used to ratchet stop_loss UP.
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS highest_price NUMERIC(12,4)`);
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS trailing_armed BOOLEAN NOT NULL DEFAULT FALSE`);
@@ -477,6 +484,7 @@ const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'circuit_breaker', 'emergency_pause', 'agent_running',
   'day_enabled', 'swing_enabled', 'asx_swing_enabled', 'trading_mode', 'risk_scale',
   'auto_breaker_reset',
+  'day_trading_recovery_buffer_seconds',
 ]);
 
 async function updatePortfolio(updates) {
