@@ -260,7 +260,11 @@ function MarketCard({ card }) {
                 </span>
               </div>
               <div className="text-[9px] text-[var(--text-dim)] mt-0.5">
-                {sent.cached ? 'cached' : 'fresh'} · Grok
+                {sent.cached ? 'cached' : 'fresh'} · {
+                  sent.providersValid != null
+                    ? `${sent.providersValid}/${sent.providersTotal} AI`
+                    : 'AI'
+                }
               </div>
             </>
           ) : (

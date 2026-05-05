@@ -1,15 +1,64 @@
-// Grok-powered news sentiment for watchlist symbols.
-// Cached per-symbol with TTL to keep token spend modest and latency low.
+// Multi-AI ensemble news sentiment for watchlist symbols.
+//
+// For each symbol we fan out to three independent LLMs in parallel:
+//   • Grok 4 Fast       (xAI direct)        — real-time news + social channel specialist
+//   • Claude 3.7 Sonnet (OpenRouter)        — careful narrative reasoning
+//   • GPT-4o            (OpenRouter)        — generalist cross-check
+//
+// Each model returns a JSON payload (news_score, social_score, score, summary,
+// social_summary, insights[], sources[]). We then blend numeric scores
+// (mean of all responding providers) and merge text fields into a single
+// robust output that downstream consumers see exactly as before — same shape,
+// same caching, same TTL — plus an extra `providers` array listing which
+// models actually contributed.
 const axios = require('axios');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
-const MODEL = process.env.GROK_SENTIMENT_MODEL || 'grok-4-fast-non-reasoning';
-const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '600') * 1000; // 10 min default — keep tighter so each vote sees recent news + social
-const TIMEOUT_MS = 12000;
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '600') * 1000; // 10 min default
+const TIMEOUT_MS = 15000;
 // Cap is sized for the full US (30) + ASX (27) universe with headroom; bumped
 // from 64 → 128 when the watchlist expanded so no entry gets evicted under
 // normal operation.
 const MAX_CACHE = parseInt(process.env.SENTIMENT_CACHE_MAX || '128');
+// Minimum providers that must respond with valid JSON for us to publish a
+// "fresh" blended payload. With 3 providers, requiring 1 keeps us resilient
+// to a single upstream outage but flags single-source results as such.
+// Clamped to [1, PROVIDERS.length] at module init so a misconfigured env var
+// (e.g. "0", empty, or "abc") can never silently bypass the insufficient-
+// provider guard and publish a fake "fresh" payload during a full outage.
+const _rawMin = parseInt(process.env.SENTIMENT_MIN_PROVIDERS || '1');
+
+// Three-model ensemble. `id` shows up in the blended payload's `providers`
+// array; `provider` selects the HTTP transport (xai vs openrouter).
+// NOTE: declared before MIN_PROVIDERS clamp so we can use PROVIDERS.length.
+const PROVIDERS = [
+  {
+    id: 'grok',
+    label: 'Grok 4 Fast',
+    provider: 'xai',
+    model: process.env.GROK_SENTIMENT_MODEL || 'grok-4-fast-non-reasoning',
+  },
+  {
+    id: 'claude',
+    label: 'Claude 3.7 Sonnet',
+    provider: 'openrouter',
+    model: 'anthropic/claude-3.7-sonnet',
+  },
+  {
+    id: 'gpt4o',
+    label: 'GPT-4o',
+    provider: 'openrouter',
+    model: 'openai/gpt-4o',
+  },
+];
+
+// Clamp into [1, PROVIDERS.length]. NaN / 0 / negative all collapse to 1 so
+// the insufficient-provider guard in blendProviderResults() can never be
+// silently bypassed by a misconfigured env var.
+const MIN_PROVIDERS = Number.isFinite(_rawMin)
+  ? Math.max(1, Math.min(PROVIDERS.length, _rawMin))
+  : 1;
 
 // LRU cache (symbol → { ts, data }) — Map iteration order = insertion order, so
 // touching = delete+re-set keeps recently-used items at the tail; evict from head.
@@ -35,11 +84,15 @@ function touchCache(sym, entry) {
 function defaultPayload(symbol, reason) {
   return {
     symbol,
-    score: 0,            // -1 .. +1
+    score: 0,
     label: 'neutral',
+    news_score: 0,
+    social_score: 0,
     summary: reason || 'No recent news available.',
+    social_summary: '',
     insights: [],
     sources: [],
+    providers: [],
     cached: false,
     fetchedAt: new Date().toISOString(),
     stale: true,
@@ -60,32 +113,28 @@ function clamp(v) {
   return +Math.max(-1, Math.min(1, n)).toFixed(2);
 }
 
-function sanitize(obj, symbol) {
-  if (!obj || typeof obj !== 'object') return defaultPayload(symbol, 'Malformed response');
-  // Combined score (back-compat). New: separate news_score + social_score.
-  const newsScore   = clamp(obj.news_score);
+// Per-provider response → normalised, score-only object. We delay text
+// merging until blendProviderResults() so we keep each provider's full text.
+function parseProviderJson(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const newsScore = clamp(obj.news_score);
   const socialScore = clamp(obj.social_score);
   let score = clamp(obj.score);
   if (score == null) {
-    if (newsScore != null && socialScore != null) score = +((newsScore * 0.6 + socialScore * 0.4)).toFixed(2);
-    else score = newsScore != null ? newsScore : (socialScore != null ? socialScore : 0);
+    if (newsScore != null && socialScore != null) {
+      score = +((newsScore * 0.6 + socialScore * 0.4)).toFixed(2);
+    } else {
+      score = newsScore != null ? newsScore : (socialScore != null ? socialScore : 0);
+    }
   }
-  const insights = Array.isArray(obj.insights) ? obj.insights.slice(0, 3).map(s => String(s).slice(0, 160)) : [];
-  const sources = Array.isArray(obj.sources) ? obj.sources.slice(0, 3).map(s => String(s).slice(0, 80)) : [];
-  const social_summary = String(obj.social_summary || '').slice(0, 200);
   return {
-    symbol,
-    score,
-    label: classify(score),
     news_score: newsScore,
     social_score: socialScore,
+    score,
     summary: String(obj.summary || '').slice(0, 280),
-    social_summary,
-    insights,
-    sources,
-    cached: false,
-    fetchedAt: new Date().toISOString(),
-    stale: false,
+    social_summary: String(obj.social_summary || '').slice(0, 200),
+    insights: Array.isArray(obj.insights) ? obj.insights.slice(0, 3).map(s => String(s).slice(0, 160)) : [],
+    sources: Array.isArray(obj.sources) ? obj.sources.slice(0, 3).map(s => String(s).slice(0, 80)) : [],
   };
 }
 
@@ -110,46 +159,197 @@ Respond with ONLY valid JSON (no markdown, no prose):
 If you genuinely have no real recent information, return all scores at 0 with summary "no notable recent news".`;
 }
 
-async function fetchFresh(symbol) {
+// Robust JSON extraction — prefer response_format JSON, fall back to regex if
+// a provider returned markdown-wrapped output.
+function extractJson(text) {
+  if (!text) return null;
+  try { return JSON.parse(text); } catch {}
+  const m = text.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  return null;
+}
+
+async function callXai(provider, prompt) {
   const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
-  if (!key) return defaultPayload(symbol, 'XAI_API_KEY not configured');
+  if (!key) return { id: provider.id, ok: false, reason: 'XAI_API_KEY missing' };
   try {
     const res = await axios.post(
       XAI_URL,
       {
-        model: MODEL,
-        messages: [{ role: 'user', content: buildPrompt(symbol) }],
+        model: provider.model,
+        messages: [{ role: 'user', content: prompt }],
         max_tokens: 400,
         temperature: 0.2,
         response_format: { type: 'json_object' },
       },
       { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: TIMEOUT_MS }
     );
-    const text = res.data?.choices?.[0]?.message?.content || '{}';
-    let parsed;
-    try { parsed = JSON.parse(text); }
-    catch {
-      // Strip code-fence/markdown if Grok ignored response_format hint.
-      const m = text.match(/\{[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : null;
-    }
-    return sanitize(parsed, symbol);
+    const text = res.data?.choices?.[0]?.message?.content || '';
+    const parsed = parseProviderJson(extractJson(text));
+    if (!parsed) return { id: provider.id, ok: false, reason: 'malformed JSON' };
+    return { id: provider.id, label: provider.label, ok: true, ...parsed };
   } catch (e) {
-    console.error(`[Sentiment:${symbol}]`, e.response?.data?.error?.message || e.message);
-    return defaultPayload(symbol, `Fetch failed: ${e.message}`);
+    return { id: provider.id, ok: false, reason: e.response?.data?.error?.message || e.message };
   }
+}
+
+async function callOpenRouter(provider, prompt) {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) return { id: provider.id, ok: false, reason: 'OPENROUTER_API_KEY missing' };
+  try {
+    const res = await axios.post(
+      OPENROUTER_URL,
+      {
+        model: provider.model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 400,
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'HTTP-Referer': 'https://alphatrade.replit.app',
+          'X-Title': 'AlphaTrade AI',
+          'Content-Type': 'application/json',
+        },
+        timeout: TIMEOUT_MS,
+      }
+    );
+    const text = res.data?.choices?.[0]?.message?.content || '';
+    const parsed = parseProviderJson(extractJson(text));
+    if (!parsed) return { id: provider.id, ok: false, reason: 'malformed JSON' };
+    return { id: provider.id, label: provider.label, ok: true, ...parsed };
+  } catch (e) {
+    return { id: provider.id, ok: false, reason: e.response?.data?.error?.message || e.message };
+  }
+}
+
+function callProvider(provider, prompt) {
+  if (provider.provider === 'xai') return callXai(provider, prompt);
+  if (provider.provider === 'openrouter') return callOpenRouter(provider, prompt);
+  return Promise.resolve({ id: provider.id, ok: false, reason: 'unknown provider' });
+}
+
+// Mean of defined values (skip nulls). Returns null if no values supplied.
+function mean(values) {
+  const ns = values.filter(v => Number.isFinite(v));
+  if (!ns.length) return null;
+  return +(ns.reduce((a, b) => a + b, 0) / ns.length).toFixed(2);
+}
+
+// Pick the longest non-empty string — keeps the most informative summary
+// rather than averaging text. Trims at 280 chars.
+function bestText(strings, max = 280) {
+  const candidates = strings.filter(s => s && s.trim() && !/^no\s+(notable|recent)/i.test(s.trim()));
+  if (!candidates.length) {
+    const any = strings.find(s => s && s.trim());
+    return any ? any.slice(0, max) : '';
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0].slice(0, max);
+}
+
+// Dedupe an array of short strings (case-insensitive), preserve insertion order.
+function dedupe(strings, max) {
+  const seen = new Set();
+  const out = [];
+  for (const s of strings) {
+    if (!s) continue;
+    const k = s.toLowerCase().trim();
+    if (k && !seen.has(k)) { seen.add(k); out.push(s); }
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+// Combine the per-provider parsed results into one blended payload.
+// Numeric scores: arithmetic mean across responding providers.
+// Text:           pick the longest non-trivial summary/social_summary.
+// Lists:          concat + dedupe (insights up to 3, sources up to 5).
+function blendProviderResults(symbol, providerResults) {
+  const ok = providerResults.filter(r => r.ok);
+  if (ok.length < MIN_PROVIDERS) {
+    const reasons = providerResults.map(r => `${r.id}:${r.reason || 'no data'}`).join(', ');
+    // Degraded payload still carries provider-count metadata so the UI /
+    // telemetry can distinguish "all 3 providers down" from "no data yet".
+    return {
+      ...defaultPayload(symbol, `Ensemble unavailable (${reasons})`),
+      providers: [],
+      providersValid: 0,
+      providersTotal: PROVIDERS.length,
+    };
+  }
+
+  const blendedNews   = mean(ok.map(r => r.news_score));
+  const blendedSocial = mean(ok.map(r => r.social_score));
+  let blendedScore    = mean(ok.map(r => r.score));
+  if (blendedScore == null) {
+    if (blendedNews != null && blendedSocial != null) {
+      blendedScore = +((blendedNews * 0.6 + blendedSocial * 0.4)).toFixed(2);
+    } else {
+      blendedScore = blendedNews != null ? blendedNews : (blendedSocial != null ? blendedSocial : 0);
+    }
+  }
+
+  const summary        = bestText(ok.map(r => r.summary));
+  const social_summary = bestText(ok.map(r => r.social_summary), 200);
+  const insights       = dedupe(ok.flatMap(r => r.insights || []), 3);
+  const sources        = dedupe(ok.flatMap(r => r.sources || []), 5);
+
+  return {
+    symbol,
+    score: blendedScore,
+    label: classify(blendedScore),
+    news_score: blendedNews,
+    social_score: blendedSocial,
+    summary: summary || 'no notable recent news',
+    social_summary,
+    insights,
+    sources,
+    // Per-model breakdown so the UI / debugging can show which providers
+    // contributed and what each one independently said.
+    providers: ok.map(r => ({
+      id: r.id,
+      label: r.label,
+      score: r.score,
+      news_score: r.news_score,
+      social_score: r.social_score,
+      summary: r.summary,
+    })),
+    providersValid: ok.length,
+    providersTotal: PROVIDERS.length,
+    cached: false,
+    fetchedAt: new Date().toISOString(),
+    stale: false,
+  };
+}
+
+async function fetchFresh(symbol) {
+  const prompt = buildPrompt(symbol);
+  // Fan out to all providers in parallel; allSettled so one slow/failed
+  // upstream never drags down the others.
+  const settled = await Promise.allSettled(PROVIDERS.map(p => callProvider(p, prompt)));
+  const results = settled.map((s, i) =>
+    s.status === 'fulfilled'
+      ? s.value
+      : { id: PROVIDERS[i].id, ok: false, reason: s.reason?.message || 'rejected' }
+  );
+  const failed = results.filter(r => !r.ok);
+  if (failed.length) {
+    console.warn(`[Sentiment:${symbol}] ${failed.length}/${PROVIDERS.length} providers failed: ` +
+      failed.map(r => `${r.id}=${r.reason}`).join('; '));
+  }
+  return blendProviderResults(symbol, results);
 }
 
 async function getSentiment(symbol, { force = false } = {}) {
   const sym = String(symbol).toUpperCase();
   const cached = cache.get(sym);
   if (!force && cached && Date.now() - cached.ts < TTL_MS) {
-    // Touch for LRU recency.
     touchCache(sym, cached);
     return { ...cached.data, cached: true };
   }
-  // In-flight dedupe: if another caller is already fetching this symbol,
-  // await their promise instead of issuing a duplicate Grok request.
   if (inflight.has(sym)) return inflight.get(sym);
 
   const p = (async () => {
@@ -165,15 +365,12 @@ async function getSentiment(symbol, { force = false } = {}) {
   return p;
 }
 
-// Pre-fetch many symbols in parallel with bounded concurrency (avoid Grok
-// rate-limit). Guarded by a global lock so a slow batch never overlaps with
-// the next cycle's batch — at most one refresh runs at a time.
-async function getSentimentBatch(symbols, { concurrency = 4 } = {}) {
-  // Coalesce overlapping batch calls onto a single in-flight promise. Per-
-  // symbol getSentiment() already does its own inflight-dedupe, so the
-  // worst-case overlap is a no-op rather than a duplicate Grok request — but
-  // returning the shared promise means the caller actually gets the data
-  // instead of an empty {} (which previously caused silent missed refreshes).
+// Pre-fetch many symbols in parallel with bounded concurrency. Per-symbol
+// getSentiment() already does inflight-dedupe; the batch-level promise here
+// coalesces multiple overlapping callers (agent cycle + boot refresh +
+// /api/markets backfill) so the second caller awaits the first instead of
+// getting an empty {} back.
+async function getSentimentBatch(symbols, { concurrency = 3 } = {}) {
   if (batchInflight) return batchInflight;
   const run = (async () => {
     const out = {};
@@ -207,4 +404,8 @@ function getAllCached() {
 
 function clearCache() { cache.clear(); }
 
-module.exports = { getSentiment, getSentimentBatch, getCached, getAllCached, clearCache, classify };
+function getProviders() {
+  return PROVIDERS.map(p => ({ id: p.id, label: p.label, provider: p.provider, model: p.model }));
+}
+
+module.exports = { getSentiment, getSentimentBatch, getCached, getAllCached, clearCache, classify, getProviders, PROVIDERS };

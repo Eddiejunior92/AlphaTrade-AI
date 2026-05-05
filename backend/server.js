@@ -513,7 +513,7 @@ app.get('/api/markets', async (req, res) => {
     // Fire-and-forget — the Promise never blocks the response.
     const missing = watchlist.filter(s => !sents[s]);
     if (missing.length) {
-      sentimentService.getSentimentBatch(missing, { concurrency: 4 })
+      sentimentService.getSentimentBatch(missing, { concurrency: 3 })
         .catch(e => console.error('[Sentiment] Backfill error:', e.message));
     }
 
@@ -888,7 +888,7 @@ server.listen(PORT, '0.0.0.0', () => {
       const wl = getCombinedWatchlist();
       if (!wl.length) return;
       console.log(`[Sentiment] Bootstrap/refresh for ${wl.length} symbols...`);
-      await sentimentService.getSentimentBatch(wl, { concurrency: 4 });
+      await sentimentService.getSentimentBatch(wl, { concurrency: 3 });
       console.log(`[Sentiment] Cache populated (${Object.keys(sentimentService.getAllCached()).length} entries).`);
     } catch (e) {
       console.error('[Sentiment] Bootstrap error:', e.message);

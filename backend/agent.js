@@ -653,7 +653,7 @@ async function runCycle() {
     // Refresh news sentiment for the FULL watchlist (US + ASX). Cached;
     // failure never blocks trading.
     const allWatchlistSymbols = [...new Set([...WATCHLIST, ...asxWatchlist])];
-    sentimentService.getSentimentBatch(allWatchlistSymbols, { concurrency: 4 })
+    sentimentService.getSentimentBatch(allWatchlistSymbols, { concurrency: 3 })
       .catch(e => console.error('[Agent] Sentiment refresh error:', e.message));
 
     if (portfolio.swing_enabled || portfolio.asx_swing_enabled) {
