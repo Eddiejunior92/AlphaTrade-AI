@@ -92,6 +92,12 @@ function MarketCard({ card }) {
   // X-axis ticks:
   //   1d → top of each ET hour inside the data range (avoids overnight gaps).
   //   5d → first bar of each unique ET calendar day (one label per session).
+  // Timezone follows the card's market — ASX charts render in Sydney time
+  // (so a chart for an ASX-listed name shows that exchange's session hours)
+  // and US charts stay in New York time. tzLabel is appended to the tooltip
+  // so operators can see at a glance which exchange clock they're reading.
+  const chartTz    = market === 'ASX' ? 'Australia/Sydney' : 'America/New_York';
+  const tzLabel    = market === 'ASX' ? 'AEST/AEDT' : 'ET';
   const xTicks = (() => {
     if (series.length < 2) return [];
     if (range === '1d') {
@@ -101,11 +107,12 @@ function MarketCard({ card }) {
       for (let t = start; t <= series[series.length - 1].t; t += stepMs) ticks.push(t);
       return ticks;
     }
-    // 5d: one tick per unique ET date — picks the first bar of each session.
+    // 5d: one tick per unique session date in the chart's local TZ — picks
+    // the first bar of each session.
     const seen = new Set();
     const ticks = [];
     for (const pt of series) {
-      const key = new Date(pt.t).toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+      const key = new Date(pt.t).toLocaleDateString('en-US', { timeZone: chartTz });
       if (!seen.has(key)) { seen.add(key); ticks.push(pt.t); }
     }
     return ticks;
@@ -113,11 +120,11 @@ function MarketCard({ card }) {
   const xTickFmt = (v) => {
     if (range === '1d') {
       return new Date(v).toLocaleTimeString('en-US', {
-        timeZone: 'America/New_York', hour: 'numeric', hour12: true,
+        timeZone: chartTz, hour: 'numeric', hour12: true,
       }).replace(/\s/g, '').toLowerCase();
     }
     return new Date(v).toLocaleDateString('en-US', {
-      timeZone: 'America/New_York', month: 'numeric', day: 'numeric',
+      timeZone: chartTz, month: 'numeric', day: 'numeric',
     });
   };
   const yTickFmt = (v) => `${csym}${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`;
@@ -207,7 +214,7 @@ function MarketCard({ card }) {
                   background: 'rgba(20,20,22,0.95)', border: '1px solid rgba(255,255,255,0.1)',
                   borderRadius: 12, fontSize: 11, padding: '6px 10px', color: '#fff',
                 }}
-                labelFormatter={(v) => new Date(v).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' ET'}
+                labelFormatter={(v) => new Date(v).toLocaleString('en-US', { timeZone: chartTz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true }) + ' ' + tzLabel}
                 formatter={(v) => [`${csym}${fmtPrice(v)}`, 'Price']}
               />
               <Area
@@ -227,7 +234,7 @@ function MarketCard({ card }) {
           </span>
           {lastBarAt && (
             <span className="ml-2 opacity-60">
-              · last bar {new Date(lastBarAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+              · last bar {new Date(lastBarAt).toLocaleString('en-US', { timeZone: chartTz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} {tzLabel}
             </span>
           )}
         </div>
