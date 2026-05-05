@@ -38,7 +38,7 @@ const MODELS = [
 
 const MIN_VALID_MODELS = parseInt(process.env.MIN_VALID_MODELS || '3');
 
-function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta }) {
+function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights, priorMeta, causalContext, counterfactualContext }) {
   // Compact upgrade blocks — informational only, never override quorum/gate.
   const adaptiveBlock = adaptiveHints ? `\n${adaptiveHints}\n` : '';
   const portRiskBlock = portfolioRisk ? `\n${portfolioRisk}\n` : '';
@@ -69,11 +69,19 @@ function buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, por
   // Prior cycle's meta-reasoner opinion (if any). Models can see and
   // disagree with the prior take — useful context, not gospel.
   const metaBlock = priorMeta ? `\n${priorMeta}\n` : '';
+  // Causal-inference graph for the current (strategy × regime × market)
+  // context — top features that historically *cause* (per spurious-filtered
+  // lift) higher or lower win-rate. Strictly informational.
+  const causalBlock = causalContext ? `\n${causalContext}\n` : '';
+  // Counterfactual replay summary — "what if we tightened the gate / required
+  // 4/4 quorum / required meta-agreement" over recent closes. Informational
+  // only; the live rules are not changed by this layer.
+  const cfBlock = counterfactualContext ? `\n${counterfactualContext}\n` : '';
   // Long-term knowledge-graph block — slow-moving per-symbol context
   // (sector peers, earnings track, valuation, macro, major events).
   // Informational; never overrides quorum/gate/sizing.
   const knowledgeBlock = knowledgeContext ? `\n${knowledgeContext}\n` : '';
-  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${knowledgeBlock}`;
+  const upgradeContext = `${adaptiveBlock}${portRiskBlock}${flowLine}${optsLine}${optFlowLine}${earnLine}${regimeBlock}${macroBlock}${simBlock}${weightsBlock}${metaBlock}${causalBlock}${cfBlock}${knowledgeBlock}`;
   // 20-year historical intelligence (cached, refreshed once/day before open).
   // Already a pre-rendered text block — null when cache isn't warm yet.
   const historicalBlock = historical ? `\n${historical}\n` : '';
@@ -327,7 +335,7 @@ async function queryModel(model, prompt) {
   return null;
 }
 
-async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market }) {
+async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, regime, market, causalContext, counterfactualContext }) {
   // ---------------------------------------------------------------------
   // STEP 1 — Resolve dynamic per-model weights for this (strategy, regime,
   // market) context. Cold-start safe (uniform 1.0). Failures degrade to
@@ -351,7 +359,7 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
   // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
   // ---------------------------------------------------------------------
   const calls = MODELS.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext }))
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

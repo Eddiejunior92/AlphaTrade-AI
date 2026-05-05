@@ -174,6 +174,26 @@ async function ensureSchema() {
     )
   `);
 
+  // Causal inference + counterfactual reasoning layer (causalInferenceService
+  // + counterfactualService). Per (strategy × regime × market) we mine the
+  // closed-trade history to identify which decision-time features have a
+  // *real* lift on win-rate (vs spurious correlations under a sample-size
+  // floor) and what the aggregate P&L would have been under a few canned
+  // decision-rule counterfactuals (tighter conf gate, stricter quorum, skip
+  // adverse regimes, etc.). Single JSONB blob per context bucket; refreshed
+  // on a slow cadence. Strictly informational — quorum/gate/breaker untouched.
+  await query(`
+    CREATE TABLE IF NOT EXISTS causal_insights (
+      strategy   TEXT NOT NULL,
+      regime     TEXT NOT NULL,
+      market     TEXT NOT NULL,
+      payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+      n_closes   INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (strategy, regime, market)
+    )
+  `);
+
   // Backtest runs — full history of dashboard-launched backtests with their
   // params, equity curve, and trade log. Used for the Backtest tab.
   await query(`

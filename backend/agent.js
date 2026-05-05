@@ -28,6 +28,8 @@ const optionsFlowService = require('./services/optionsFlowService');
 const macroFactorService = require('./services/macroFactorService');
 const macroForecastService = require('./services/macroForecastService');
 const scenarioSimService = require('./services/scenarioSimService');
+const causalInference = require('./services/causalInferenceService');
+const counterfactual = require('./services/counterfactualService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -642,6 +644,21 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     if (sim?.ok) scenarioSim = scenarioSimService.renderForPrompt(sim);
   } catch (_) {}
 
+  // Causal-inference + counterfactual context for THIS (strategy × regime ×
+  // market) bucket. Both are cached graphs refreshed on a 30-min cadence by
+  // the boot-time scheduler below. Strictly informational — neither layer
+  // can change the consensus, the gate, the size, or the breaker. Failures
+  // here degrade silently to null blocks (LLMs simply don't see them).
+  let causalContext = null, counterfactualContext = null;
+  try {
+    const g = await causalInference.getGraph({ strategy: sc.name, regime, market: info.market });
+    causalContext = causalInference.renderForPrompt(g);
+  } catch (_) {}
+  try {
+    const r = await counterfactual.getResults({ strategy: sc.name, regime, market: info.market });
+    counterfactualContext = counterfactual.renderForPrompt(r);
+  } catch (_) {}
+
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
   let earningsSignal = null;
@@ -662,6 +679,8 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // Dynamic-weighting + meta-reasoner context. Both are strictly
     // informational; raw quorum + confidence gate retain full veto.
     regime, market: info.market,
+    // Causal + counterfactual prompt blocks. Pre-rendered text or null.
+    causalContext, counterfactualContext,
   });
 
   // Pre-compute ML features here too so the SIGNAL audit always carries them
@@ -691,7 +710,12 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       weighted_votes: signal.weightedVotes,
       ensemble_weights: signal.weights,
       weight_context: signal.weightContext,
-      meta_opinion: signal.meta },
+      meta_opinion: signal.meta,
+      // Compact tags for the dashboard so it can show "this signal saw a
+      // causal block" / "saw a counterfactual hint" without re-resolving
+      // the whole context bucket.
+      causal_seen: !!causalContext,
+      counterfactual_seen: !!counterfactualContext },
   });
 
   // Tag signal with market+currency so the dashboard can filter US vs ASX
@@ -1466,6 +1490,27 @@ setTimeout(() => {
     .catch(e => console.error('[Macro] Startup forecast failed:', e.message));
 }, 75_000);
 scheduleMacroForecastRefresh();
+
+// Causal-inference + counterfactual warm-up — delayed 90s so the audit_log
+// + trades joins don't pile on with the other startup queries. Runs once at
+// startup, then every 30 min. Both refreshes are independent, mutually
+// non-blocking, and silently swallow failures so a learning hiccup can
+// never break the trading loop.
+setTimeout(() => {
+  // force:true so the warm-up call always runs even though the module-load
+  // timestamp would otherwise throttle it. The interval below uses the
+  // default (non-forced) TTL-gated path so re-entrancy stays safe.
+  causalInference.refresh({ force: true })
+    .then(r => console.log(`[Causal] Startup refresh: built ${r.bucketsBuilt} buckets from ${r.totalCloses} closes`))
+    .catch(e => console.error('[Causal] Startup refresh failed:', e.message));
+  counterfactual.refresh({ force: true })
+    .then(r => console.log(`[Counterfactual] Startup refresh: built ${r.bucketsBuilt} buckets from ${r.totalCloses} closes`))
+    .catch(e => console.error('[Counterfactual] Startup refresh failed:', e.message));
+}, 90_000);
+setInterval(() => {
+  causalInference.refresh().catch(() => {});
+  counterfactual.refresh().catch(() => {});
+}, 30 * 60 * 1000);
 
 (async () => {
   try {

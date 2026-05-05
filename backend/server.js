@@ -330,6 +330,8 @@ const optionsFlowService = require('./services/optionsFlowService');
 const macroForecastService = require('./services/macroForecastService');
 const scenarioSimService = require('./services/scenarioSimService');
 const llmWeightingService = require('./services/llmWeightingService');
+const causalInferenceService = require('./services/causalInferenceService');
+const counterfactualService = require('./services/counterfactualService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -467,6 +469,48 @@ app.get('/api/llm-weights', async (req, res) => {
       llmWeightingService.getDashboardSummary(),
     ]);
     res.json({ ...snap, summary, prompt: llmWeightingService.renderForPrompt(snap) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Causal-inference graph introspection. Returns the per-(strategy, regime,
+// market) graph of feature → outcome edges (lift on win-rate, sample sizes,
+// confidence tier, spurious filter). Read-only.
+app.get('/api/causal-insights', async (req, res) => {
+  try {
+    const strategy = String(req.query.strategy || 'day');
+    const regime = String(req.query.regime || 'unknown');
+    const market = String(req.query.market || 'US').toUpperCase();
+    const [graph, summary] = await Promise.all([
+      causalInferenceService.getGraph({ strategy, regime: { primary: regime }, market }),
+      causalInferenceService.getDashboardSummary(),
+    ]);
+    res.json({
+      strategy, regime, market,
+      graph: graph || null,
+      prompt: causalInferenceService.renderForPrompt(graph),
+      summary,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Counterfactual-replay introspection. Returns the per-(strategy, regime,
+// market) results for the canned decision-rule counterfactuals (tighter
+// confidence gate, stricter quorum, skip adverse regimes, etc.). Read-only.
+app.get('/api/counterfactuals', async (req, res) => {
+  try {
+    const strategy = String(req.query.strategy || 'day');
+    const regime = String(req.query.regime || 'unknown');
+    const market = String(req.query.market || 'US').toUpperCase();
+    const [bucket, summary] = await Promise.all([
+      counterfactualService.getResults({ strategy, regime: { primary: regime }, market }),
+      counterfactualService.getDashboardSummary(),
+    ]);
+    res.json({
+      strategy, regime, market,
+      bucket: bucket || null,
+      prompt: counterfactualService.renderForPrompt(bucket),
+      summary,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
