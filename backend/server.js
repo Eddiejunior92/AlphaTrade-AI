@@ -978,6 +978,29 @@ app.get('/api/adaptive/performance', async (_req, res) => {
 let adaptiveRecomputeInFlight = false;
 let lastAdaptiveRecomputeAt = 0;
 const ADAPTIVE_RECOMPUTE_COOLDOWN_MS = 60_000;
+// =============================================================================
+// Daily performance report — manual trigger (auto-runs nightly at 21:30 UTC).
+// Operator-gated; fully idempotent (UPSERTs the daily_performance row for the
+// requested date). `sendDiscord=false` lets an operator preview the summary
+// without firing the webhook.
+// =============================================================================
+const dailyPerformanceService = require('./services/dailyPerformanceService');
+const { perfMetrics: agentPerfMetrics } = require('./agent');
+app.post('/api/performance/daily', requireOperator, async (req, res) => {
+  try {
+    const tradingDate = req.body?.tradingDate || req.query?.tradingDate || null;
+    const sendDiscord = req.body?.sendDiscord !== false && req.query?.sendDiscord !== 'false';
+    const r = await dailyPerformanceService.runDailyPerformanceJob({
+      tradingDate, perfMetrics: agentPerfMetrics, sendDiscord,
+    });
+    // Orchestrator never throws — surface its structured status verbatim.
+    res.status(r.success ? 200 : 500).json(r);
+  } catch (e) {
+    console.error('[DailyPerf] Manual run failed:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.post('/api/adaptive/recompute', requireOperatorStrictGate, async (req, res) => {
   if (adaptiveRecomputeInFlight) return res.status(429).json({ error: 'Adaptive recompute already running.' });
   const since = Date.now() - lastAdaptiveRecomputeAt;

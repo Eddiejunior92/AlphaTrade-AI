@@ -7,6 +7,7 @@ const brokerRouter = require('./services/brokerRouter');
 const marketRegistry = require('./services/marketRegistry');
 const fxService = require('./services/fxService');
 const discordService = require('./services/discordService');
+const dailyPerformanceService = require('./services/dailyPerformanceService');
 const riskManager = require('./services/riskManager');
 const sentimentService = require('./services/sentimentService');
 const fundamentalsService = require('./services/fundamentalsService');
@@ -1743,6 +1744,28 @@ function scheduleAdaptiveRecompute() {
   }, next - now);
 }
 
+// Daily performance report — runs at 21:30 UTC (~16:30 ET, 30 min after US
+// close so SELL ladders settle and trade_memory rows land). Computes per-
+// market stats, stores the row in daily_performance, and sends a formatted
+// Discord summary. Best-effort: any error logs and reschedules for tomorrow.
+let dailyPerfHandle = null;
+function scheduleDailyPerformanceReport() {
+  if (dailyPerfHandle) clearTimeout(dailyPerfHandle);
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(21, 30, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  dailyPerfHandle = setTimeout(async () => {
+    try {
+      const r = await dailyPerformanceService.runDailyPerformanceJob({ perfMetrics });
+      console.log(`[DailyPerf] Auto-run: US=${r.summary.us.n_trades}t $${r.summary.us.net_pnl_usd.toFixed(2)} | ASX=${r.summary.asx.n_trades}t $${r.summary.asx.net_pnl_usd.toFixed(2)} | discord=${r.discordSent ? 'sent' : 'skipped/failed'}`);
+    } catch (e) {
+      console.error('[DailyPerf] Auto-run failed:', e.message);
+    }
+    scheduleDailyPerformanceReport();
+  }, next - now);
+}
+
 let optionsActivityHandle = null;
 function scheduleOptionsActivityRefresh() {
   if (optionsActivityHandle) clearInterval(optionsActivityHandle);
@@ -2027,6 +2050,7 @@ async function getAgentSnapshot() {
 scheduleDailyReset();
 scheduleDailyIntelligence();
 scheduleAdaptiveRecompute();
+scheduleDailyPerformanceReport();
 scheduleOptionsActivityRefresh();
 scheduleDailyKnowledgeGraph();
 // Boot-time non-blocking warm-up — kicks off the first refresh once the
