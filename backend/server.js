@@ -326,6 +326,7 @@ const mlAdaptive = require('./services/mlAdaptiveService');
 const metaLearning = require('./services/metaLearningService');
 const knowledgeGraph = require('./services/knowledgeGraphService');
 const rlExecution = require('./services/rlExecutionService');
+const optionsFlowService = require('./services/optionsFlowService');
 const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 
@@ -419,6 +420,23 @@ app.get('/api/knowledge', async (_req, res) => {
 app.get('/api/rl/execution', async (_req, res) => {
   try { res.json(await rlExecution.getStatus()); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Quantitative options-flow snapshot for one symbol — chain stats (P/C ratio,
+// IV avg, IV rank, IV skew) + unusual sweeps/blocks. Read-only; rejects
+// symbols outside the combined US+ASX whitelist (ASX has no chain).
+app.get('/api/options-flow/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    const allow = new Set(getCombinedWatchlist());
+    if (!allow.has(symbol)) return res.status(403).json({ error: 'symbol_not_in_watchlist' });
+    // Use raw read here so the introspection endpoint can show the last-known
+    // snapshot with a `_stale` flag even after TTL expires. The prompt path
+    // (agent.js) uses TTL-enforced getCached and will not inject stale data.
+    const cached = optionsFlowService.getCachedRaw(symbol);
+    if (!cached) return res.status(404).json({ error: 'no_cached_flow', hint: 'cache warms ~60s after boot, then refreshes every 30 min during US market hours' });
+    res.json({ ...cached, prompt: optionsFlowService.renderForPrompt(cached) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/knowledge/:symbol', async (req, res) => {

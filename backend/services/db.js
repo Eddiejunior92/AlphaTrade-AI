@@ -89,6 +89,19 @@ async function ensureSchema() {
     )
   `);
 
+  // Implied-volatility history — one row per symbol per trading day. Used by
+  // optionsFlowService to compute IV rank (where today's IV sits in the
+  // rolling 252-day high/low range). Cheap, append-only.
+  await query(`
+    CREATE TABLE IF NOT EXISTS iv_history (
+      symbol      TEXT NOT NULL,
+      as_of_date  DATE NOT NULL,
+      iv_avg      DOUBLE PRECISION NOT NULL,
+      PRIMARY KEY (symbol, as_of_date)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS iv_history_symbol_date_idx ON iv_history (symbol, as_of_date DESC)`);
+
   // RL execution layer — tabular Q-table over (state, action). State =
   // regime|strategy|mfe-bucket|pnl-bucket; action ∈ {NONE, TIGHTEN, LOOSEN,
   // ARM_EARLY, LOCK_IN}. Trained online from realised R-multiple per closed

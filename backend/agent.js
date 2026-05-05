@@ -24,6 +24,7 @@ const portfolioOpt = require('./services/portfolioOptimizationService');
 const hedgingService = require('./services/hedgingService');
 const orderFlowService = require('./services/orderFlowService');
 const optionsActivityService = require('./services/optionsActivityService');
+const optionsFlowService = require('./services/optionsFlowService');
 const earningsSignalService = require('./services/earningsSignalService');
 const db = require('./services/db');
 const { STRATEGIES, listStrategies, getStrategy, applyRiskScale, getRiskScale, listRiskScales, DEFAULT_RISK_SCALE, getWatchlist, getWatchlistForStrategy } = require('./strategies');
@@ -585,6 +586,18 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     } catch (_) {}
   }
 
+  // Quantitative options-chain block — P/C ratio, IV avg, IV rank, IV skew,
+  // unusual sweeps/blocks. Pulled from cache only here so the per-symbol
+  // cycle never blocks on the chain fetch (refresh runs on its own 30-min
+  // schedule + at startup). US-only.
+  let optionsFlow = null;
+  if (!isAsxSymbol) {
+    try {
+      const flow = optionsFlowService.getCached(symbol);
+      if (flow) optionsFlow = optionsFlowService.renderForPrompt(flow);
+    } catch (_) {}
+  }
+
   // Earnings signal — derived from cached fundamentals (no extra API). PEAD
   // bias + pre-earnings blackout flag for both day and swing strategies.
   let earningsSignal = null;
@@ -600,7 +613,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     symbol, priceData, sentiment, newsSentiment, holding, portfolio,
     patterns, fundamentals, indicators, intraday, historical,
     strategyName: sc.name, premarket,
-    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, earningsSignal,
+    adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
     regimeContext, knowledgeContext,
   });
 
@@ -1133,6 +1146,39 @@ function scheduleOptionsActivityRefresh() {
   }, 30 * 60 * 1000);
 }
 
+// Build a {symbol → spot} map for the options-flow batch. Uses the most
+// recent 1-min bar close (cheap; the cycle already pulls these). Best-effort
+// per symbol — missing entries simply skip flow refresh for that name.
+async function buildSpotLookup(symbols) {
+  const out = {};
+  for (const s of symbols) {
+    try {
+      const bars = await alpacaService.getBars(s, '1Min', 1);
+      const last = Array.isArray(bars) && bars.length ? bars[bars.length - 1] : null;
+      const px = last?.c ?? last?.close ?? null;
+      if (px) out[s] = px;
+    } catch (_) {}
+  }
+  return out;
+}
+
+// Real options-chain refresh (Alpaca snapshot endpoint). Runs every 30 min
+// during US market hours. Needs a spot-price lookup so each symbol gets a
+// near-money strike filter — pulled from the in-memory price snapshot the
+// cycle already builds, falling back to a fresh getLatestQuote per symbol
+// if the snapshot is empty.
+let optionsFlowHandle = null;
+function scheduleOptionsFlowRefresh() {
+  if (optionsFlowHandle) clearInterval(optionsFlowHandle);
+  optionsFlowHandle = setInterval(async () => {
+    if (!memoryState.marketOpen) return;
+    try {
+      const spotLookup = await buildSpotLookup(WATCHLIST);
+      await optionsFlowService.refreshBatch(WATCHLIST, spotLookup);
+    } catch (e) { console.error('[OptionsFlow] Batch refresh failed:', e.message); }
+  }, 30 * 60 * 1000);
+}
+
 // --- Long-term knowledge graph — daily refresh ----------------------------
 // Runs once per day at ~08:00 UTC (~03:00-04:00 ET, well before US open and
 // after Sydney close). Pulls cached fundamentals + sentiment per symbol and
@@ -1320,6 +1366,16 @@ adaptiveLearning.recomputeFromHistory()
 optionsActivityService.refreshBatch(WATCHLIST)
   .then(() => console.log(`[OptionsActivity] Startup batch refreshed for ${WATCHLIST.length} symbols`))
   .catch(e => console.error('[OptionsActivity] Startup refresh failed:', e.message));
+
+// Quantitative options-flow + IV warm-up. Delayed 60s so the price-bar API
+// isn't slammed at boot alongside everything else.
+setTimeout(() => {
+  buildSpotLookup(WATCHLIST)
+    .then(spot => optionsFlowService.refreshBatch(WATCHLIST, spot))
+    .then(() => console.log(`[OptionsFlow] Startup batch refreshed for ${WATCHLIST.length} symbols`))
+    .catch(e => console.error('[OptionsFlow] Startup refresh failed:', e.message));
+}, 60_000);
+scheduleOptionsFlowRefresh();
 
 (async () => {
   try {
