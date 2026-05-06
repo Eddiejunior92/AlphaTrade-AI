@@ -63,6 +63,19 @@ async function start({ getSnapshot, getRecentTrades }) {
     console.log('[DiscordChat] DISCORD_BOT_TOKEN not set — chat bot disabled. (Daily P&L webhook still works.)');
     return { ok: false, reason: 'no_token' };
   }
+  // Single-instance guard: Discord delivers messageCreate to EVERY gateway
+  // session logged in with the same token, so running the bot in both the
+  // dev workspace and the published deployment makes every user message
+  // get answered twice (different wording, because each process queries
+  // the LLM independently with its own snapshot). Replit sets
+  // REPLIT_DEPLOYMENT=1 only inside published deployments; everywhere else
+  // we skip starting unless the operator opts in with DISCORD_CHAT_FORCE_START=true.
+  const isDeployment = process.env.REPLIT_DEPLOYMENT === '1';
+  const forceStart   = String(process.env.DISCORD_CHAT_FORCE_START || '').toLowerCase() === 'true';
+  if (!isDeployment && !forceStart) {
+    console.log('[DiscordChat] Skipping bot start — not in a published deployment. (Set DISCORD_CHAT_FORCE_START=true to override for local testing; only ONE process should ever run with a given DISCORD_BOT_TOKEN.)');
+    return { ok: false, reason: 'dev_environment_skipped' };
+  }
   // Lazy require so the dependency cost is only paid when the token is set.
   let DiscordPkg;
   try { DiscordPkg = require('discord.js'); }
