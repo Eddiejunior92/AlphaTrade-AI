@@ -27,6 +27,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
     *   `services/marketRegistry.js`: Market metadata.
     *   `services/alpacaService.js`, `services/ibkrService.js`: Broker interactions.
     *   `services/discordChatService.js`: Discord chat integration.
+    *   `services/proactiveAlertsService.js`: Predictive early-warning detectors (informational only — never modify safety rails).
 *   `/frontend`: React dashboard application.
     *   `/frontend/src/App.jsx`: Main frontend component.
 *   `package.json`: Project dependencies and scripts.
@@ -70,6 +71,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   Per-market master switches gate NEW ENTRIES ONLY; open positions are always managed.
 *   ASX execution is hard-blocked by default and requires `ASX_EXECUTION_WIRED=true` to enable real IBKR routing.
 *   `asx_day` strategy is restricted to the top-10 most-liquid ASX names (BHP/CBA/CSL/NAB/WBC/ANZ/RIO/WES/MQG/TLS) and enforces a A$5,000 minimum notional per trade to keep IBKR commissions under ~0.12%. Override universe via `WATCHLIST_ASX_DAY`.
+*   Proactive alerts read `memoryState.lastSnapshot` (cached by `runCycle`) — they NEVER call `getAgentSnapshot()` to avoid extra broker fetches. All proactive detectors are informational only and write `event_type='PROACTIVE_ALERT'` audit rows.
 
 ## Pointers
 

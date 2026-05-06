@@ -30,6 +30,7 @@ const optionsActivityService = require('./services/optionsActivityService');
 const optionsFlowService = require('./services/optionsFlowService');
 const macroFactorService = require('./services/macroFactorService');
 const macroForecastService = require('./services/macroForecastService');
+const proactiveAlerts = require('./services/proactiveAlertsService');
 const scenarioSimService = require('./services/scenarioSimService');
 const causalInference = require('./services/causalInferenceService');
 const counterfactual = require('./services/counterfactualService');
@@ -241,6 +242,7 @@ const memoryState = {
   strategyLastRun: {},
   strategyCycles: {},
   lastDynamic: null,
+  lastSnapshot: null, // lean snapshot cached by runCycle for proactive alerts
 };
 
 let intervalHandle = null;
@@ -1417,6 +1419,25 @@ async function runCycle() {
     // dynamic-scaling math expect — they all operate in USD.
     const { equity } = await riskManager.computeEquity(allH, pmap.usdLookup);
     const cb = await riskManager.checkCircuitBreaker(equity);
+    // Stash a lean snapshot for the proactive-alerts layer so it never has to
+    // call getAgentSnapshot() (which would trigger a fresh broker fetch).
+    // Cycle runs every ~20-60s, alerts tick every 60s — always fresh enough.
+    try {
+      const breakerCfg = riskManager.getConfig(portfolio);
+      const dayStart = parseFloat(portfolio.day_start_equity) || equity;
+      const dailyPnL = equity - dayStart;
+      memoryState.lastSnapshot = {
+        ts: Date.now(),
+        circuitBreakerTripped: !!portfolio.circuit_breaker,
+        dailyLossUSD: Math.max(0, -dailyPnL),
+        breakerConfig: {
+          maxDailyDrawdownPct: breakerCfg.maxDailyDrawdownPct,
+          maxDailyLossUSD:     breakerCfg.maxDailyLossUSD,
+          currentDrawdownPct:  dayStart > 0 ? Math.max(0, (dayStart - equity) / dayStart) : 0,
+          currentLossUSD:      Math.max(0, -dailyPnL),
+        },
+      };
+    } catch (_) { /* swallow — snapshot is best-effort */ }
     if (cb.tripped) {
       console.log(`[Agent] CB active — ${cb.reason || 'tripped'}`);
       await handleBreakerTrip({ cb, portfolio, equity, where: 'pre-cycle' });
@@ -2207,6 +2228,32 @@ function scheduleMacroForecastRefresh() {
   }, 60 * 60 * 1000);
 }
 
+// --- Proactive alerts: predictive / early-warning detection layer ---------
+// Runs every 60s during US market hours (and during ASX hours when ASX is
+// enabled). Pure observability — uses the same snapshot the dashboard reads
+// and the existing perfMetrics counters. Each detector has its own cooldown
+// so the same condition cannot spam Discord. Failures are swallowed.
+let proactiveAlertsHandle = null;
+function scheduleProactiveAlerts() {
+  if (proactiveAlertsHandle) clearInterval(proactiveAlertsHandle);
+  proactiveAlertsHandle = setInterval(async () => {
+    try {
+      const anyMarketOpen = !!memoryState.marketOpen || !!memoryState.usMarketOpen || !!memoryState.asxMarketOpen;
+      if (!anyMarketOpen) return;
+      // Read the snapshot the cycle already produced — never trigger a fresh
+      // broker fetch from the alerts layer. Skip if the snapshot is stale
+      // (>5min) — that means cycles have stalled and the dashboard's
+      // existing health rails will already be alerting on it.
+      const snap = memoryState.lastSnapshot;
+      if (!snap || (Date.now() - snap.ts) > 5 * 60 * 1000) return;
+      const r = await proactiveAlerts.runProactiveCheck({ snapshot: snap, perfMetrics });
+      if (r.fired && r.fired.length) {
+        console.log(`[ProactiveAlerts] Fired: ${r.fired.join(', ')}`);
+      }
+    } catch (e) { console.error('[ProactiveAlerts] Tick failed:', e.message); }
+  }, 60 * 1000);
+}
+
 // --- Long-term knowledge graph — daily refresh ----------------------------
 // Runs once per day at ~08:00 UTC (~03:00-04:00 ET, well before US open and
 // after Sydney close). Pulls cached fundamentals + sentiment per symbol and
@@ -2533,6 +2580,7 @@ setTimeout(() => {
     .catch(e => console.error('[Macro] Startup forecast failed:', e.message));
 }, 75_000);
 scheduleMacroForecastRefresh();
+scheduleProactiveAlerts();
 
 // [Data Depth] Earnings-transcript warm-up — delayed 105s. Initial batch
 // targets the first 6 US watchlist symbols only so we don't burn a chunk

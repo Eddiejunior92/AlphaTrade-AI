@@ -431,6 +431,7 @@ const llmWeightingService = require('./services/llmWeightingService');
 const causalInferenceService = require('./services/causalInferenceService');
 const counterfactualService = require('./services/counterfactualService');
 const safetySuggestionService = require('./services/safetySuggestionService');
+const proactiveAlertsService = require('./services/proactiveAlertsService');
 const memoryService = require('./services/memoryService');
 const propagationService = require('./services/propagationService');
 const feedbackService = require('./services/feedbackService');
@@ -846,6 +847,23 @@ app.get('/api/counterfactuals', async (req, res) => {
 // user must POST explicitly. The applier dispatches via a hard-coded
 // whitelist inside the service — unknown kinds are refused before any
 // state writer runs.
+// Proactive Alerts — predictive / early-warning detection. Strictly
+// informational; never changes any safety rule. GET returns active alerts +
+// cooldown state + history; POST /toggle (operator) flips the master switch.
+app.get('/api/alerts/proactive', async (_req, res) => {
+  try {
+    res.json(proactiveAlertsService.getStatus());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/alerts/proactive/toggle', requireOperator, async (req, res) => {
+  try {
+    const enabled = req.body?.enabled !== false;
+    proactiveAlertsService.setEnabled(enabled);
+    res.json({ success: true, enabled: proactiveAlertsService.isEnabled() });
+  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+});
+
 app.get('/api/safety-suggestions', async (_req, res) => {
   try {
     const summary = await safetySuggestionService.getDashboardSummary();
