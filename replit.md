@@ -72,6 +72,10 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   ASX execution is hard-blocked by default and requires `ASX_EXECUTION_WIRED=true` to enable real IBKR routing.
 *   `asx_day` strategy is restricted to the top-10 most-liquid ASX names (BHP/CBA/CSL/NAB/WBC/ANZ/RIO/WES/MQG/TLS) and enforces a A$5,000 minimum notional per trade to keep IBKR commissions under ~0.12%. Override universe via `WATCHLIST_ASX_DAY`.
 *   Proactive alerts read `memoryState.lastSnapshot` (cached by `runCycle`) — they NEVER call `getAgentSnapshot()` to avoid extra broker fetches. All proactive detectors are informational only and write `event_type='PROACTIVE_ALERT'` audit rows.
+*   Discord chat bot (`discordChatService.start()`) is gated on `REPLIT_DEPLOYMENT=1` so only the published instance connects — running two processes with the same `DISCORD_BOT_TOKEN` causes Discord to deliver every message twice. Override with `DISCORD_CHAT_FORCE_START=true` for local testing (and stop the deployed bot first).
+*   Discord/voice chat is **info-only** by design — no code path from `brokerService.chat()` to `placeOrder`. The system prompt explicitly forbids Alpha from claiming to execute trades; manual execution must go through the dashboard's `/api/manual-order` endpoint.
+*   Manual buy/sell endpoint (`POST /api/manual-order`) is operator-token-gated (strict) and re-uses `agent.executeOrder` so manual trades enforce kill-switch, circuit breaker, atomic cash/holdings, and tamper-evident audit log just like autonomous trades. Writes a `MANUAL_ORDER` audit row in addition to `TRADE_EXECUTED`.
+*   Voice chat persists last 50 messages in `localStorage` under `alphatrade.chat.history` so reopening the panel restores context. Trash icon in chat header clears it.
 
 ## Pointers
 

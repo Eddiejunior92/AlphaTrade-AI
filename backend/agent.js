@@ -2854,6 +2854,11 @@ module.exports = {
   // pre-warmup. Read-only USD price-lookup builder; identical logic to the
   // per-cycle path. Does NOT touch trading state.
   buildPriceLookup,
+  // Exposed for /api/manual-order — re-uses the same execution pathway
+  // the autonomous agent uses (kill-switch guard, broker placeOrder, atomic
+  // cash + holdings update, audit log, per-market FX). The HTTP endpoint
+  // adds the operator-token gate and price lookup before delegating here.
+  executeOrder,
   // [Upgrade #4] Surfaced for /api/perf — observability only.
   perfMetrics,
 };

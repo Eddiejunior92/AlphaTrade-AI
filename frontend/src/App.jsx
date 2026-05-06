@@ -6,6 +6,7 @@ import TradeLog from './components/TradeLog';
 import HoldingsTable from './components/HoldingsTable';
 import ReasoningFeed from './components/ReasoningFeed';
 import VoiceChat from './components/VoiceChat';
+import ManualOrderPanel from './components/ManualOrderPanel';
 import Tooltip from './components/Tooltip';
 import MarketsTab from './components/MarketsTab';
 import ErrorBoundary from './components/ErrorBoundary';
@@ -104,6 +105,7 @@ export default function App() {
     setMarketEnabled, setMarketMode,
     authStatus, setOperatorToken, getStoredOperatorToken,
     setBreakerAutoReset,
+    manualOrder,
   } = useAgent();
   // Operator token entry — UI lives in Settings, but the saved value is also
   // shown as a top-of-page red banner whenever the token is required but
@@ -689,6 +691,13 @@ export default function App() {
 
         {tab === 'positions' && (
           <div className="space-y-4">
+            <ManualOrderPanel
+              manualOrder={manualOrder}
+              loading={loading}
+              watchlist={state?.watchlist || []}
+              holdings={holdings}
+              tokenMissing={tokenMissing}
+            />
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <h2 className="text-lg font-semibold tracking-tight">
                 Open Positions <span className="text-[var(--text-dim)] text-sm font-normal">· {filteredHoldings.length} of {holdings.length}</span>

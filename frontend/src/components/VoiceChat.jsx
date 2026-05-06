@@ -3,10 +3,43 @@ import { useVoice } from '../hooks/useVoice';
 
 const GREETING = "Hi, I'm Alpha — your personal broker. I'm watching the market and your portfolio in real time. Ask me anything, or tell me to make a move.";
 
+// Chat persistence — keep the last N messages in localStorage so closing
+// and reopening the chat preserves context. Capped to keep the prompt
+// payload small (Grok still gets the full live snapshot every turn, so
+// stale older messages aren't load-bearing — they're just there to keep
+// the conversation feel and let Alpha reference earlier topics).
+const STORAGE_KEY = 'alphatrade.chat.history';
+const MAX_PERSISTED = 50;
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    // Defensive shape check — drop anything that isn't a {role, content} pair.
+    const clean = parsed.filter(m => m && typeof m === 'object' && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string');
+    return clean.length ? clean : null;
+  } catch { return null; }
+}
+function saveHistory(messages) {
+  try {
+    const trimmed = messages.slice(-MAX_PERSISTED);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {}
+}
+function clearHistory() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch {}
+}
+
 export default function VoiceChat({ open, onClose, brokerChat }) {
-  const [messages, setMessages] = useState([
-    { role: 'assistant', content: GREETING },
-  ]);
+  // Lazy-init from localStorage so reopening the panel restores the
+  // previous conversation. If nothing is stored yet, start with the
+  // greeting bubble.
+  const [messages, setMessages] = useState(() => {
+    const restored = loadHistory();
+    return restored || [{ role: 'assistant', content: GREETING }];
+  });
   const [input, setInput] = useState('');
   const [thinking, setThinking] = useState(false);
   const [autoSpeak, setAutoSpeak] = useState(true);
@@ -85,11 +118,26 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
   }, [messages, thinking, brokerChat, autoSpeak, streamChat]);
 
   useEffect(() => {
+    // Only speak the greeting on open if this is a fresh session (no
+    // restored history beyond the greeting itself). Otherwise the user
+    // hears "Hi, I'm Alpha…" every time they reopen, which is noise.
     if (open && !greetedRef.current && autoSpeak) {
       greetedRef.current = true;
-      setTimeout(() => speak(GREETING), 400);
+      const isFreshSession = messages.length === 1 && messages[0].role === 'assistant' && messages[0].content === GREETING;
+      if (isFreshSession) setTimeout(() => speak(GREETING), 400);
     }
-  }, [open, autoSpeak, speak]);
+  }, [open, autoSpeak, speak, messages]);
+
+  // Persist on every message change. Cheap (synchronous JSON.stringify of
+  // ≤50 messages) and survives browser refresh / app reinstall on the
+  // same device.
+  useEffect(() => { saveHistory(messages); }, [messages]);
+
+  const resetChat = useCallback(() => {
+    clearHistory();
+    setMessages([{ role: 'assistant', content: GREETING }]);
+    greetedRef.current = false;
+  }, []);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -141,6 +189,11 @@ export default function VoiceChat({ open, onClose, brokerChat }) {
                 className="p-2 rounded-full hover:bg-white/10 text-sm"
                 title={autoSpeak ? 'Mute voice replies' : 'Enable voice replies'}>
                 {autoSpeak ? '🔊' : '🔇'}
+              </button>
+              <button onClick={resetChat}
+                className="p-2 rounded-full hover:bg-white/10 text-sm"
+                title="Clear chat history (Alpha will forget previous turns).">
+                🗑
               </button>
               <button onClick={onClose}
                 className="p-2 rounded-full hover:bg-white/10 text-[var(--text-dim)]">✕</button>

@@ -11,6 +11,7 @@ const {
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
   setMarketEnabled, setMarketMode, setMarketCadence,
+  buildPriceLookup, executeOrder,
 } = require('./agent');
 const discordChatService = require('./services/discordChatService');
 const complianceService = require('./services/complianceService');
@@ -1418,6 +1419,153 @@ app.post('/api/broker/tts', async (req, res) => {
 //   3. Push text deltas + audio chunks (base64 mp3, ordered by seq) over SSE
 //   This lets the client start playing audio ~1s after user stops speaking,
 //   while Grok is still generating the rest of the reply.
+// --- Manual buy/sell — operator-only escape hatch -------------------------
+// Lets the operator place a discretionary order from the dashboard without
+// waiting for autonomous quorum. Uses the SAME execution pathway as the
+// agent (kill-switch guard, broker placeOrder, atomic cash + holdings,
+// audit log, per-market FX) so manual trades are first-class citizens in
+// the books — they show up in trade history, P&L, holdings, and the
+// tamper-evident audit log just like autonomous trades.
+//
+// Inputs (JSON body):
+//   symbol    — e.g. "NVDA" or "BHP" (must be in the configured watchlist)
+//   side      — "BUY" or "SELL"
+//   qty       — positive integer
+//   strategy  — one of: day | swing | asx_day | asx_swing
+//
+// Safety:
+//   - Strict OPERATOR_TOKEN gate (refuses if token unset on server).
+//   - Kill-switch and circuit breaker still apply (executeOrder enforces).
+//   - Validates symbol against the combined watchlist.
+//   - Validates strategy matches the symbol's market (no day-trading ASX
+//     symbols on the US "day" strategy slot, etc.).
+//   - SELL is rejected if no matching open holding exists for that
+//     (symbol, strategy) tuple — prevents accidental shorts.
+//   - Per-process mutex serializes ALL manual orders so a double-clicked
+//     button (or two operators) cannot both pass the SELL pre-check and
+//     submit two broker orders against the same holding.
+//   - Circuit breaker / emergency pause are checked explicitly; the
+//     autonomous cycle gates on these at cycle level (executeOrder itself
+//     only blocks on kill-switch), so manual orders need their own check.
+let _manualOrderInFlight = false;
+app.post('/api/manual-order', requireOperatorStrictGate, async (req, res) => {
+  if (_manualOrderInFlight) {
+    return res.status(429).json({ error: 'Another manual order is in flight — try again in a moment.' });
+  }
+  _manualOrderInFlight = true;
+  try {
+    const { symbol: rawSymbol, side: rawSide, qty: rawQty, strategy: rawStrategy } = req.body || {};
+    const symbol   = String(rawSymbol || '').trim().toUpperCase();
+    const side     = String(rawSide   || '').trim().toUpperCase();
+    const strategy = String(rawStrategy || '').trim().toLowerCase();
+    const qty      = parseInt(rawQty, 10);
+
+    if (!symbol)                          return res.status(400).json({ error: 'symbol required' });
+    if (!['BUY', 'SELL'].includes(side))  return res.status(400).json({ error: 'side must be BUY or SELL' });
+    if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ error: 'qty must be a positive integer' });
+    const allowedStrategies = ['day', 'swing', 'asx_day', 'asx_swing'];
+    if (!allowedStrategies.includes(strategy)) {
+      return res.status(400).json({ error: `strategy must be one of: ${allowedStrategies.join(', ')}` });
+    }
+
+    // Watchlist guard — protects against typos and blocks arbitrary-symbol
+    // attacks if the endpoint is ever exposed to a less-trusted operator.
+    const wl = getCombinedWatchlist();
+    if (!wl.includes(symbol)) {
+      return res.status(400).json({ error: `symbol ${symbol} not in watchlist (allowed: ${wl.join(', ')})` });
+    }
+
+    // Strategy↔market sanity check.
+    const info = require('./services/marketRegistry').getSymbolInfo(symbol);
+    const isAsxStrat = strategy.startsWith('asx_');
+    if (info.market === 'ASX' && !isAsxStrat) {
+      return res.status(400).json({ error: `${symbol} is an ASX symbol — use strategy asx_day or asx_swing.` });
+    }
+    if (info.market === 'US' && isAsxStrat) {
+      return res.status(400).json({ error: `${symbol} is a US symbol — use strategy day or swing.` });
+    }
+
+    // SELL guard: must have an existing holding for this (symbol, strategy).
+    if (side === 'SELL') {
+      const existing = await db.getHolding(symbol, strategy);
+      if (!existing) {
+        return res.status(400).json({ error: `no open ${strategy} holding for ${symbol} — cannot SELL.` });
+      }
+      if (qty > parseInt(existing.qty, 10)) {
+        return res.status(400).json({ error: `SELL qty ${qty} exceeds open ${strategy} position of ${existing.qty} ${symbol}.` });
+      }
+    }
+
+    // Breaker / emergency-pause gate — the autonomous cycle checks these
+    // at cycle level (see runCycle), but executeOrder itself only blocks
+    // on kill-switch. A manual order must respect every safety rail the
+    // autonomous path does, so check before delegating.
+    const portfolio = await db.getPortfolio();
+    if (portfolio?.emergency_pause) {
+      return res.status(409).json({ error: 'Emergency pause is active — resume the agent before placing manual orders.' });
+    }
+    if (portfolio?.circuit_breaker) {
+      return res.status(409).json({ error: 'Circuit breaker is tripped — reset the breaker before placing manual orders.' });
+    }
+    if (isKillSwitchLatched && isKillSwitchLatched()) {
+      return res.status(409).json({ error: 'Kill switch is latched — restart the process to clear it.' });
+    }
+
+    // Fresh price lookup via the same path the agent uses. Uses 1Min bar
+    // from brokerRouter (Alpaca for US, IBKR for ASX). If bars are
+    // unavailable, fall back to the holding's avg_cost on SELL, or refuse
+    // on BUY (we won't blind-fire a buy with no price).
+    const priceLookup = await buildPriceLookup([{ symbol, avg_cost: 0 }]);
+    let price = priceLookup.lookup[symbol];
+    if (!Number.isFinite(price) || price <= 0) {
+      if (side === 'SELL') {
+        const h = await db.getHolding(symbol, strategy);
+        price = parseFloat(h?.avg_cost) || 0;
+      }
+      if (!Number.isFinite(price) || price <= 0) {
+        return res.status(503).json({ error: `Could not fetch a current price for ${symbol} — broker data may be down. Try again shortly.` });
+      }
+    }
+
+    // Synthetic signal so the audit row + recordTrade payload look uniform
+    // alongside autonomous trades. consensus='manual' makes manual orders
+    // easy to filter out of model-performance learning later.
+    const signal = { confidence: 1.0, consensus: 'manual', signal: side };
+
+    const trade = await executeOrder({
+      symbol, side, qty, price, signal,
+      reason: `Manual ${side} by operator from dashboard`,
+      strategy,
+      market: info.market, currency: info.currency,
+    });
+
+    if (!trade) {
+      // executeOrder returns null on kill-switch block or broker error.
+      // Both already write their own audit rows.
+      return res.status(503).json({ error: 'Order rejected by safety layer or broker (see audit log).' });
+    }
+
+    // Best-effort audit row for the manual override itself, separate from
+    // the TRADE_EXECUTED row that executeOrder writes. Makes manual
+    // intervention easy to spot in the compliance feed.
+    try {
+      await db.recordAudit({
+        event_type: 'MANUAL_ORDER',
+        symbol, decision: side,
+        confidence: 1.0, consensus: 'manual',
+        payload: { qty, price, strategy, market: info.market, source: 'dashboard' },
+      });
+    } catch {}
+
+    res.json({ ok: true, trade, price });
+  } catch (e) {
+    console.error('[Server] manual-order error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    _manualOrderInFlight = false;
+  }
+});
+
 app.post('/api/broker/chat-stream', async (req, res) => {
   const t0 = Date.now();
   res.setHeader('Content-Type', 'text/event-stream');

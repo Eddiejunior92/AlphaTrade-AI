@@ -272,5 +272,18 @@ export function useAgent() {
         return r;
       } finally { setLoad(k, false); }
     },
+    // Manual buy/sell — operator override that bypasses quorum but still
+    // runs through the agent's full execution pathway (kill switch, atomic
+    // cash + holdings, audit log). Returns { ok, trade, price } on success
+    // or { error } on rejection. Refreshes trades + audit on success so the
+    // dashboard updates immediately.
+    manualOrder: async ({ symbol, side, qty, strategy }) => {
+      setLoad('manualOrder', true);
+      try {
+        const r = await apiPost('/manual-order', { symbol, side, qty, strategy });
+        if (r && r.ok) await refreshLogs();
+        return r;
+      } finally { setLoad('manualOrder', false); }
+    },
   };
 }
