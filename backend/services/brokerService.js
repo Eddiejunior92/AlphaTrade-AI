@@ -1,5 +1,6 @@
 const axios = require('axios');
 
+const costTracker = require('./llmCostTracker');
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const GROK_MODEL = process.env.GROK_BROKER_MODEL || 'grok-4-fast-non-reasoning';
 
@@ -99,6 +100,7 @@ async function chat({ messages, snapshot, recentSignals, recentTrades, voice = f
         timeout: 25000,
       }
     );
+    costTracker.recordUsage({ service: 'chat', market: 'SHARED', modelId: GROK_MODEL, response: res.data });
     const reply = res.data?.choices?.[0]?.message?.content?.trim() || '';
     return { reply, model: GROK_MODEL, provider: 'xai-grok' };
   } catch (e) {
@@ -125,6 +127,10 @@ async function chatStream({ messages, snapshot, recentSignals, recentTrades, voi
       temperature: 0.7,
       top_p: 0.95,
       stream: true,
+      // xAI honors this OpenAI-compatible flag and emits a final SSE chunk
+      // containing the `usage` block — without it, streamed responses have
+      // no token counts and we'd silently undercount cost.
+      stream_options: { include_usage: true },
     },
     {
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
@@ -136,6 +142,7 @@ async function chatStream({ messages, snapshot, recentSignals, recentTrades, voi
   return new Promise((resolve, reject) => {
     let full = '';
     let buffer = '';
+    let finalUsage = null;
     res.data.on('data', (chunk) => {
       buffer += chunk.toString('utf8');
       const lines = buffer.split('\n');
@@ -147,6 +154,8 @@ async function chatStream({ messages, snapshot, recentSignals, recentTrades, voi
         if (payload === '[DONE]') continue;
         let j;
         try { j = JSON.parse(payload); } catch { continue; /* partial JSON */ }
+        // The final usage chunk has empty choices and a populated usage block.
+        if (j?.usage) finalUsage = j.usage;
         const delta = j?.choices?.[0]?.delta?.content;
         if (delta) {
           full += delta;
@@ -155,7 +164,17 @@ async function chatStream({ messages, snapshot, recentSignals, recentTrades, voi
         }
       }
     });
-    res.data.on('end', () => resolve({ reply: full.trim(), model: GROK_MODEL, provider: 'xai-grok' }));
+    res.data.on('end', () => {
+      // If the provider omitted usage (some xAI variants do for short streams),
+      // estimate from output length: ~4 chars per token is the OpenAI rule of
+      // thumb. Mark the entry so reconciliation can spot estimated rows later.
+      if (!finalUsage && full) {
+        const est = Math.ceil(full.length / 4);
+        finalUsage = { prompt_tokens: 0, completion_tokens: est, total_tokens: est };
+      }
+      costTracker.recordUsage({ service: 'chat', market: 'SHARED', modelId: GROK_MODEL, response: { usage: finalUsage } });
+      resolve({ reply: full.trim(), model: GROK_MODEL, provider: 'xai-grok' });
+    });
     res.data.on('error', reject);
   });
 }

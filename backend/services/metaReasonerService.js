@@ -21,6 +21,7 @@
 //     opinion this cycle" and proceed with raw quorum unchanged.
 
 const axios = require('axios');
+const costTracker = require('./llmCostTracker');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const META_MODEL = process.env.META_REASONER_MODEL || 'anthropic/claude-3.7-sonnet';
@@ -98,6 +99,7 @@ async function synthesize({ symbol, strategy, regime, market, votes, weights, mo
         timeout: META_TIMEOUT_MS,
       }
     );
+    costTracker.recordUsage({ service: 'meta_reasoner', market: market || 'SHARED', modelId: META_MODEL, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     const parsed = parseMetaResponse(text);
     if (!parsed) return null;

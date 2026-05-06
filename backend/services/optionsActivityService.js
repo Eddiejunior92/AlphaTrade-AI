@@ -2,6 +2,8 @@
 // reports of unusual options flow on watchlist symbols. TTL-cached per symbol.
 // Strictly informational; rendered as one extra prompt line.
 const axios = require('axios');
+const costTracker = require('./llmCostTracker');
+const marketRegistry = require('./marketRegistry');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_OPTIONS_MODEL || 'grok-4-fast-non-reasoning';
@@ -50,6 +52,8 @@ If nothing notable found, return has_unusual_activity=false with summary="no not
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       timeout: TIMEOUT_MS,
     });
+    const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
+    costTracker.recordUsage({ service: 'options', market, modelId: MODEL, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '{}';
     let parsed;
     try { parsed = JSON.parse(text); }

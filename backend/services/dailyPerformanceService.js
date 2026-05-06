@@ -18,6 +18,7 @@
 
 const db = require('./db');
 const discord = require('./discordService');
+const costTracker = require('./llmCostTracker');
 
 // ----------------------------------------------------------------------------
 // Schema — daily_performance: one row per (date, market). UPSERT on conflict
@@ -189,16 +190,19 @@ async function computeDailySummary({ tradingDate, perfMetrics, market } = {}) {
     : null;
 
   // Skip the market(s) the caller didn't ask for so the SQL stays cheap.
-  const [us, asx, insights] = await Promise.all([
+  const [us, asx, insights, usCosts, asxCosts] = await Promise.all([
     (!market || market === 'US')  ? computeMarketStats(usDate,  'US')  : Promise.resolve(null),
     (!market || market === 'ASX') ? computeMarketStats(asxDate, 'ASX') : Promise.resolve(null),
     computeIntelligenceInsights(),
+    (!market || market === 'US')  ? costTracker.getDailyCostsByMarket({ tradingDate: usDate,  market: 'US',  tz: MARKET_TZ.US  }) : Promise.resolve(null),
+    (!market || market === 'ASX') ? costTracker.getDailyCostsByMarket({ tradingDate: asxDate, market: 'ASX', tz: MARKET_TZ.ASX }) : Promise.resolve(null),
   ]);
 
-  // Per-market LLM accounting. perfMetrics carries per-market counters
-  // (tagged at increment time in agent.js) so each report bills only the
-  // calls actually made for that market's symbols.
-  const llmCallCost  = Number(process.env.LLM_CALL_COST_USD) || 0.002;
+  // Per-market LLM accounting. PRIMARY source is the `llm_usage_logs` table
+  // populated by every LLM call site via llmCostTracker.recordUsage — this
+  // gives us TRUE token-level spend per service per market. The old
+  // perfMetrics counters are kept around as a fallback for the cycle-cadence
+  // skip-rate display only.
   // Data-feed cost can be set per-market (Alpaca → US, IBKR → ASX). Falls
   // back to splitting DATA_FEED_COST_USD_PER_DAY 50/50 if only the legacy
   // single-value var is set.
@@ -206,28 +210,34 @@ async function computeDailySummary({ tradingDate, perfMetrics, market } = {}) {
   const dataUS       = process.env.DATA_FEED_COST_USD_PER_DAY_US  != null ? Number(process.env.DATA_FEED_COST_USD_PER_DAY_US)  : legacyData / 2;
   const dataASX      = process.env.DATA_FEED_COST_USD_PER_DAY_ASX != null ? Number(process.env.DATA_FEED_COST_USD_PER_DAY_ASX) : legacyData / 2;
   // NOTE: `ensembleEscalated*` is a SUBSET of `ensembleCalls*` (every
-  // escalated tick also increments calls). Only bill `calls` here.
+  // escalated tick also increments calls). Only used for the skip-rate
+  // display — actual $ costs come from llm_usage_logs above.
   const callsByMkt  = perfMetrics?.ensembleCallsByMarket   || { US: 0, ASX: 0 };
   const skipByMkt   = perfMetrics?.ensembleSkippedByMarket || { US: 0, ASX: 0 };
   const quietByMkt  = perfMetrics?.ensembleQuietSkippedByMarket || { US: 0, ASX: 0 };
   const escByMkt    = perfMetrics?.ensembleEscalatedByMarket    || { US: 0, ASX: 0 };
 
-  const buildExpenses = (mkt, marketStats) => {
-    const calls = callsByMkt[mkt] || 0;
-    const llmCost = +(calls * llmCallCost).toFixed(2);
-    const data    = +((mkt === 'US' ? dataUS : dataASX) || 0).toFixed(2);
-    const gross   = +((marketStats?.net_pnl_usd || 0)).toFixed(2);
-    const costs   = +(llmCost + data).toFixed(2);
+  const buildExpenses = (mkt, marketStats, costs) => {
+    const realLlmCost = +(costs?.total_cost_usd || 0).toFixed(4);
+    const realCalls   = costs?.total_calls || 0;
+    const realTokens  = costs?.total_tokens || 0;
+    const data        = +((mkt === 'US' ? dataUS : dataASX) || 0).toFixed(2);
+    const gross       = +((marketStats?.net_pnl_usd || 0)).toFixed(2);
+    const totalCosts  = +(realLlmCost + data).toFixed(4);
     return {
-      llm_call_cost_usd: llmCallCost,
-      llm_calls_billed:  calls,
-      llm_skipped:       (skipByMkt[mkt] || 0) + (quietByMkt[mkt] || 0),
-      llm_escalated:     escByMkt[mkt] || 0,
-      llm_cost_usd:      llmCost,
+      llm_calls_billed:  realCalls,                         // real call count from llm_usage_logs
+      llm_tokens:        realTokens,
+      llm_cost_usd:      realLlmCost,                       // REAL token-level cost
+      llm_breakdown:     costs?.breakdown || [],            // per-service rollup for display
+      // Cycle metrics — show skip-rate of the trading-cycle ensemble even
+      // though their $ cost is now part of llm_breakdown.
+      cycle_calls:       callsByMkt[mkt] || 0,
+      cycle_skipped:     (skipByMkt[mkt] || 0) + (quietByMkt[mkt] || 0),
+      cycle_escalated:   escByMkt[mkt] || 0,
       data_feed_usd:     data,
-      total_costs_usd:   costs,
+      total_costs_usd:   totalCosts,
       total_gross_usd:   gross,
-      total_net_usd:     +(gross - costs).toFixed(2),
+      total_net_usd:     +(gross - totalCosts).toFixed(4),
     };
   };
 
@@ -235,8 +245,8 @@ async function computeDailySummary({ tradingDate, perfMetrics, market } = {}) {
     tradingDate: market === 'ASX' ? asxDate : usDate,
     market: market || null,                 // null = both-market combined run
     us, asx,
-    expenses_us:  us  ? buildExpenses('US',  us)  : null,
-    expenses_asx: asx ? buildExpenses('ASX', asx) : null,
+    expenses_us:  us  ? buildExpenses('US',  us,  usCosts)  : null,
+    expenses_asx: asx ? buildExpenses('ASX', asx, asxCosts) : null,
     breaker_tripped: !!portfolio.circuit_breaker,
     mode:            portfolio.trading_mode || 'paper',
     risk_scale:      portfolio.risk_scale   || 'balanced',
@@ -345,15 +355,34 @@ function formatMarketReport(summary, market) {
   const fmtSigned  = (v) => `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`;
 
   const e = expenses || {};
-  const totalLLMActivity = (e.llm_calls_billed || 0) + (e.llm_skipped || 0);
-  const skipRate = totalLLMActivity > 0 ? ((e.llm_skipped / totalLLMActivity) * 100).toFixed(0) : '0';
+  // Cycle-cadence skip-rate (trading-ensemble specific — sentiment/KG/etc
+  // don't have a "skip" concept).
+  const cycleActivity = (e.cycle_calls || 0) + (e.cycle_skipped || 0);
+  const skipRate = cycleActivity > 0 ? ((e.cycle_skipped / cycleActivity) * 100).toFixed(0) : '0';
+
+  // Per-service breakdown — shows which subsystem (ensemble / sentiment /
+  // premarket / KG / fundamentals / options / earnings / chat / meta) drove
+  // the cost. Shared overhead (premarket header, chat, meta) is split 50/50
+  // and tagged with †.
+  const breakdown = (e.llm_breakdown || []).filter(b => b.cost_usd > 0);
+  const breakdownLines = breakdown.map(b => {
+    const tag = b.shared ? ' †' : '';
+    // For shared rows, the displayed call/token count is the FULL daily total
+    // for that service (not halved) — only $cost is split, so summing the two
+    // reports gives true daily spend without double-counting calls.
+    return `   – ${b.service}${tag}: $${b.cost_usd.toFixed(4)} (${b.calls.toLocaleString()} calls · ${(b.tokens / 1000).toFixed(1)}K tok)`;
+  });
+
   const pnlBlock = e.total_gross_usd != null ? [
     `💰 **Net P&L (after costs)**`,
-    `• Gross: **${fmtSigned(e.total_gross_usd)}**  •  Costs: $${e.total_costs_usd.toFixed(2)}  •  **Net: ${fmtSigned(e.total_net_usd)}**`,
-    `• Expenses: LLM $${e.llm_cost_usd.toFixed(2)} (${(e.llm_calls_billed || 0).toLocaleString()} calls @ $${e.llm_call_cost_usd}) + Data $${e.data_feed_usd.toFixed(2)}`,
-    `• LLM activity: ${(e.llm_calls_billed || 0).toLocaleString()} called · ${(e.llm_skipped || 0).toLocaleString()} skipped (${skipRate}% skip-rate) · ${(e.llm_escalated || 0).toLocaleString()} escalated to premium`,
+    `• Gross: **${fmtSigned(e.total_gross_usd)}**  •  Costs: $${e.total_costs_usd.toFixed(4)}  •  **Net: ${fmtSigned(e.total_net_usd)}**`,
+    `• LLM (real token-level): $${e.llm_cost_usd.toFixed(4)} across ${(e.llm_calls_billed || 0).toLocaleString()} calls (${((e.llm_tokens || 0) / 1000).toFixed(1)}K tokens)`,
+    ...(breakdownLines.length ? breakdownLines : []),
+    `• Data feed: $${e.data_feed_usd.toFixed(2)}`,
+    `• Trading-ensemble cadence: ${(e.cycle_calls || 0).toLocaleString()} cycles · ${(e.cycle_skipped || 0).toLocaleString()} skipped (${skipRate}% skip-rate) · ${(e.cycle_escalated || 0).toLocaleString()} escalated`,
+    breakdown.some(b => b.shared) ? `*† Shared service — call/token totals shown in full; only $cost is split 50/50 across markets.*` : null,
     '',
-  ] : [];
+  ].filter(Boolean) : [];
 
   const fmtRegime = (r) => {
     if (!r) return '*no closed trades*';

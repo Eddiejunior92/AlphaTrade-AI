@@ -28,6 +28,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
     *   `services/alpacaService.js`, `services/ibkrService.js`: Broker interactions.
     *   `services/discordChatService.js`: Discord chat integration.
     *   `services/proactiveAlertsService.js`: Predictive early-warning detectors (informational only — never modify safety rails).
+    *   `services/llmCostTracker.js`: Real per-token LLM cost tracking — every LLM call site reports its `usage` block, persisted to `llm_usage_logs`, queried by daily report.
 *   `/frontend`: React dashboard application.
     *   `/frontend/src/App.jsx`: Main frontend component.
 *   `package.json`: Project dependencies and scripts.
@@ -78,6 +79,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   Voice chat persists last 50 messages in `localStorage` under `alphatrade.chat.history` so reopening the panel restores context. Trash icon in chat header clears it.
 *   Cost knobs: `AGENT_INTERVAL_SECONDS` (default 60s — was 20s) controls the master cycle cadence; lowering it multiplies LLM spend linearly. `LLM_SKIP_PRICE_BPS` (default 70 = 0.70%) is the price-drift threshold below which a cached HOLD verdict is reused instead of re-calling the ensemble; widening it cuts spend during chop. Raise/lower via env vars without code changes.
 *   Daily performance reports are PER-MARKET: US fires at 21:30 UTC (~16:30 ET, 30min after US close), ASX fires at 07:00 UTC (after the latest possible Sydney close — covers both AEST and AEDT). Each market gets its own Discord post with its own LLM cost (perfMetrics tags increments by `sc.market`), its own data-feed cost (`DATA_FEED_COST_USD_PER_DAY_US`/`_ASX`, fallback to legacy `DATA_FEED_COST_USD_PER_DAY` split 50/50), and its own trade list. Trade-day SQL filter uses `(created_at AT TIME ZONE $tz)::date` so ASX sessions that span midnight UTC are correctly attributed.
+*   LLM cost tracking is REAL token-level (not flat-rate): every call site (`llmService`, `sentimentService`, `premarketService`, `knowledgeGraphService`, `fundamentalsService`, `optionsActivityService`, `earningsTranscriptService`, `metaReasonerService`, `brokerService`) calls `costTracker.recordUsage({ service, market, modelId, response })` after the HTTP response lands. Pricing table lives in `llmCostTracker.js` (PRICING array) — update there when models are repriced. Daily report queries `llm_usage_logs` aggregated by service+market+trading-day. Shared services (premarket, meta, chat) tagged `market='SHARED'` and split 50/50 across US/ASX reports. Recording is best-effort and swallows errors — tracker failure NEVER breaks a trading cycle. `LLM_CALL_COST_USD` env var is now obsolete (still read for backward compat but no longer used by the report).
 
 ## Pointers
 

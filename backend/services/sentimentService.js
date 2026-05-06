@@ -12,6 +12,8 @@
 // same caching, same TTL — plus an extra `providers` array listing which
 // models actually contributed.
 const axios = require('axios');
+const costTracker = require('./llmCostTracker');
+const marketRegistry = require('./marketRegistry');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -183,7 +185,7 @@ function extractJson(text) {
   return null;
 }
 
-async function callXai(provider, prompt) {
+async function callXai(provider, prompt, market) {
   const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) return { id: provider.id, ok: false, reason: 'XAI_API_KEY missing' };
   try {
@@ -198,6 +200,7 @@ async function callXai(provider, prompt) {
       },
       { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: TIMEOUT_MS }
     );
+    costTracker.recordUsage({ service: 'sentiment', market: market || 'SHARED', modelId: provider.model, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     const parsed = parseProviderJson(extractJson(text));
     if (!parsed) return { id: provider.id, ok: false, reason: 'malformed JSON' };
@@ -207,7 +210,7 @@ async function callXai(provider, prompt) {
   }
 }
 
-async function callOpenRouter(provider, prompt) {
+async function callOpenRouter(provider, prompt, market) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return { id: provider.id, ok: false, reason: 'OPENROUTER_API_KEY missing' };
   try {
@@ -230,6 +233,7 @@ async function callOpenRouter(provider, prompt) {
         timeout: TIMEOUT_MS,
       }
     );
+    costTracker.recordUsage({ service: 'sentiment', market: market || 'SHARED', modelId: provider.model, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     const parsed = parseProviderJson(extractJson(text));
     if (!parsed) return { id: provider.id, ok: false, reason: 'malformed JSON' };
@@ -239,9 +243,9 @@ async function callOpenRouter(provider, prompt) {
   }
 }
 
-function callProvider(provider, prompt) {
-  if (provider.provider === 'xai') return callXai(provider, prompt);
-  if (provider.provider === 'openrouter') return callOpenRouter(provider, prompt);
+function callProvider(provider, prompt, market) {
+  if (provider.provider === 'xai') return callXai(provider, prompt, market);
+  if (provider.provider === 'openrouter') return callOpenRouter(provider, prompt, market);
   return Promise.resolve({ id: provider.id, ok: false, reason: 'unknown provider' });
 }
 
@@ -341,9 +345,10 @@ function blendProviderResults(symbol, providerResults) {
 
 async function fetchFresh(symbol) {
   const prompt = buildPrompt(symbol);
+  const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
   // Fan out to all providers in parallel; allSettled so one slow/failed
   // upstream never drags down the others.
-  const settled = await Promise.allSettled(PROVIDERS.map(p => callProvider(p, prompt)));
+  const settled = await Promise.allSettled(PROVIDERS.map(p => callProvider(p, prompt, market)));
   const results = settled.map((s, i) =>
     s.status === 'fulfilled'
       ? s.value

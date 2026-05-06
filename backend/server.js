@@ -1738,6 +1738,7 @@ server.listen(PORT, '0.0.0.0', () => {
   // Pre-market briefings: schedule both markets independently so an outage on
   // one (or an empty watchlist) never blocks the other. US runs at 08:00 ET,
   // ASX at 09:00 Sydney.
+  require('./services/llmCostTracker').ensureSchema().catch(e => console.error('[LLMCost] ensureSchema failed:', e.message));
   premarketService.ensureSchema()
     .then(() => {
       const usWl  = () => getWatchlist();

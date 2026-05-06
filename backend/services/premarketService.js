@@ -12,6 +12,7 @@ const axios = require('axios');
 const db = require('./db');
 const bus = require('./eventBus');
 const marketRegistry = require('./marketRegistry');
+const costTracker = require('./llmCostTracker');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_PREMARKET_MODEL || 'grok-4-fast-non-reasoning';
@@ -260,6 +261,7 @@ async function fetchFreshBriefing(market, watchlist) {
       },
       { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: TIMEOUT_MS }
     );
+    costTracker.recordUsage({ service: 'premarket', market: market || 'SHARED', modelId: MODEL, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '{}';
     let parsed;
     try { parsed = JSON.parse(text); }

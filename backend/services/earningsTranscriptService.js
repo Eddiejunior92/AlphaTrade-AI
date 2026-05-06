@@ -29,6 +29,8 @@
 
 const axios = require('axios');
 const db = require('./db');
+const costTracker = require('./llmCostTracker');
+const marketRegistry = require('./marketRegistry');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const TIMEOUT_MS = 18000;
@@ -95,6 +97,8 @@ Keep every string ≤ 120 chars. 2-4 items per array max.`;
     max_tokens: 700,
     response_format: { type: 'json_object' },
   }, { headers: { Authorization: `Bearer ${apiKey}` }, timeout: TIMEOUT_MS });
+  const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
+  costTracker.recordUsage({ service: 'earnings', market, modelId: MODEL, response: res?.data });
   const txt = res?.data?.choices?.[0]?.message?.content || '';
   const parsed = _safeParseJson(txt);
   if (!parsed || typeof parsed !== 'object') throw new Error('parse-failed');

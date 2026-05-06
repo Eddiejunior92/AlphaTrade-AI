@@ -32,6 +32,7 @@
 const axios = require('axios');
 const db = require('./db');
 const marketRegistry = require('./marketRegistry');
+const costTracker = require('./llmCostTracker');
 const fundamentalsService = require('./fundamentalsService');
 const sentimentService = require('./sentimentService');
 const { getWatchlist } = require('../strategies');
@@ -265,6 +266,8 @@ Snippets: ${sourceText}`;
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       timeout: LLM_TIMEOUT_MS,
     });
+    const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
+    costTracker.recordUsage({ service: 'knowledge_graph', market, modelId: LLM_MODEL, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     let parsed = null;
     try { parsed = JSON.parse(text); }

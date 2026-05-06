@@ -1,6 +1,7 @@
 const axios = require('axios');
 const llmWeighting = require('./llmWeightingService');
 const metaReasoner = require('./metaReasonerService');
+const costTracker = require('./llmCostTracker');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
@@ -375,7 +376,7 @@ function parseModelResponse(text, modelMeta) {
   };
 }
 
-async function callOpenRouter(model, prompt) {
+async function callOpenRouter(model, prompt, costCtx) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) return null;
   try {
@@ -397,6 +398,7 @@ async function callOpenRouter(model, prompt) {
         timeout: 20000,
       }
     );
+    costTracker.recordUsage({ service: 'ensemble', market: costCtx?.market || 'SHARED', modelId: model.model, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     _recordSuccess(model.id);
     return parseModelResponse(text, model);
@@ -408,7 +410,7 @@ async function callOpenRouter(model, prompt) {
   }
 }
 
-async function callXAI(model, prompt) {
+async function callXAI(model, prompt, costCtx) {
   const key = process.env.XAI_API_KEY || process.env.GROK_API_KEY;
   if (!key) return null;
   try {
@@ -428,6 +430,7 @@ async function callXAI(model, prompt) {
         timeout: 20000,
       }
     );
+    costTracker.recordUsage({ service: 'ensemble', market: costCtx?.market || 'SHARED', modelId: model.model, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     _recordSuccess(model.id);
     return parseModelResponse(text, model);
@@ -439,9 +442,9 @@ async function callXAI(model, prompt) {
   }
 }
 
-async function queryModel(model, prompt) {
-  if (model.provider === 'openrouter') return callOpenRouter(model, prompt);
-  if (model.provider === 'xai') return callXAI(model, prompt);
+async function queryModel(model, prompt, costCtx) {
+  if (model.provider === 'openrouter') return callOpenRouter(model, prompt, costCtx);
+  if (model.provider === 'xai') return callXAI(model, prompt, costCtx);
   return null;
 }
 
@@ -473,7 +476,7 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
   // STEP 3 — Run the 4 model votes in parallel (existing behaviour).
   // ---------------------------------------------------------------------
   const calls = pool.map(m =>
-    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }))
+    queryModel(m, buildPrompt({ symbol, priceData, sentiment, newsSentiment, holding, portfolio, role: m.role, patterns, fundamentals, indicators, intraday, historical, strategyName, premarket, adaptiveHints, portfolioRisk, orderFlow, optionsActivity, optionsFlow, earningsSignal, earningsTranscript, varStress, dynamicHedging, liquidityProfile, regimeContext, knowledgeContext, macroForecast, scenarioSim, ensembleWeights: weightsBlock, priorMeta: priorMetaBlock, causalContext, counterfactualContext, experienceContext, propagationContext, feedbackContext, marketPriorContext }), { market: market || 'US' })
   );
   const settled = await Promise.allSettled(calls);
   const results = settled

@@ -3,6 +3,8 @@
 // intra-day. Used ONLY by the longer-hold (swing) strategy — the day
 // strategy never calls into here.
 const axios = require('axios');
+const costTracker = require('./llmCostTracker');
+const marketRegistry = require('./marketRegistry');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const MODEL = process.env.GROK_FUNDAMENTALS_MODEL || 'grok-4-fast-non-reasoning';
@@ -101,6 +103,8 @@ async function fetchFromGrok(symbol) {
       },
       { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: TIMEOUT_MS },
     );
+    const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
+    costTracker.recordUsage({ service: 'fundamentals', market, modelId: MODEL, response: res.data });
     const text = res.data?.choices?.[0]?.message?.content || '';
     let parsed = null;
     try { parsed = JSON.parse(text); }
