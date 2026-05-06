@@ -54,7 +54,7 @@ function MiniSparkline({ points }) {
   );
 }
 
-export default function BacktestPanel({ marketOf }) {
+export default function BacktestPanel({ marketOf, asxEnabled = false }) {
   const [params, setParams] = useState(DEFAULTS);
   const [marketScope, setMarketScope] = useState('ALL');
   const [loading, setLoading] = useState(false);
@@ -153,7 +153,7 @@ export default function BacktestPanel({ marketOf }) {
             <p className="text-[11px] text-[var(--text-dim)] mt-0.5">Rules-based proxy on daily bars (RSI + trend + MACD). Slippage, commission, trailing stop, regime filter all configurable. Not a full 4-LLM replay.</p>
           </div>
           <div className="flex items-center gap-2">
-            <MarketFilter value={marketScope} onChange={onScopeChange} />
+            <MarketFilter value={marketScope} onChange={onScopeChange} asxEnabled={asxEnabled} />
             <button onClick={run} disabled={loading}
               className="px-4 py-2 rounded-xl bg-[var(--green)] text-black font-semibold text-sm hover:bg-[var(--green)]/80 disabled:opacity-50 disabled:cursor-not-allowed">
               {loading ? 'Running…' : 'Run backtest'}
@@ -256,7 +256,7 @@ export default function BacktestPanel({ marketOf }) {
         <div className="bg-white/5 rounded-2xl border border-white/10 p-5">
           <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
             <h3 className="text-sm font-bold text-white">Recent runs</h3>
-            <MarketFilter value={recentFilter} onChange={setRecentFilter} counts={recentCounts} />
+            <MarketFilter value={recentFilter} onChange={setRecentFilter} counts={recentCounts} asxEnabled={asxEnabled} />
           </div>
           <div className="space-y-1.5">
             {filteredRecent.map(r => {

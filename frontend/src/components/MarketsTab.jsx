@@ -6,7 +6,7 @@ import MarketFilter from './MarketFilter';
 import SectorFilter, { buildSectorCounts } from './SectorFilter';
 import FxBadge from './FxBadge';
 
-export default function MarketsTab({ fx, sectorOf = () => 'Other', focusSymbol = null, onFocusConsumed }) {
+export default function MarketsTab({ fx, sectorOf = () => 'Other', focusSymbol = null, onFocusConsumed, asxEnabled = false }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -84,7 +84,7 @@ export default function MarketsTab({ fx, sectorOf = () => 'Other', focusSymbol =
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <MarketFilter value={filter} onChange={setFilter} counts={counts} />
+          <MarketFilter value={filter} onChange={setFilter} counts={counts} asxEnabled={asxEnabled} />
           <SectorFilter value={sector} onChange={setSector} counts={sectorCounts} />
           <button
             onClick={handleRefresh}

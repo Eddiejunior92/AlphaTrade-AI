@@ -600,6 +600,7 @@ export default function App() {
         {tab === 'markets' && (
           <ErrorBoundary>
             <MarketsTab fx={fx} sectorOf={sectorOf}
+              asxEnabled={!!state?.asxEnabled}
               focusSymbol={focusSymbol}
               onFocusConsumed={() => setFocusSymbol(null)} />
           </ErrorBoundary>
@@ -609,6 +610,7 @@ export default function App() {
           <ErrorBoundary>
             <CompaniesTab
               companies={companies}
+              asxEnabled={!!state?.asxEnabled}
               onJumpToMarkets={(sym) => { setFocusSymbol(sym); setTab('markets'); }}
               onJumpToBriefing={() => setTab('home')}
             />
@@ -799,7 +801,7 @@ export default function App() {
 
         {tab === 'backtest' && (
           <ErrorBoundary>
-            <BacktestPanel marketOf={marketOf} />
+            <BacktestPanel marketOf={marketOf} asxEnabled={!!state?.asxEnabled} />
           </ErrorBoundary>
         )}
 

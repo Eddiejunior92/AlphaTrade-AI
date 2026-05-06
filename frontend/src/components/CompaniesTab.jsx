@@ -10,7 +10,7 @@ import { SECTORS } from '../lib/sectors';
 //
 // Quick-link buttons jump the user to the Markets card or the Pre-market
 // briefing for that symbol — both flows already exist in App.jsx.
-export default function CompaniesTab({ companies = [], onJumpToMarkets, onJumpToBriefing }) {
+export default function CompaniesTab({ companies = [], onJumpToMarkets, onJumpToBriefing, asxEnabled = false }) {
   // App.jsx fetches /api/companies once on mount and shares it with every
   // surface (Markets sector lookup, Live Signals chip, etc.) — we consume
   // that same list here instead of re-fetching to keep one source of truth.
@@ -83,7 +83,7 @@ export default function CompaniesTab({ companies = [], onJumpToMarkets, onJumpTo
 
       {/* Scope controls */}
       <div className="flex flex-wrap items-center gap-2">
-        <MarketFilter value={marketFilter} onChange={setMarketFilter} counts={marketCounts} />
+        <MarketFilter value={marketFilter} onChange={setMarketFilter} counts={marketCounts} asxEnabled={asxEnabled} />
         <SectorFilter value={sectorFilter} onChange={setSectorFilter} counts={sectorCounts} />
         <div className="ml-auto flex items-center gap-2">
           <input
