@@ -87,6 +87,22 @@ async function start({ getSnapshot, getRecentTrades }) {
 
   _client.once(Events.ClientReady, async (c) => {
     console.log(`[DiscordChat] Logged in as ${c.user.tag}. Listening on ${channelId ? `channel ${channelId} + DMs` : 'DMs only (set DISCORD_CHAT_CHANNEL_ID for a server channel)'}`);
+    // Diagnostic: enumerate every guild + visible text channel so we can
+    // see exactly where the bot ended up. If the configured channelId
+    // doesn't appear in this list, the bot is in the wrong server (or
+    // doesn't have View Channel permission for that channel).
+    try {
+      const guilds = c.guilds.cache;
+      console.log(`[DiscordChat] In ${guilds.size} server(s):`);
+      for (const [, g] of guilds) {
+        const textChannels = g.channels.cache.filter(ch => typeof ch.send === 'function');
+        console.log(`[DiscordChat]   • ${g.name} (id=${g.id}) — ${textChannels.size} text channel(s):`);
+        for (const [, ch] of textChannels) {
+          const marker = ch.id === channelId ? '  ← CONFIGURED' : '';
+          console.log(`[DiscordChat]       #${ch.name} (id=${ch.id})${marker}`);
+        }
+      }
+    } catch (e) { console.error('[DiscordChat] guild enumeration failed:', e.message); }
     // Diagnostic heartbeat: try to fetch the configured channel and post a
     // boot message. This proves (a) the bot is in the server, (b) it can see
     // the channel, and (c) it has Send Messages permission. If any of those
