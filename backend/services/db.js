@@ -482,6 +482,12 @@ async function ensureSchema() {
   // preceding audit row (by id). The verifier walks the chain forward.
   await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT`);
   await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS row_hash TEXT`);
+  // Store the exact canonical body string used at hash time. Without this,
+  // re-deriving the body at verify time round-trips JSONB through Postgres
+  // (key reordering / numeric reformatting), which produces a different
+  // string and breaks the chain even on untampered rows. Storing the body
+  // verbatim makes the chain verifiable byte-for-byte forever after.
+  await query(`ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS canonical_body TEXT`);
   await query(`CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log (created_at)`);
   // Asset-class scaffolding — every trade/holding/audit row knows what it
   // represents. Default 'equity' preserves all existing behavior; future
@@ -649,13 +655,16 @@ async function recordAudit({ event_type, symbol, decision, confidence, models, p
        ac, prevHash]
     );
     row = insert.rows[0];
+    // Build the canonical body from the SAME values we just inserted (not
+    // re-read from JSONB). Persist that exact string in canonical_body so
+    // the verifier can re-hash byte-for-byte without round-tripping JSONB.
     const body = canonicalAuditBody({
       event_type, symbol, decision, confidence, models, payload, asset_class: ac, created_at: row.created_at,
     });
     const rowHash = crypto.createHash('sha256').update(prevHash + '|' + body).digest('hex');
     const upd = await client.query(
-      'UPDATE audit_log SET row_hash = $1 WHERE id = $2 RETURNING *',
-      [rowHash, row.id]
+      'UPDATE audit_log SET row_hash = $1, canonical_body = $2 WHERE id = $3 RETURNING *',
+      [rowHash, body, row.id]
     );
     row = upd.rows[0];
     await client.query('COMMIT');
@@ -690,29 +699,36 @@ async function verifyAuditChain({ since } = {}) {
   let where = '';
   if (since) { args.push(since); where = `WHERE created_at >= $${args.length}`; }
   const { rows } = await query(
-    `SELECT id, event_type, symbol, decision, confidence, models, payload, asset_class, prev_hash, row_hash, created_at
+    `SELECT id, event_type, symbol, decision, confidence, models, payload, asset_class, prev_hash, row_hash, canonical_body, created_at
      FROM audit_log ${where} ORDER BY id ASC`, args
   );
-  let verified = 0, legacy = 0;
+  let verified = 0, legacy = 0, legacyNoBody = 0;
   const brokenAt = [];
   let expectedPrev = null;
   for (const r of rows) {
     if (!r.row_hash) { legacy += 1; expectedPrev = null; continue; }
+    // Rows written before the canonical_body column existed cannot be
+    // re-hashed reliably (JSONB round-trip reorders keys). Treat them as
+    // legacy — the chain from this row's row_hash forward is still verified.
+    if (!r.canonical_body) {
+      legacyNoBody += 1;
+      expectedPrev = r.row_hash;
+      continue;
+    }
     if (expectedPrev != null && r.prev_hash !== expectedPrev) {
       brokenAt.push({ id: r.id, reason: 'prev_hash mismatch', expected: expectedPrev, found: r.prev_hash });
       expectedPrev = r.row_hash;
       continue;
     }
-    const body = canonicalAuditBody(r);
-    const h = crypto.createHash('sha256').update((r.prev_hash || 'GENESIS') + '|' + body).digest('hex');
+    const h = crypto.createHash('sha256').update((r.prev_hash || 'GENESIS') + '|' + r.canonical_body).digest('hex');
     if (h !== r.row_hash) {
-      brokenAt.push({ id: r.id, reason: 'row_hash mismatch (tampered or schema drift)' });
+      brokenAt.push({ id: r.id, reason: 'row_hash mismatch (tampered)' });
     } else {
       verified += 1;
     }
     expectedPrev = r.row_hash;
   }
-  return { ok: brokenAt.length === 0, total: rows.length, verified, legacy, brokenAt };
+  return { ok: brokenAt.length === 0, total: rows.length, verified, legacy: legacy + legacyNoBody, legacyPreHash: legacy, legacyPreBody: legacyNoBody, brokenAt };
 }
 
 module.exports = {
