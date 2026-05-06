@@ -16,6 +16,7 @@ const discordChatService = require('./services/discordChatService');
 const complianceService = require('./services/complianceService');
 const alpacaService = require('./services/alpacaService');
 const llmService = require('./services/llmService');
+const fxService = require('./services/fxService');
 const brokerService = require('./services/brokerService');
 const sentimentService = require('./services/sentimentService');
 const premarketService = require('./services/premarketService');
@@ -847,6 +848,21 @@ app.get('/api/counterfactuals', async (req, res) => {
 // user must POST explicitly. The applier dispatches via a hard-coded
 // whitelist inside the service — unknown kinds are refused before any
 // state writer runs.
+// FX status / on-demand refresh. GET is unauthenticated (status is already
+// in /api/state). POST forces an immediate provider rotation — useful when
+// adding a new EXCHANGERATE_API_KEY or after a known upstream outage.
+app.get('/api/fx', (_req, res) => {
+  try { res.json(fxService.getStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/fx/refresh', requireOperator, async (_req, res) => {
+  try {
+    const r = await fxService.refresh();
+    res.json({ success: r.ok, ...r, status: fxService.getStatus() });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 // Proactive Alerts — predictive / early-warning detection. Strictly
 // informational; never changes any safety rule. GET returns active alerts +
 // cooldown state + history; POST /toggle (operator) flips the master switch.

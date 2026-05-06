@@ -2228,6 +2228,22 @@ function scheduleMacroForecastRefresh() {
   }, 60 * 60 * 1000);
 }
 
+// --- FX live-rate refresher -----------------------------------------------
+// Refreshes AUD/USD every FX_TTL_SECONDS (default 30 min). Runs regardless of
+// market-hours so the rate is fresh by the time Sydney opens. Lazy refresh
+// inside fxService.getAudToUsd() handles boot + on-demand reads.
+let fxRefreshHandle = null;
+function scheduleFxRefresh() {
+  if (fxRefreshHandle) clearInterval(fxRefreshHandle);
+  const intervalMs = (parseInt(process.env.FX_TTL_SECONDS || '1800')) * 1000;
+  fxRefreshHandle = setInterval(async () => {
+    try {
+      const r = await fxService.refresh();
+      if (r.ok) console.log(`[FX] Scheduled refresh: AUD/USD=${r.rate.toFixed(4)} (${r.source})`);
+    } catch (e) { console.error('[FX] Scheduled refresh failed:', e.message); }
+  }, intervalMs);
+}
+
 // --- Proactive alerts: predictive / early-warning detection layer ---------
 // Runs every 60s during US market hours (and during ASX hours when ASX is
 // enabled). Pure observability — uses the same snapshot the dashboard reads
@@ -2581,6 +2597,12 @@ setTimeout(() => {
 }, 75_000);
 scheduleMacroForecastRefresh();
 scheduleProactiveAlerts();
+scheduleFxRefresh();
+// Boot-time FX refresh — fire-and-forget so the rate is warm before the
+// first ASX cycle, but never blocks startup if all providers are down.
+fxService.refresh()
+  .then(r => { if (r.ok) console.log(`[FX] Startup refresh: AUD/USD=${r.rate.toFixed(4)} (${r.source})`); })
+  .catch(e => console.error('[FX] Startup refresh failed:', e.message));
 
 // [Data Depth] Earnings-transcript warm-up — delayed 105s. Initial batch
 // targets the first 6 US watchlist symbols only so we don't burn a chunk

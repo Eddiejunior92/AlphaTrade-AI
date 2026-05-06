@@ -8,9 +8,18 @@ export default function FxBadge({ fx, compact = false }) {
   if (!fx) return null;
   const rate = fx.audusd;
   const ok = typeof rate === 'number' && Number.isFinite(rate) && rate > 0;
-  const stale = !!fx.stale;
-  const color = !ok ? 'var(--red)' : stale ? 'var(--yellow)' : 'var(--green)';
-  const label = !ok ? 'No FX rate' : stale ? 'FX (stale)' : 'FX (live)';
+  // health is the canonical signal from the backend: 'live' | 'stale' |
+  // 'fallback' | 'cold'. Older payloads only had `stale`, so derive it.
+  const health = fx.health || (!ok ? 'cold' : fx.stale ? 'stale' : 'live');
+  const isFallback = health === 'fallback' || fx.source === 'fallback_constant';
+  const color = !ok ? 'var(--red)'
+              : isFallback ? 'var(--red)'
+              : health === 'stale' ? 'var(--yellow)'
+              : 'var(--green)';
+  const label = !ok ? 'No FX rate'
+              : isFallback ? 'FX (fallback)'
+              : health === 'stale' ? 'FX (stale)'
+              : 'FX (live)';
   const fetched = fx.fetchedAt
     ? new Date(fx.fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : null;
@@ -18,7 +27,7 @@ export default function FxBadge({ fx, compact = false }) {
   if (compact) {
     return (
       <span
-        title={`AUD/USD ${ok ? rate.toFixed(4) : '—'} · source ${fx.source || '?'}${fetched ? ` · @ ${fetched}` : ''}${stale ? ' · stale' : ''}`}
+        title={`AUD/USD ${ok ? rate.toFixed(4) : '—'} · source ${fx.source || '?'}${fetched ? ` · @ ${fetched}` : ''}${health !== 'live' ? ` · ${health}` : ''}`}
         className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full"
         style={{ background: `color-mix(in srgb, ${color} 14%, transparent)`, color }}
       >
