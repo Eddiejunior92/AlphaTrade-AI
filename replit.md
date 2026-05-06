@@ -77,6 +77,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   Manual buy/sell endpoint (`POST /api/manual-order`) is operator-token-gated (strict) and re-uses `agent.executeOrder` so manual trades enforce kill-switch, circuit breaker, atomic cash/holdings, and tamper-evident audit log just like autonomous trades. Writes a `MANUAL_ORDER` audit row in addition to `TRADE_EXECUTED`.
 *   Voice chat persists last 50 messages in `localStorage` under `alphatrade.chat.history` so reopening the panel restores context. Trash icon in chat header clears it.
 *   Cost knobs: `AGENT_INTERVAL_SECONDS` (default 60s — was 20s) controls the master cycle cadence; lowering it multiplies LLM spend linearly. `LLM_SKIP_PRICE_BPS` (default 70 = 0.70%) is the price-drift threshold below which a cached HOLD verdict is reused instead of re-calling the ensemble; widening it cuts spend during chop. Raise/lower via env vars without code changes.
+*   Daily performance reports are PER-MARKET: US fires at 21:30 UTC (~16:30 ET, 30min after US close), ASX fires at 07:00 UTC (after the latest possible Sydney close — covers both AEST and AEDT). Each market gets its own Discord post with its own LLM cost (perfMetrics tags increments by `sc.market`), its own data-feed cost (`DATA_FEED_COST_USD_PER_DAY_US`/`_ASX`, fallback to legacy `DATA_FEED_COST_USD_PER_DAY` split 50/50), and its own trade list. Trade-day SQL filter uses `(created_at AT TIME ZONE $tz)::date` so ASX sessions that span midnight UTC are correctly attributed.
 
 ## Pointers
 

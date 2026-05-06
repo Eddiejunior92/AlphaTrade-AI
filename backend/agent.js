@@ -81,6 +81,13 @@ const perfMetrics = {
   ensembleSkipped: 0,       // skip-cache reuse count (HOLD passthroughs)
   ensembleQuietSkipped: 0,  // quiet-market shortcut hits (no LLM call at all)
   ensembleEscalated: 0,     // calls that included the premium tier
+  // Per-market split — used by the daily performance report so each market
+  // (US / ASX) is billed only for its own LLM activity. Tagged from
+  // analyzeAndTradeSymbol() using strategyConfig.market.
+  ensembleCallsByMarket:        { US: 0, ASX: 0 },
+  ensembleSkippedByMarket:      { US: 0, ASX: 0 },
+  ensembleQuietSkippedByMarket: { US: 0, ASX: 0 },
+  ensembleEscalatedByMarket:    { US: 0, ASX: 0 },
   watchdogResets: 0,
   startedAt: Date.now(),
 };
@@ -999,11 +1006,16 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   // need a prior cached signal, just a sleepy regime + neutral news + no
   // setup. Catches the long tail of names that aren't in cache yet.
   const quietSignal = tryQuietMarketShortcut({ strategyName: sc.name, holding, escalate, regime, newsSentiment, patterns, intraday });
+  // Tag every counter increment with the symbol's market so the daily
+  // performance report can bill each market for its own LLM activity.
+  const _mktKey = (sc.market || 'US').toUpperCase() === 'ASX' ? 'ASX' : 'US';
   if (quietSignal) {
     perfMetrics.ensembleQuietSkipped++;
+    perfMetrics.ensembleQuietSkippedByMarket[_mktKey]++;
     signal = quietSignal;
   } else if (canSkip) {
     perfMetrics.ensembleSkipped++;
+    perfMetrics.ensembleSkippedByMarket[_mktKey]++;
     signal = {
       ...skipCached.signal,
       _skippedFromCache: true,
@@ -1012,7 +1024,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     };
   } else {
     perfMetrics.ensembleCalls++;
-    if (escalate) perfMetrics.ensembleEscalated++;
+    perfMetrics.ensembleCallsByMarket[_mktKey]++;
+    if (escalate) {
+      perfMetrics.ensembleEscalated++;
+      perfMetrics.ensembleEscalatedByMarket[_mktKey]++;
+    }
     signal = await llmService.getEnsembleDecision({
       symbol, priceData, sentiment, newsSentiment, holding, portfolio,
       patterns, fundamentals, indicators, intraday, historical,
@@ -2108,22 +2124,32 @@ function scheduleAdaptiveRecompute() {
 // close so SELL ladders settle and trade_memory rows land). Computes per-
 // market stats, stores the row in daily_performance, and sends a formatted
 // Discord summary. Best-effort: any error logs and reschedules for tomorrow.
-let dailyPerfHandle = null;
-function scheduleDailyPerformanceReport() {
-  if (dailyPerfHandle) clearTimeout(dailyPerfHandle);
+// One scheduler PER MARKET: US fires ~30min after US close (21:30 UTC ≈
+// 16:30 ET), ASX fires ~30min after ASX close (07:00 UTC ≈ 17:00 AEST /
+// 18:00 AEDT — set safely after the latest possible close). Each market
+// gets its own Discord post with its own LLM/data costs and trades.
+function _scheduleMarketReport(market, hourUTC, minuteUTC, handleRef) {
+  if (handleRef.t) clearTimeout(handleRef.t);
   const now = new Date();
   const next = new Date(now);
-  next.setUTCHours(21, 30, 0, 0);
+  next.setUTCHours(hourUTC, minuteUTC, 0, 0);
   if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  dailyPerfHandle = setTimeout(async () => {
+  handleRef.t = setTimeout(async () => {
     try {
-      const r = await dailyPerformanceService.runDailyPerformanceJob({ perfMetrics });
-      console.log(`[DailyPerf] Auto-run: US=${r.summary.us.n_trades}t $${r.summary.us.net_pnl_usd.toFixed(2)} | ASX=${r.summary.asx.n_trades}t $${r.summary.asx.net_pnl_usd.toFixed(2)} | discord=${r.discordSent ? 'sent' : 'skipped/failed'}`);
+      const r = await dailyPerformanceService.runDailyPerformanceJob({ market, perfMetrics });
+      const m = r.summary?.[market.toLowerCase()];
+      console.log(`[DailyPerf] Auto-run ${market}: ${m?.n_trades || 0}t $${(m?.net_pnl_usd || 0).toFixed(2)} | discord=${r.discordSent ? 'sent' : 'skipped/failed'}`);
     } catch (e) {
-      console.error('[DailyPerf] Auto-run failed:', e.message);
+      console.error(`[DailyPerf] Auto-run ${market} failed:`, e.message);
     }
-    scheduleDailyPerformanceReport();
+    _scheduleMarketReport(market, hourUTC, minuteUTC, handleRef);
   }, next - now);
+}
+const _usPerfHandle  = { t: null };
+const _asxPerfHandle = { t: null };
+function scheduleDailyPerformanceReport() {
+  _scheduleMarketReport('US',  21, 30, _usPerfHandle);  // 16:30 ET
+  _scheduleMarketReport('ASX',  7,  0, _asxPerfHandle); // 17:00 AEST / 18:00 AEDT
 }
 
 let optionsActivityHandle = null;

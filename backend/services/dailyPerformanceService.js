@@ -66,7 +66,15 @@ async function ensureSchema() {
 //                      × 1% (proxy, since per-trade risk_at_entry isn't
 //                      explicitly stored — caveat is shown in the summary).
 // ----------------------------------------------------------------------------
+// Per-market trading-day boundary: US sessions live in America/New_York;
+// ASX sessions in Australia/Sydney. ASX session in UTC spans midnight
+// (~23:00 prev → 06:00 current), so a naive UTC ::date filter would miss
+// the morning leg. AT TIME ZONE rotates the timestamp into the local
+// trading day before the cast.
+const MARKET_TZ = { US: 'America/New_York', ASX: 'Australia/Sydney' };
+
 async function computeMarketStats(tradingDate, market) {
+  const tz = MARKET_TZ[market] || 'UTC';
   const closedQ = await db.query(`
     SELECT
       COUNT(*)::int                         AS n_trades,
@@ -80,9 +88,8 @@ async function computeMarketStats(tradingDate, market) {
       ), 0)::float                          AS avg_r
     FROM trade_memory
     WHERE market = $1
-      AND created_at >= $2::date
-      AND created_at <  ($2::date + INTERVAL '1 day')
-  `, [market, tradingDate]);
+      AND (created_at AT TIME ZONE $3)::date = $2::date
+  `, [market, tradingDate, tz]);
   const closed = closedQ.rows[0];
 
   // Best winner + worst loser of the day. Two separate queries so we get the
@@ -90,14 +97,14 @@ async function computeMarketStats(tradingDate, market) {
   const [bestRes, worstRes] = await Promise.all([
     db.query(`
       SELECT symbol, pnl_usd::float AS pnl_usd FROM trade_memory
-      WHERE market=$1 AND created_at >= $2::date AND created_at < ($2::date + INTERVAL '1 day')
+      WHERE market=$1 AND (created_at AT TIME ZONE $3)::date = $2::date
       ORDER BY pnl_usd DESC LIMIT 1
-    `, [market, tradingDate]),
+    `, [market, tradingDate, tz]),
     db.query(`
       SELECT symbol, pnl_usd::float AS pnl_usd FROM trade_memory
-      WHERE market=$1 AND created_at >= $2::date AND created_at < ($2::date + INTERVAL '1 day')
+      WHERE market=$1 AND (created_at AT TIME ZONE $3)::date = $2::date
       ORDER BY pnl_usd ASC LIMIT 1
-    `, [market, tradingDate]),
+    `, [market, tradingDate, tz]),
   ]);
   const best  = bestRes.rows[0]  && bestRes.rows[0].pnl_usd  > 0 ? bestRes.rows[0]  : null;
   const worst = worstRes.rows[0] && worstRes.rows[0].pnl_usd < 0 ? worstRes.rows[0] : null;
@@ -106,15 +113,15 @@ async function computeMarketStats(tradingDate, market) {
     SELECT COALESCE(SUM(qty * price * 0.01), 0)::float AS total_risk_usd
     FROM trades
     WHERE side='BUY' AND market=$1
-      AND created_at >= $2::date AND created_at < ($2::date + INTERVAL '1 day')
-  `, [market, tradingDate]);
+      AND (created_at AT TIME ZONE $3)::date = $2::date
+  `, [market, tradingDate, tz]);
 
   const regimeQ = await db.query(`
     SELECT regime, COALESCE(SUM(pnl_usd), 0)::float AS pnl, COUNT(*)::int AS n
     FROM trade_memory
-    WHERE market=$1 AND created_at >= $2::date AND created_at < ($2::date + INTERVAL '1 day')
+    WHERE market=$1 AND (created_at AT TIME ZONE $3)::date = $2::date
     GROUP BY regime ORDER BY pnl DESC LIMIT 1
-  `, [market, tradingDate]);
+  `, [market, tradingDate, tz]);
 
   return {
     market,
@@ -149,9 +156,18 @@ async function computeIntelligenceInsights() {
 // ----------------------------------------------------------------------------
 // Top-level compute — combines per-market stats + portfolio state + insights.
 // ----------------------------------------------------------------------------
-async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
+// Returns YYYY-MM-DD as it reads in the given IANA timezone today.
+function _todayInTz(tz) {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  return fmt.format(new Date()); // 'YYYY-MM-DD'
+}
+
+async function computeDailySummary({ tradingDate, perfMetrics, market } = {}) {
   await ensureSchema();
-  const date = tradingDate || new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
+  // Trading date defaults are timezone-aware so an ASX report run at 07:00
+  // UTC picks today's Sydney date even when the UTC date already rolled.
+  const usDate  = tradingDate || _todayInTz('America/New_York');
+  const asxDate = tradingDate || _todayInTz('Australia/Sydney');
 
   const portRows = await db.query(`SELECT * FROM portfolio LIMIT 1`);
   const portfolio = portRows.rows[0] || {};
@@ -172,50 +188,55 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
     ? { abs_usd: dayEndEquity - dayStartEquity, pct: dayStartEquity > 0 ? ((dayEndEquity - dayStartEquity) / dayStartEquity) * 100 : null }
     : null;
 
+  // Skip the market(s) the caller didn't ask for so the SQL stays cheap.
   const [us, asx, insights] = await Promise.all([
-    computeMarketStats(date, 'US'),
-    computeMarketStats(date, 'ASX'),
+    (!market || market === 'US')  ? computeMarketStats(usDate,  'US')  : Promise.resolve(null),
+    (!market || market === 'ASX') ? computeMarketStats(asxDate, 'ASX') : Promise.resolve(null),
     computeIntelligenceInsights(),
   ]);
 
-  const llm = perfMetrics ? {
-    calls:     perfMetrics.ensembleCalls       || 0,
-    skipped:   (perfMetrics.ensembleSkipped    || 0) + (perfMetrics.ensembleQuietSkipped || 0),
-    escalated: perfMetrics.ensembleEscalated   || 0,
-  } : null;
-
-  // Operating-cost estimate. Token-level accounting would require capturing
-  // the `usage` block from every OpenRouter response — out of scope for this
-  // pass. Instead we use an env-tunable per-call rate. The default 0.002 USD
-  // is a generous mid-range estimate (Grok-4-Fast/Gemini-Flash sit far below;
-  // GPT-4o sits above) so reported "net after costs" is conservative — not
-  // optimistic. Operators can tune LLM_CALL_COST_USD once they want a
-  // tighter number. Data-feed cost is a flat daily figure (Alpaca free tier
-  // = $0; if/when a paid feed is wired, set DATA_FEED_COST_USD_PER_DAY).
+  // Per-market LLM accounting. perfMetrics carries per-market counters
+  // (tagged at increment time in agent.js) so each report bills only the
+  // calls actually made for that market's symbols.
   const llmCallCost  = Number(process.env.LLM_CALL_COST_USD) || 0.002;
-  const dataDailyUSD = Number(process.env.DATA_FEED_COST_USD_PER_DAY) || 0;
-  // NOTE: `ensembleEscalated` is a SUBSET of `ensembleCalls` (every escalated
-  // tick also increments ensembleCalls in agent.js — see perfMetrics around
-  // L1012). Only count `calls` here, otherwise escalated ticks are billed
-  // twice and net P&L is understated.
-  const llmCalls     = llm?.calls || 0;
-  const llmCostUSD   = +(llmCalls * llmCallCost).toFixed(2);
-  const totalGrossUSD = (us.net_pnl_usd || 0) + (asx.net_pnl_usd || 0);
-  const totalCostsUSD = +(llmCostUSD + dataDailyUSD).toFixed(2);
-  const totalNetUSD   = +(totalGrossUSD - totalCostsUSD).toFixed(2);
-  const expenses = {
-    llm_call_cost_usd: llmCallCost,
-    llm_calls_billed:  llmCalls,
-    llm_cost_usd:      llmCostUSD,
-    data_feed_usd:     +dataDailyUSD.toFixed(2),
-    total_costs_usd:   totalCostsUSD,
-    total_gross_usd:   +totalGrossUSD.toFixed(2),
-    total_net_usd:     totalNetUSD,
+  // Data-feed cost can be set per-market (Alpaca → US, IBKR → ASX). Falls
+  // back to splitting DATA_FEED_COST_USD_PER_DAY 50/50 if only the legacy
+  // single-value var is set.
+  const legacyData   = Number(process.env.DATA_FEED_COST_USD_PER_DAY) || 0;
+  const dataUS       = process.env.DATA_FEED_COST_USD_PER_DAY_US  != null ? Number(process.env.DATA_FEED_COST_USD_PER_DAY_US)  : legacyData / 2;
+  const dataASX      = process.env.DATA_FEED_COST_USD_PER_DAY_ASX != null ? Number(process.env.DATA_FEED_COST_USD_PER_DAY_ASX) : legacyData / 2;
+  // NOTE: `ensembleEscalated*` is a SUBSET of `ensembleCalls*` (every
+  // escalated tick also increments calls). Only bill `calls` here.
+  const callsByMkt  = perfMetrics?.ensembleCallsByMarket   || { US: 0, ASX: 0 };
+  const skipByMkt   = perfMetrics?.ensembleSkippedByMarket || { US: 0, ASX: 0 };
+  const quietByMkt  = perfMetrics?.ensembleQuietSkippedByMarket || { US: 0, ASX: 0 };
+  const escByMkt    = perfMetrics?.ensembleEscalatedByMarket    || { US: 0, ASX: 0 };
+
+  const buildExpenses = (mkt, marketStats) => {
+    const calls = callsByMkt[mkt] || 0;
+    const llmCost = +(calls * llmCallCost).toFixed(2);
+    const data    = +((mkt === 'US' ? dataUS : dataASX) || 0).toFixed(2);
+    const gross   = +((marketStats?.net_pnl_usd || 0)).toFixed(2);
+    const costs   = +(llmCost + data).toFixed(2);
+    return {
+      llm_call_cost_usd: llmCallCost,
+      llm_calls_billed:  calls,
+      llm_skipped:       (skipByMkt[mkt] || 0) + (quietByMkt[mkt] || 0),
+      llm_escalated:     escByMkt[mkt] || 0,
+      llm_cost_usd:      llmCost,
+      data_feed_usd:     data,
+      total_costs_usd:   costs,
+      total_gross_usd:   gross,
+      total_net_usd:     +(gross - costs).toFixed(2),
+    };
   };
 
   return {
-    tradingDate: date,
+    tradingDate: market === 'ASX' ? asxDate : usDate,
+    market: market || null,                 // null = both-market combined run
     us, asx,
+    expenses_us:  us  ? buildExpenses('US',  us)  : null,
+    expenses_asx: asx ? buildExpenses('ASX', asx) : null,
     breaker_tripped: !!portfolio.circuit_breaker,
     mode:            portfolio.trading_mode || 'paper',
     risk_scale:      portfolio.risk_scale   || 'balanced',
@@ -223,8 +244,6 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
     day_end_equity:   dayEndEquity,
     equity_change:    equityChange,
     insights,
-    llm,
-    expenses,
   };
 }
 
@@ -235,6 +254,7 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
 async function storeSummary(summary) {
   for (const key of ['us', 'asx']) {
     const s = summary[key];
+    if (!s) continue;  // single-market run skips the other side
     await db.query(`
       INSERT INTO daily_performance (
         trading_date, market, net_pnl_usd, n_trades, n_wins, n_losses, win_rate,
@@ -309,18 +329,31 @@ function formatMarketBlock(label, flag, s) {
   return lines.join('\n');
 }
 
-function formatSummaryText(summary) {
-  const dateLabel = new Date(summary.tradingDate + 'T00:00:00Z').toUTCString().slice(0, 16);
-  const breaker   = summary.breaker_tripped ? '🚨 **TRIPPED**' : '✅ Clear';
-  const insights  = summary.insights;
-  const llm       = summary.llm;
+// Per-market formatter. `market` is 'US' or 'ASX'. Only renders that
+// market's stats, that market's expense breakdown, and the portfolio-wide
+// capital position (cash+holdings is unified USD-equivalent so it's the
+// same number on either report — we label it accordingly).
+function formatMarketReport(summary, market) {
+  const mkt        = market.toUpperCase();
+  const data       = mkt === 'ASX' ? summary.asx : summary.us;
+  const expenses   = mkt === 'ASX' ? summary.expenses_asx : summary.expenses_us;
+  const flag       = mkt === 'ASX' ? '🇦🇺' : '🇺🇸';
+  const label      = mkt === 'ASX' ? 'ASX Markets' : 'US Markets';
+  const dateLabel  = new Date(summary.tradingDate + 'T00:00:00Z').toUTCString().slice(0, 16);
+  const breaker    = summary.breaker_tripped ? '🚨 **TRIPPED**' : '✅ Clear';
+  const insights   = summary.insights;
+  const fmtSigned  = (v) => `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`;
 
-  const skipRate = (llm && (llm.calls + llm.skipped) > 0)
-    ? ((llm.skipped / (llm.calls + llm.skipped)) * 100).toFixed(0)
-    : '0';
-  const llmLine = llm
-    ? `• LLM cycles: ${llm.calls.toLocaleString()} called · ${llm.skipped.toLocaleString()} skipped (${skipRate}% skip-rate) · ${llm.escalated.toLocaleString()} escalated to premium`
-    : null;
+  const e = expenses || {};
+  const totalLLMActivity = (e.llm_calls_billed || 0) + (e.llm_skipped || 0);
+  const skipRate = totalLLMActivity > 0 ? ((e.llm_skipped / totalLLMActivity) * 100).toFixed(0) : '0';
+  const pnlBlock = e.total_gross_usd != null ? [
+    `💰 **Net P&L (after costs)**`,
+    `• Gross: **${fmtSigned(e.total_gross_usd)}**  •  Costs: $${e.total_costs_usd.toFixed(2)}  •  **Net: ${fmtSigned(e.total_net_usd)}**`,
+    `• Expenses: LLM $${e.llm_cost_usd.toFixed(2)} (${(e.llm_calls_billed || 0).toLocaleString()} calls @ $${e.llm_call_cost_usd}) + Data $${e.data_feed_usd.toFixed(2)}`,
+    `• LLM activity: ${(e.llm_calls_billed || 0).toLocaleString()} called · ${(e.llm_skipped || 0).toLocaleString()} skipped (${skipRate}% skip-rate) · ${(e.llm_escalated || 0).toLocaleString()} escalated to premium`,
+    '',
+  ] : [];
 
   const fmtRegime = (r) => {
     if (!r) return '*no closed trades*';
@@ -328,30 +361,14 @@ function formatSummaryText(summary) {
     const n = r.n === 1 ? '1 trade' : `${r.n} trades`;
     return `${r.regime} (${s}$${Math.abs(r.pnl).toFixed(2)}, ${n})`;
   };
-  const usRegime  = fmtRegime(summary.us.best_regime);
-  const asxRegime = fmtRegime(summary.asx.best_regime);
-
-  // P&L summary — gross, expenses, net-after-costs. Always rendered (even
-  // on zero-trade days) so the operator can see today's run rate of LLM
-  // spend against revenue.
-  const e = summary.expenses || {};
-  const fmtSigned = (v) => `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`;
-  const pnlBlock = e.total_gross_usd != null ? [
-    `💰 **Net P&L (after costs)**`,
-    `• Gross: **${fmtSigned(e.total_gross_usd)}**  •  Costs: $${e.total_costs_usd.toFixed(2)}  •  **Net: ${fmtSigned(e.total_net_usd)}**`,
-    `• Expenses: LLM $${e.llm_cost_usd.toFixed(2)} (${e.llm_calls_billed.toLocaleString()} calls @ $${e.llm_call_cost_usd}) + Data $${e.data_feed_usd.toFixed(2)}`,
-    '',
-  ] : [];
 
   return [
-    `📊 **Daily Performance — ${dateLabel}**`,
+    `📊 **${mkt} Daily Performance — ${dateLabel}**`,
     '─────────────────────────────',
     ...pnlBlock,
-    formatMarketBlock('US Markets',  '🇺🇸', summary.us),
+    formatMarketBlock(label, flag, data),
     '',
-    formatMarketBlock('ASX Markets', '🇦🇺', summary.asx),
-    '',
-    `💼 **Capital Position**`,
+    `💼 **Capital Position** *(portfolio-wide, USD)*`,
     summary.day_start_equity != null
       ? `• Start: $${summary.day_start_equity.toFixed(2)}  →  End: $${summary.day_end_equity.toFixed(2)}`
       : `• End equity: $${summary.day_end_equity.toFixed(2)}`,
@@ -367,25 +384,47 @@ function formatSummaryText(summary) {
     `• Mode: **${summary.mode.toUpperCase()}**  •  Risk scale: **${summary.risk_scale.toUpperCase()}**`,
     '',
     `🧠 **Intelligence Layer**`,
-    `• Best regime today (US):  ${usRegime}`,
-    `• Best regime today (ASX): ${asxRegime}`,
+    `• Best regime today: ${fmtRegime(data?.best_regime)}`,
     insights.top_model    ? `• Top voter (cum.):    \`${insights.top_model.model_id}\` — ${(insights.top_model.wr * 100).toFixed(1)}% WR (n=${insights.top_model.n_trades})` : null,
     insights.bottom_model ? `• Bottom voter (cum.): \`${insights.bottom_model.model_id}\` — ${(insights.bottom_model.wr * 100).toFixed(1)}% WR (n=${insights.bottom_model.n_trades})` : null,
-    llmLine,
   ].filter(Boolean).join('\n');
 }
 
-async function sendToDiscord(summary) {
-  const text = formatSummaryText(summary);
-  const totalPnl = (summary.us.net_pnl_usd || 0) + (summary.asx.net_pnl_usd || 0);
+// Back-compat shim: formatSummaryText(summary) returns the report for
+// the market the summary was scoped to. If both markets are present
+// (legacy/manual run with no market filter), returns US then ASX
+// concatenated — the scheduler now sends them as two posts but this keeps
+// the manual API/test paths working.
+function formatSummaryText(summary) {
+  if (summary.market === 'US')  return formatMarketReport(summary, 'US');
+  if (summary.market === 'ASX') return formatMarketReport(summary, 'ASX');
+  const parts = [];
+  if (summary.us)  parts.push(formatMarketReport(summary, 'US'));
+  if (summary.asx) parts.push(formatMarketReport(summary, 'ASX'));
+  return parts.join('\n\n══════════════════════════════\n\n');
+}
+
+async function _sendOneMarket(summary, market) {
+  const data = market === 'ASX' ? summary.asx : summary.us;
+  const text = formatMarketReport(summary, market);
+  const pnl  = data?.net_pnl_usd || 0;
   // Color coding: red on tripped breaker, green on net profit, amber on loss.
-  const color = summary.breaker_tripped ? 0xff0000 : (totalPnl >= 0 ? 0x00c851 : 0xff8c00);
+  const color = summary.breaker_tripped ? 0xff0000 : (pnl >= 0 ? 0x00c851 : 0xff8c00);
+  const flag  = market === 'ASX' ? '🇦🇺' : '🇺🇸';
   await discord.sendAlert({
-    title: `📊 Daily Performance — ${summary.tradingDate}`,
+    title: `${flag} ${market} Daily Performance — ${summary.tradingDate}`,
     description: text,
     color,
     fields: [],
   });
+}
+
+async function sendToDiscord(summary) {
+  // Each market gets its OWN Discord post — separate trade list, separate
+  // expense breakdown, separate color coding. Skip a market that wasn't
+  // computed in this run.
+  if (summary.us)  await _sendOneMarket(summary, 'US');
+  if (summary.asx) await _sendOneMarket(summary, 'ASX');
 }
 
 // ----------------------------------------------------------------------------
@@ -398,10 +437,10 @@ async function sendToDiscord(summary) {
 // returned status without aborting the others or crashing the nightly
 // scheduler. Callers (the cron tick, the manual endpoint) get a structured
 // `{success, stage?, error?, summary?, formatted?, discordSent}` object.
-async function runDailyPerformanceJob({ tradingDate, perfMetrics, sendDiscord = true } = {}) {
+async function runDailyPerformanceJob({ tradingDate, perfMetrics, sendDiscord = true, market } = {}) {
   let summary = null;
   try {
-    summary = await computeDailySummary({ tradingDate, perfMetrics });
+    summary = await computeDailySummary({ tradingDate, perfMetrics, market });
   } catch (e) {
     console.error('[DailyPerf] compute failed:', e.message);
     return { success: false, stage: 'compute_failed', error: e.message, discordSent: false };
