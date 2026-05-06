@@ -156,6 +156,22 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
   const portRows = await db.query(`SELECT * FROM portfolio LIMIT 1`);
   const portfolio = portRows.rows[0] || {};
 
+  // End-of-day equity proxy = cash + Σ(qty × best-known mark). We prefer
+  // `highest_price` (updated every cycle by the trailing-stop logic, so
+  // it's a fresh in-session price) and fall back to `avg_cost` for any
+  // position that hasn't ticked yet. Avoids needing a live broker price
+  // fetch at report time and stays read-only.
+  const cash = parseFloat(portfolio.cash_balance) || 0;
+  const holdingsQ = await db.query(`
+    SELECT COALESCE(SUM(qty * COALESCE(highest_price, avg_cost) * COALESCE(fx_rate_at_entry, 1.0)), 0)::float AS holdings_value_usd
+    FROM holdings
+  `);
+  const dayEndEquity = cash + (holdingsQ.rows[0]?.holdings_value_usd || 0);
+  const dayStartEquity = portfolio.day_start_equity != null ? parseFloat(portfolio.day_start_equity) : null;
+  const equityChange = dayStartEquity != null
+    ? { abs_usd: dayEndEquity - dayStartEquity, pct: dayStartEquity > 0 ? ((dayEndEquity - dayStartEquity) / dayStartEquity) * 100 : null }
+    : null;
+
   const [us, asx, insights] = await Promise.all([
     computeMarketStats(date, 'US'),
     computeMarketStats(date, 'ASX'),
@@ -203,7 +219,9 @@ async function computeDailySummary({ tradingDate, perfMetrics } = {}) {
     breaker_tripped: !!portfolio.circuit_breaker,
     mode:            portfolio.trading_mode || 'paper',
     risk_scale:      portfolio.risk_scale   || 'balanced',
-    day_start_equity: portfolio.day_start_equity != null ? parseFloat(portfolio.day_start_equity) : null,
+    day_start_equity: dayStartEquity,
+    day_end_equity:   dayEndEquity,
+    equity_change:    equityChange,
     insights,
     llm,
     expenses,
@@ -333,10 +351,20 @@ function formatSummaryText(summary) {
     '',
     formatMarketBlock('ASX Markets', '🇦🇺', summary.asx),
     '',
+    `💼 **Capital Position**`,
+    summary.day_start_equity != null
+      ? `• Start: $${summary.day_start_equity.toFixed(2)}  →  End: $${summary.day_end_equity.toFixed(2)}`
+      : `• End equity: $${summary.day_end_equity.toFixed(2)}`,
+    summary.equity_change
+      ? `• Change: ${summary.equity_change.abs_usd >= 0 ? '+' : '-'}$${Math.abs(summary.equity_change.abs_usd).toFixed(2)}` +
+        (summary.equity_change.pct != null
+          ? `  (${summary.equity_change.pct >= 0 ? '+' : ''}${summary.equity_change.pct.toFixed(2)}%)`
+          : '')
+      : null,
+    '',
     `🛡️ **Risk & Safety**`,
     `• Circuit breaker: ${breaker}`,
     `• Mode: **${summary.mode.toUpperCase()}**  •  Risk scale: **${summary.risk_scale.toUpperCase()}**`,
-    summary.day_start_equity != null ? `• Day-start equity: $${summary.day_start_equity.toFixed(2)}` : null,
     '',
     `🧠 **Intelligence Layer**`,
     `• Best regime today (US):  ${usRegime}`,
