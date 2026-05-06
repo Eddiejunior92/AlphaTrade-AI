@@ -24,6 +24,13 @@ async function ensureSchema() {
   // opt-out rather than opt-in, but operators who don't want ASX exposure
   // can turn it off via the existing /api/agent/strategy endpoint.
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_swing_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  // ASX day strategy toggle — defaults TRUE so it lights up immediately on
+  // the next ASX open in paper mode. Operators who don't want intraday ASX
+  // exposure can flip it off via the existing strategy toggle endpoint.
+  // Universe is restricted to the top-10 most-liquid ASX names + a A$5k
+  // minimum notional inside the agent so this can't bleed slowly via tiny
+  // commission-heavy orders.
+  await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS asx_day_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trading_mode TEXT NOT NULL DEFAULT 'paper'`);
   await query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS risk_scale TEXT NOT NULL DEFAULT 'balanced'`);
   // Optional auto-reset of the circuit breaker at the daily roll (paper mode
@@ -507,7 +514,7 @@ async function getPortfolio() {
 const ALLOWED_PORTFOLIO_FIELDS = new Set([
   'cash_balance', 'starting_balance', 'day_start_equity',
   'circuit_breaker', 'emergency_pause', 'agent_running',
-  'day_enabled', 'swing_enabled', 'asx_swing_enabled', 'trading_mode', 'risk_scale',
+  'day_enabled', 'swing_enabled', 'asx_swing_enabled', 'asx_day_enabled', 'trading_mode', 'risk_scale',
   'auto_breaker_reset',
   'day_trading_recovery_buffer_seconds',
   'day_trading_cadence_seconds',

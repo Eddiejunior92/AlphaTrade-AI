@@ -69,6 +69,35 @@ const STRATEGIES = {
   // in USD-equivalent terms (FX-converted at sizing time and at equity
   // computation), so the loss budget remains a unified portfolio cap
   // across both markets.
+  // ASX day strategy — intraday trades on the top-10 most-liquid ASX names
+  // via IBKR. Mirrors the US day strategy's intraday discipline (no overnight
+  // hold, force-flatten before close, dip-buy required, recovery buffer
+  // applies) but uses 15-Min bars + 120s tick cadence and a A$5,000
+  // minimum notional to keep the IBKR commission floor (~A$6/order) under
+  // ~0.12% of trade size. ASX day-trading is intentionally NOT as fast as
+  // US day-trading because IBKR ASX commissions, wider spreads, and lower
+  // off-top-10 liquidity make minute-level churn unprofitable. Watchlist
+  // is restricted in `getWatchlistForStrategy('asx_day')`.
+  asx_day: {
+    name: 'asx_day',
+    label: 'ASX Day Trading',
+    description: 'Australian-market intraday trades via IBKR. 15-min bars, top-10 most-liquid names only, A$5k min notional, auto-flattens 5 min before ASX close. AUD-priced; risk sized in USD-equivalent so the daily loss budget remains a single portfolio cap across both markets.',
+    market: 'ASX',
+    currency: 'AUD',
+    timeframe: '15Min',
+    lookback: 60,
+    intervalSeconds: 120,
+    stopLossPct: 0.01,
+    takeProfitPct: 0.02,
+    maxHoldings: 2,
+    forceFlattenBeforeClose: true,
+    holdOvernight: false,
+    minDirectionalAgreement: 3,
+    maxPositionPct: 0.03,
+    trailingStopPct: null,
+    trailingActivatePct: null,
+    minNotionalAUD: 5000,
+  },
   asx_swing: {
     name: 'asx_swing',
     label: 'ASX Swing',
@@ -183,16 +212,31 @@ function getWatchlist() {
 // ASX strategy pulls from marketRegistry. Caller-side dispatch so we
 // don't have to import marketRegistry at the top (avoids a cycle if
 // marketRegistry ever needs strategy metadata).
+// Top-10 most liquid ASX names — used by `asx_day` only. Wider names get
+// crushed by IBKR's commission floor + spread on intraday flips, so the day
+// strategy is restricted to the deepest order books. Order intentionally
+// matches the operator's stated preference (BHP, CBA, CSL, NAB, WBC, ANZ,
+// RIO, WES, MQG, TLS) — TLS is added explicitly even though it isn't in the
+// 27-name swing universe because Telstra is one of the 10 most-traded ASX
+// names by daily turnover.
+const ASX_DAY_WATCHLIST = ['BHP', 'CBA', 'CSL', 'NAB', 'WBC', 'ANZ', 'RIO', 'WES', 'MQG', 'TLS'];
+
 function getWatchlistForStrategy(strategyName) {
   if (strategyName === 'asx_swing') {
     const { getAsxWatchlist } = require('./services/marketRegistry');
     return getAsxWatchlist();
   }
+  if (strategyName === 'asx_day') {
+    const { isAsxEnabled } = require('./services/marketRegistry');
+    if (!isAsxEnabled()) return [];
+    const fromEnv = (process.env.WATCHLIST_ASX_DAY || '').split(',').map(s => s.trim()).filter(Boolean);
+    return fromEnv.length ? fromEnv : ASX_DAY_WATCHLIST;
+  }
   return getWatchlist();
 }
 
 module.exports = {
-  STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE, DEFAULT_WATCHLIST, getWatchlist,
+  STRATEGIES, RISK_SCALES, DEFAULT_RISK_SCALE, DEFAULT_WATCHLIST, ASX_DAY_WATCHLIST, getWatchlist,
   getWatchlistForStrategy,
   getStrategy, listStrategies, getRiskScale, applyRiskScale, listRiskScales,
 };

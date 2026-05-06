@@ -38,6 +38,9 @@ const ASX_WATCHLIST_DEFAULT = [
   'STO',  // Santos — oil & gas
   'ORG',  // Origin Energy — utility + LNG
   'WDS',  // Woodside Energy — LNG / oil & gas major
+  'TLS',  // Telstra — top-10 ASX by daily turnover (telco). Added so the
+          // `asx_day` top-10 universe routes correctly through IBKR/AUD;
+          // the swing universe also picks it up (broader coverage is fine).
 ];
 
 // ============================================================================
@@ -163,7 +166,37 @@ function nextAsxOpen(now = new Date()) {
   return null;
 }
 
+// Returns a clock-shaped object for ASX, matching the Alpaca `/clock`
+// payload that the US strategies consume — `is_open`, `next_close` (ISO),
+// `timestamp` (ISO). Used by `asx_day` so its `forceFlattenBeforeClose`
+// hook can compute minutes-until-close the same way the US day strategy
+// does. Returns null when ASX is disabled (env kill-switch) — caller
+// should treat that as "no clock available, skip flatten check".
+function getAsxClock(now = new Date()) {
+  if (!isAsxEnabled()) return null;
+  const open = isAsxOpen(now);
+  // Compute today's 16:00 Sydney as UTC ISO. Same offset trick as
+  // nextAsxOpen() — try both AEST (+10) and AEDT (+11), pick the one
+  // whose UTC instant formats back to 16:00 Sydney for that calendar day.
+  const parts = new Intl.DateTimeFormat('en-AU', {
+    timeZone: 'Australia/Sydney',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const get = t => parts.find(p => p.type === t)?.value;
+  const y = get('year'), mo = get('month'), d = get('day');
+  let nextClose = null;
+  for (const offset of [10, 11]) {
+    const utcMs = Date.UTC(+y, +mo - 1, +d, 16 - offset, 0, 0);
+    const cand = new Date(utcMs);
+    const sydH = +new Intl.DateTimeFormat('en-AU', {
+      timeZone: 'Australia/Sydney', hour: '2-digit', hour12: false,
+    }).formatToParts(cand).find(p => p.type === 'hour').value;
+    if (sydH === 16) { nextClose = cand.toISOString(); break; }
+  }
+  return { is_open: open, next_close: nextClose, timestamp: now.toISOString() };
+}
+
 module.exports = {
   getAsxWatchlist, getSymbolInfo, isAsx, isUs, brokerFor, currencyFor,
-  isAsxOpen, nextAsxOpen, isAsxEnabled,
+  isAsxOpen, nextAsxOpen, isAsxEnabled, getAsxClock,
 };

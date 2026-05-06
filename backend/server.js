@@ -870,6 +870,7 @@ app.post('/api/safety-suggestions/refresh', requireOperator, async (_req, res) =
         enabled: s.name === 'day' ? !!portfolio?.day_enabled
                : s.name === 'swing' ? !!portfolio?.swing_enabled
                : s.name === 'asx_swing' ? !!portfolio?.asx_swing_enabled
+               : s.name === 'asx_day' ? !!portfolio?.asx_day_enabled
                : false,
       }));
     const result = await safetySuggestionService.refresh({ force: true, portfolio, strategies });

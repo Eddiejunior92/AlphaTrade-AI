@@ -1113,7 +1113,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     // STRICTLY ADDITIVE — when it fires the BUY is downgraded to HOLD via
     // TRADE_REJECTED audit; it can never upgrade HOLD→BUY, lift confidence,
     // bypass quorum, or relax any safety rail.
-    if (sc.name === 'day') {
+    if (sc.name === 'day' || sc.name === 'asx_day') {
       const bufferSec = Number.isFinite(parseInt(portfolio?.day_trading_recovery_buffer_seconds))
         ? parseInt(portfolio.day_trading_recovery_buffer_seconds)
         : RECOVERY_BUFFER_DEFAULT;
@@ -1228,6 +1228,46 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       const macroTag = macroAdjustForRisk ? ` | macro=${macroAdjustForRisk.regime}→${macroAdjustForRisk.forecastRegime}` +
         (macroAdjustForRisk.confidenceBoost ? ` (+${(macroAdjustForRisk.confidenceBoost*100).toFixed(1)}pp gate)` : '') +
         (macroAdjustForRisk.sizeMult < 1 ? ` ×${macroAdjustForRisk.sizeMult.toFixed(2)} size` : '') : '';
+      // ASX day-trading minimum notional gate. IBKR's ASX commission floor
+      // (~A$6/order) eats > 0.4% of any sub-A$1.5k trade — at A$5k it's
+      // ~0.12%, comfortably below our typical ~0.3% edge. Strictly
+      // additive: rejects the BUY via TRADE_REJECTED audit, never relaxes
+      // any other safety rail. `latest` is the native AUD price for ASX.
+      if (sc.name === 'asx_day') {
+        // Defensive routing check — every asx_day symbol must resolve to
+        // market='ASX' in the registry, otherwise the order would route
+        // to the wrong broker (Alpaca instead of IBKR) with the wrong
+        // currency. Hard-reject rather than risk a misrouted order.
+        if (info.market !== 'ASX') {
+          await db.recordAudit({
+            event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+            confidence: signal.confidence,
+            payload: {
+              reason: 'asx_day_symbol_misrouted',
+              strategy: sc.name, expected_market: 'ASX',
+              actual_market: info.market, broker: info.broker,
+            },
+          });
+          console.error(`[asx_day] SAFETY: ${symbol} resolved to market=${info.market} (expected ASX) — rejecting BUY`);
+          return;
+        }
+        const minNotional = sc.minNotionalAUD || 5000;
+        const tradeNotionalAud = eval_.qty * latest;
+        if (tradeNotionalAud < minNotional) {
+          await db.recordAudit({
+            event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+            confidence: signal.confidence,
+            payload: {
+              reason: 'asx_day_min_notional',
+              strategy: sc.name, market: info.market,
+              min_notional_aud: minNotional,
+              trade_notional_aud: +tradeNotionalAud.toFixed(2),
+              qty: eval_.qty, price_aud: +latest.toFixed(4),
+            },
+          });
+          return;
+        }
+      }
       await executeOrder({
         symbol, side: 'BUY', qty: eval_.qty, price: latest,
         signal,
@@ -1466,6 +1506,12 @@ async function runCycle() {
       // eligible. The asxMarketOn switch only blocks new entries; exits
       // continue so any existing ASX position can still be managed.
       { sc: { ...applyRiskScale(STRATEGIES.asx_swing, scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
+      // ASX day strategy. Same ASX cadence as swing (operator picked 120s
+      // — wide enough to keep IBKR happy, fast enough to be intraday).
+      // Gets a real ASX clock so its forceFlattenBeforeClose hook can
+      // compute minutes-until 16:00 Sydney, exactly mirroring how the US
+      // day strategy uses Alpaca's clock to flatten before NYSE close.
+      { sc: { ...applyRiskScale(STRATEGIES.asx_day, scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_day_enabled !== false, marketOpen: asxOpen, clock: marketRegistry.getAsxClock(), noNewEntries: !asxMarketOn },
     ];
     // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
     // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
@@ -1481,8 +1527,8 @@ async function runCycle() {
       const elapsed = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 1000 : Infinity;
       return elapsed >= s.sc.intervalSeconds - 5;
     });
-    const usBucket = eligibleStrategies.filter(s => s.sc.name !== 'asx_swing');
-    const asxBucket = eligibleStrategies.filter(s => s.sc.name === 'asx_swing');
+    const usBucket = eligibleStrategies.filter(s => s.sc.market !== 'ASX');
+    const asxBucket = eligibleStrategies.filter(s => s.sc.market === 'ASX');
 
     const runBucketSequential = async (bucket) => {
       for (const { sc, clock: stratClock, noNewEntries } of bucket) {
@@ -1900,6 +1946,7 @@ async function setStrategyEnabled(strategyName, enabled) {
   const field = strategyName === 'day'       ? 'day_enabled'
               : strategyName === 'swing'     ? 'swing_enabled'
               : strategyName === 'asx_swing' ? 'asx_swing_enabled'
+              : strategyName === 'asx_day'   ? 'asx_day_enabled'
               : null;
   if (!field) throw new Error(`Unknown strategy: ${strategyName}`);
   await db.updatePortfolio({ [field]: !!enabled });
@@ -2260,6 +2307,7 @@ async function getAgentSnapshot() {
     enabled: s.name === 'day'       ? !!portfolio.day_enabled
            : s.name === 'swing'     ? !!portfolio.swing_enabled
            : s.name === 'asx_swing' ? portfolio.asx_swing_enabled !== false
+           : s.name === 'asx_day'   ? portfolio.asx_day_enabled !== false
            : false,
     holdings: holdings.filter(h => h.strategy === s.name).length,
     lastRun: memoryState.strategyLastRun[s.name] || null,
@@ -2623,6 +2671,7 @@ async function _resolveSafetyContext() {
     enabled: s.name === 'day' ? !!portfolio?.day_enabled
            : s.name === 'swing' ? !!portfolio?.swing_enabled
            : s.name === 'asx_swing' ? !!portfolio?.asx_swing_enabled
+           : s.name === 'asx_day' ? !!portfolio?.asx_day_enabled
            : false,
   }));
   return { portfolio, strategies };

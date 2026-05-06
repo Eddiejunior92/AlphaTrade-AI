@@ -43,7 +43,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 
 ## Product
 
-*   Autonomous trading with day and swing strategies for US and ASX markets.
+*   Autonomous trading with day and swing strategies for both US and ASX markets (US `day`/`swing` via Alpaca; ASX `asx_day`/`asx_swing` via IBKR).
 *   Real-time dashboard displaying market data, signals, positions, and trade history.
 *   Multi-LLM ensemble for trade signal generation with configurable risk parameters.
 *   Advanced safety features including circuit breakers, kill switch, and confidence gates.
@@ -69,6 +69,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   Risk sizing is always in USD-equivalent, even for ASX trades.
 *   Per-market master switches gate NEW ENTRIES ONLY; open positions are always managed.
 *   ASX execution is hard-blocked by default and requires `ASX_EXECUTION_WIRED=true` to enable real IBKR routing.
+*   `asx_day` strategy is restricted to the top-10 most-liquid ASX names (BHP/CBA/CSL/NAB/WBC/ANZ/RIO/WES/MQG/TLS) and enforces a A$5,000 minimum notional per trade to keep IBKR commissions under ~0.12%. Override universe via `WATCHLIST_ASX_DAY`.
 
 ## Pointers
 
