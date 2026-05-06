@@ -6,7 +6,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 
 *   **Run (development):** `node backend/server.js` (backend) & `vite` (frontend)
 *   **Run (production):** `npm start`
-*   **Env Vars:** `OPERATOR_TOKEN`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `IBKR_BASE_URL`, `IBKR_ACCOUNT_ID`, `DATABASE_URL`, `DISCORD_WEBHOOK_URL`, `MAX_DAILY_LOSS_USD`, `MAX_DAILY_DRAWDOWN_PCT`, `WATCHLIST`, `AUDUSD_RATE`, `EXCHANGERATE_API_KEY`, `FX_HOST_API_KEY`, `FX_TTL_SECONDS`, `AUTO_HEDGE`, `ASX_ENABLED`, `DAY_TRADING_DIP_REQUIREMENT_STRICTNESS`, `DISCORD_BOT_TOKEN`, `DISCORD_CHAT_CHANNEL_ID`, `LLM_CALL_COST_USD`, `DATA_FEED_COST_USD_PER_DAY`.
+*   **Env Vars:** `OPERATOR_TOKEN`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `IBKR_BASE_URL`, `IBKR_ACCOUNT_ID`, `DATABASE_URL`, `DISCORD_WEBHOOK_URL`, `MAX_DAILY_LOSS_USD`, `MAX_DAILY_DRAWDOWN_PCT`, `WATCHLIST`, `AUDUSD_RATE`, `EXCHANGERATE_API_KEY`, `FX_HOST_API_KEY`, `FX_TTL_SECONDS`, `AUTO_HEDGE`, `ASX_ENABLED`, `DAY_TRADING_DIP_REQUIREMENT_STRICTNESS`, `DISCORD_BOT_TOKEN`, `DISCORD_CHAT_CHANNEL_ID`, `LLM_CALL_COST_USD`, `DATA_FEED_COST_USD_PER_DAY`, `AGENT_INTERVAL_SECONDS` (default 60), `LLM_SKIP_PRICE_BPS` (default 70), `LLM_SKIP_TTL_SECONDS` (default 120).
 
 ## Stack
 
@@ -76,6 +76,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 *   Discord/voice chat is **info-only** by design — no code path from `brokerService.chat()` to `placeOrder`. The system prompt explicitly forbids Alpha from claiming to execute trades; manual execution must go through the dashboard's `/api/manual-order` endpoint.
 *   Manual buy/sell endpoint (`POST /api/manual-order`) is operator-token-gated (strict) and re-uses `agent.executeOrder` so manual trades enforce kill-switch, circuit breaker, atomic cash/holdings, and tamper-evident audit log just like autonomous trades. Writes a `MANUAL_ORDER` audit row in addition to `TRADE_EXECUTED`.
 *   Voice chat persists last 50 messages in `localStorage` under `alphatrade.chat.history` so reopening the panel restores context. Trash icon in chat header clears it.
+*   Cost knobs: `AGENT_INTERVAL_SECONDS` (default 60s — was 20s) controls the master cycle cadence; lowering it multiplies LLM spend linearly. `LLM_SKIP_PRICE_BPS` (default 70 = 0.70%) is the price-drift threshold below which a cached HOLD verdict is reused instead of re-calling the ensemble; widening it cuts spend during chop. Raise/lower via env vars without code changes.
 
 ## Pointers
 

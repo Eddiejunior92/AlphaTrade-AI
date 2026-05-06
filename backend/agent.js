@@ -62,7 +62,7 @@ const WATCHLIST = getWatchlist();
 // often — no extra LLM calls, no extra trades, no extra risk.
 // Default tick stays 20s; only lowered if AGENT_INTERVAL_SECONDS env is set
 // or if the operator picks a sub-20s day cadence (handled implicitly here).
-const BASE_INTERVAL_SECONDS = Math.max(5, parseInt(process.env.AGENT_INTERVAL_SECONDS || '20'));
+const BASE_INTERVAL_SECONDS = Math.max(5, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
 // =============================================================================
@@ -115,7 +115,7 @@ function _pushBounded(arr, val, cap = 60) { arr.push(val); if (arr.length > cap)
 // where the previous decision was HOLD. BUY/SELL signals and held positions
 // always re-evaluate fresh on the next tick.
 const LLM_SKIP_TTL_MS = parseInt(process.env.LLM_SKIP_TTL_SECONDS || '120') * 1000;
-const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '35');
+const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '70');
 const _llmSkipCache = new Map(); // `${strategy}:${symbol}` → { signal, ts, price }
 
 // Quiet-market shortcut thresholds. When the tape is genuinely sleepy on a
