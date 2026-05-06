@@ -6,6 +6,35 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 
 // =============================================================================
+// Per-model health tracker — surfaced via getProviderStatus().health and read
+// by the dashboard to render the "LLM quorum impossible" banner. A model is
+// considered HEALTHY if its most recent call succeeded OR if it has no recent
+// failure within HEALTH_STALE_MS. A failure within that window flips it to
+// UNHEALTHY until the next successful call.
+// =============================================================================
+const HEALTH_STALE_MS = 5 * 60 * 1000;
+const _modelHealth = {}; // { [modelId]: { lastSuccessTs, lastErrorTs, lastError } }
+function _recordSuccess(modelId) {
+  const h = _modelHealth[modelId] || (_modelHealth[modelId] = {});
+  h.lastSuccessTs = Date.now();
+  h.lastErrorTs = null;
+  h.lastError = null;
+}
+function _recordError(modelId, msg) {
+  const h = _modelHealth[modelId] || (_modelHealth[modelId] = {});
+  h.lastErrorTs = Date.now();
+  h.lastError = String(msg || 'unknown').slice(0, 200);
+}
+function _isHealthy(modelId) {
+  const h = _modelHealth[modelId];
+  if (!h) return true; // never called yet → assume healthy (not yet known to be broken)
+  if (!h.lastErrorTs) return true;
+  if (h.lastSuccessTs && h.lastSuccessTs > h.lastErrorTs) return true;
+  // Last interaction was an error — stale errors don't count as currently broken.
+  return (Date.now() - h.lastErrorTs) > HEALTH_STALE_MS;
+}
+
+// =============================================================================
 // Model registry + tiered routing
 // =============================================================================
 // Each model carries a `tier`:
@@ -369,9 +398,12 @@ async function callOpenRouter(model, prompt) {
       }
     );
     const text = res.data?.choices?.[0]?.message?.content || '';
+    _recordSuccess(model.id);
     return parseModelResponse(text, model);
   } catch (e) {
-    console.error(`[LLM:${model.id}] error:`, e.response?.data?.error?.message || e.message);
+    const msg = e.response?.data?.error?.message || e.message;
+    _recordError(model.id, msg);
+    console.error(`[LLM:${model.id}] error:`, msg);
     return { model: model.id, label: model.label, role: model.role, action: 'HOLD', confidence: 0, rationale: `Error: ${e.message}`, error: true };
   }
 }
@@ -397,9 +429,12 @@ async function callXAI(model, prompt) {
       }
     );
     const text = res.data?.choices?.[0]?.message?.content || '';
+    _recordSuccess(model.id);
     return parseModelResponse(text, model);
   } catch (e) {
-    console.error(`[LLM:${model.id}] error:`, e.response?.data?.error?.message || e.message);
+    const msg = e.response?.data?.error?.message || e.message;
+    _recordError(model.id, msg);
+    console.error(`[LLM:${model.id}] error:`, msg);
     return { model: model.id, label: model.label, role: model.role, action: 'HOLD', confidence: 0, rationale: `Error: ${e.message}`, error: true };
   }
 }
@@ -553,11 +588,44 @@ async function getEnsembleDecision({ symbol, priceData, sentiment, newsSentiment
 }
 
 function getProviderStatus() {
+  const openrouter = Boolean(process.env.OPENROUTER_API_KEY);
+  const xai = Boolean(process.env.XAI_API_KEY || process.env.GROK_API_KEY);
+  // Per-model live health. A model is "configured" iff its provider key is
+  // present; "healthy" iff configured AND no recent unrecovered error. The
+  // dashboard renders a banner when healthy < required-for-quorum.
+  const health = MODELS.map(m => {
+    const configured = (m.provider === 'openrouter' && openrouter) || (m.provider === 'xai' && xai);
+    const h = _modelHealth[m.id] || {};
+    return {
+      id: m.id,
+      label: m.label,
+      provider: m.provider,
+      tier: m.tier,
+      configured,
+      healthy: configured && _isHealthy(m.id),
+      lastSuccessTs: h.lastSuccessTs || null,
+      lastErrorTs: h.lastErrorTs || null,
+      lastError: h.lastError || null,
+    };
+  });
+  const activePool = LLM_CHEAP_TIER_ONLY ? MODELS.filter(m => m.tier === 'cheap') : MODELS;
+  const activePoolSize = activePool.length;
+  const activeHealthy = activePool.filter(m => health.find(x => x.id === m.id)?.healthy).length;
+  // Mirror getRequiredValid math so the UI threshold matches the engine's.
+  const explicit = parseInt(process.env.MIN_VALID_MODELS || '');
+  const requiredHealthy = (Number.isFinite(explicit) && explicit > 0)
+    ? Math.min(explicit, activePoolSize)
+    : Math.max(2, Math.ceil(activePoolSize * 0.75));
   return {
-    openrouter: Boolean(process.env.OPENROUTER_API_KEY),
-    xai: Boolean(process.env.XAI_API_KEY || process.env.GROK_API_KEY),
+    openrouter,
+    xai,
     cheapTierOnly: LLM_CHEAP_TIER_ONLY,
     models: MODELS.map(m => ({ id: m.id, label: m.label, role: m.role, provider: m.provider, tier: m.tier })),
+    health,
+    activePoolSize,
+    activeHealthy,
+    requiredHealthy,
+    quorumPossible: activeHealthy >= requiredHealthy,
   };
 }
 

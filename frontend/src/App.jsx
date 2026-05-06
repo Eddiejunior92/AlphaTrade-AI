@@ -357,6 +357,32 @@ export default function App() {
           </div>
         </div>
       )}
+      {providers.openrouter && providers.quorumPossible === false && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 mt-3">
+          <div className="rounded-2xl p-4 border-2 border-[var(--red)]/60 bg-[var(--red)]/10">
+            <div className="flex items-start gap-3">
+              <div className="text-2xl">🧠</div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-bold text-[var(--red)]">
+                  LLM quorum impossible — {providers.activeHealthy}/{providers.activePoolSize} models healthy (need {providers.requiredHealthy})
+                </div>
+                <div className="text-[11px] text-[var(--text-dim)] mt-0.5">
+                  No new trades will fire until enough models recover. Open positions continue to be managed.
+                </div>
+                {Array.isArray(providers.health) && providers.health.some(m => m.configured && !m.healthy) && (
+                  <div className="mt-2 space-y-1">
+                    {providers.health.filter(m => m.configured && !m.healthy).map(m => (
+                      <div key={m.id} className="text-[11px] text-[var(--red)]/90 font-mono truncate" title={m.lastError || ''}>
+                        ✗ {m.label}: {m.lastError || 'no recent successful response'}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-5 anim-fade">
         {tab === 'home' && (
