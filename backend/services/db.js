@@ -617,6 +617,78 @@ async function getRecentTrades(limit = 50) {
   return rows;
 }
 
+// Order-reconciler helpers (May 2026). The agent writes trade rows with
+// whatever status the broker returned at submit-time (often `pending_new` on
+// Alpaca paper). A separate sweeper updates these rows once the broker
+// resolves the order. Window is 24h to bound the scan.
+async function getNonTerminalTrades({ hours = 24 } = {}) {
+  const { rows } = await query(
+    `SELECT id, symbol, side, qty, price, status, order_id, strategy, market, currency, fx_rate, created_at
+     FROM trades
+     WHERE status IN ('pending_new','accepted','new','partially_filled','submitted','pending_replace','pending_cancel')
+       AND order_id IS NOT NULL
+       AND order_id NOT LIKE 'mock-%'
+       AND order_id NOT LIKE 'flatten-%'
+       AND created_at > now() - ($1 || ' hours')::interval
+     ORDER BY created_at ASC`,
+    [String(hours)]
+  );
+  return rows;
+}
+
+async function updateTradeStatus(id, status) {
+  await query('UPDATE trades SET status = $2 WHERE id = $1', [id, status]);
+}
+
+// Atomic reconciliation: status transition + cash reversal + optional holding
+// delete, all in ONE transaction, gated on a compare-and-set against the
+// expected source status. Returns { applied: boolean }. If the row's status
+// already changed (another sweeper, or a crash-and-restart sweeping again),
+// `applied` is false and NO writes happen — making the reconciler crash-safe
+// and idempotent. Row is locked FOR UPDATE so two concurrent sweepers in the
+// same process (different ticks) can't both pass the CAS.
+async function reconcileTradeAtomic({
+  id,
+  fromStatuses,        // array of acceptable current statuses (e.g. ['pending_new','accepted'])
+  toStatus,            // new terminal status (e.g. 'rejected', 'filled')
+  cashDeltaUsd = 0,    // signed USD adjustment to portfolio.cash_balance
+  deleteHolding = null,// { symbol, strategy } to drop, or null
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Lock the trade row and confirm it's still in an expected source state.
+    const sel = await client.query(
+      'SELECT status FROM trades WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    if (!sel.rows.length || !fromStatuses.includes(sel.rows[0].status)) {
+      await client.query('ROLLBACK');
+      return { applied: false, reason: 'status_changed' };
+    }
+    if (cashDeltaUsd !== 0) {
+      await client.query(
+        'UPDATE portfolio SET cash_balance = cash_balance + $1, updated_at = NOW() WHERE id = 1',
+        [cashDeltaUsd]
+      );
+    }
+    if (deleteHolding && deleteHolding.symbol) {
+      await client.query(
+        'DELETE FROM holdings WHERE symbol = $1 AND strategy = $2',
+        [deleteHolding.symbol, deleteHolding.strategy || 'day']
+      );
+    }
+    await client.query('UPDATE trades SET status = $2 WHERE id = $1', [id, toStatus]);
+    await client.query('COMMIT');
+    return { applied: true };
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 // Hash-chain helpers — tamper-evident audit log. Each row hashes (prev_hash ||
 // canonical body). A consumer can replay every row and confirm row_hash[i] ==
 // sha256(row_hash[i-1] || body[i]); any silent edit breaks the chain.
@@ -734,7 +806,7 @@ async function verifyAuditChain({ since } = {}) {
 module.exports = {
   query, pool, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
   getHoldings, getHolding, upsertHolding, deleteHolding,
-  recordTrade, getRecentTrades,
+  recordTrade, getRecentTrades, getNonTerminalTrades, updateTradeStatus, reconcileTradeAtomic,
   recordAudit, getRecentAudit, verifyAuditChain,
   updateTrailing,
 };

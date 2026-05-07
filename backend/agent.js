@@ -1504,7 +1504,11 @@ async function runCycle() {
     // Refresh news sentiment for the FULL watchlist (US + ASX). Cached;
     // failure never blocks trading.
     const allWatchlistSymbols = [...new Set([...WATCHLIST, ...asxWatchlist])];
-    sentimentService.getSentimentBatch(allWatchlistSymbols, { concurrency: 3 })
+    // Pass the freshly-fetched USD prices into the sentiment batch so the
+    // price-stable cache extension can skip refreshes for symbols that
+    // haven't moved >0.1% since the last sentiment pull. Cuts spend on
+    // quiet/sideways days without sacrificing freshness during real moves.
+    sentimentService.getSentimentBatch(allWatchlistSymbols, { concurrency: 3, prices: usdFullLookup })
       .catch(e => console.error('[Agent] Sentiment refresh error:', e.message));
 
     if (portfolio.swing_enabled || portfolio.asx_swing_enabled) {
@@ -1672,7 +1676,12 @@ async function runCycle() {
 // runs OUTSIDE the trading loop and uses an independent timer; it cannot be
 // blocked by whatever is blocking the cycle. Threshold is 5 minutes — well
 // past any legitimate cycle even with all four LLMs slow-pathing.
-const WATCHDOG_HUNG_MS = parseInt(process.env.WATCHDOG_HUNG_MS || '300000');
+// Bumped from 300s → 600s (May 2026): legitimate cycles are <30s, but a
+// transient OpenRouter outage (3 of 4 LLMs returning 429s with retries)
+// can push a single cycle past 5min. 10min is still well past any healthy
+// cycle and gives upstream provider hiccups headroom without thrashing
+// the process via auto-restart.
+const WATCHDOG_HUNG_MS = parseInt(process.env.WATCHDOG_HUNG_MS || '600000');
 const WATCHDOG_INTERVAL_MS = 30_000;
 let _watchdogHandle = null;
 function startWatchdog() {
@@ -1696,6 +1705,153 @@ function startWatchdog() {
   console.log(`[Watchdog] Started — hang threshold ${WATCHDOG_HUNG_MS/1000}s`);
 }
 startWatchdog();
+
+// =============================================================================
+// Order reconciler (May 2026) — sweep non-terminal trade rows and update them
+// to whatever Alpaca says is the current status. The agent writes a trade row
+// at submit-time with whatever status Alpaca returned (often `pending_new`),
+// then never updates it. In paper mode the order almost always fills within
+// 1-2s, so the trade row is just stale display data. Real-life rejections
+// (live mode, insufficient funds, halted symbol, etc.) need the cash + holding
+// rows reversed since executeOrder optimistically wrote them on submit.
+//
+// Safety: this NEVER places, modifies, or cancels orders. It only READS from
+// Alpaca and updates our DB. All cash/holding reversals go through the same
+// adjustCash + deleteHolding helpers used by executeOrder. Audited as
+// TRADE_RECONCILED so the chain stays intact.
+// =============================================================================
+const RECONCILER_INTERVAL_MS = parseInt(process.env.ORDER_RECONCILER_INTERVAL_MS || '60000');
+const TERMINAL_FILLED = new Set(['filled', 'done_for_day']);
+const TERMINAL_CANCELLED = new Set(['canceled', 'cancelled', 'expired', 'rejected', 'suspended', 'replaced']);
+let _reconcilerRunning = false;
+let _reconcilerHandle = null;
+
+async function reconcileOrders() {
+  if (_reconcilerRunning) return;
+  _reconcilerRunning = true;
+  try {
+    const pending = await db.getNonTerminalTrades({ hours: 24 });
+    if (!pending.length) return;
+    for (const t of pending) {
+      let order;
+      try { order = await alpacaService.getOrder(t.order_id); }
+      catch (_) { continue; /* network/auth — try again next sweep */ }
+      // Order not found at broker. After 5min of being unfindable, mark
+      // 'unknown' so it stops getting swept; otherwise leave alone (race
+      // between submit + first reconciler tick).
+      if (!order) {
+        const ageMs = Date.now() - new Date(t.created_at).getTime();
+        if (ageMs > 5 * 60_000) {
+          // CAS — only audit if we actually transitioned the row.
+          const r = await db.reconcileTradeAtomic({
+            id: t.id,
+            fromStatuses: ['pending_new','accepted','new','partially_filled','submitted','pending_replace','pending_cancel'],
+            toStatus: 'unknown',
+          });
+          if (r.applied) {
+            await db.recordAudit({
+              event_type: 'TRADE_RECONCILED', symbol: t.symbol,
+              payload: { trade_id: t.id, order_id: t.order_id, from: t.status, to: 'unknown', reason: 'order_not_found' },
+            });
+          }
+        }
+        continue;
+      }
+      const brokerStatus = String(order.status || '').toLowerCase();
+      if (brokerStatus === t.status) continue;
+      // CAS source-set: only transition out of these. Captured at sweep time
+      // so a row reconciled by an earlier sweep (or a previous process) is
+      // skipped via the FOR UPDATE + status-check inside reconcileTradeAtomic.
+      const NON_TERMINAL = ['pending_new','accepted','new','partially_filled','submitted','pending_replace','pending_cancel'];
+
+      // FILLED path — status-only transition. Cash + holding were already
+      // applied optimistically at submit-time. Atomic CAS so a crash between
+      // sweeps can't double-update.
+      if (TERMINAL_FILLED.has(brokerStatus)) {
+        const r = await db.reconcileTradeAtomic({
+          id: t.id, fromStatuses: NON_TERMINAL, toStatus: brokerStatus,
+        });
+        if (r.applied) {
+          await db.recordAudit({
+            event_type: 'TRADE_RECONCILED', symbol: t.symbol,
+            payload: { trade_id: t.id, order_id: t.order_id, from: t.status, to: brokerStatus,
+                       filled_qty: order.filled_qty, filled_avg_price: order.filled_avg_price },
+          });
+        }
+        continue;
+      }
+
+      // CANCELLED/REJECTED path — atomic transactional reversal. The CAS on
+      // status (inside reconcileTradeAtomic) guarantees that even if the
+      // process crashes mid-sweep and restarts, the next sweep finds the
+      // row already terminal and applied=false short-circuits — NO second
+      // cash/holding reversal can happen. Partial fills honoured by sizing
+      // the unfilled qty.
+      if (TERMINAL_CANCELLED.has(brokerStatus)) {
+        const qty = parseFloat(t.qty);
+        const filled = parseFloat(order.filled_qty || 0);
+        const unfilled = Math.max(0, qty - filled);
+        const fx = parseFloat(t.fx_rate || 1);
+        const usdToReverse = unfilled * parseFloat(t.price) * fx;
+        const side = String(t.side || '').toUpperCase();
+        let cashDeltaUsd = 0;
+        let holdingDrop = null;
+        let warning = null;
+        if (side === 'BUY' && unfilled > 0) {
+          // Refund cash we optimistically debited; if NO fill, also drop the
+          // holding row executeOrder created. Partial-fill case keeps holding
+          // (next cycle's mark-to-market will reconcile qty drift).
+          cashDeltaUsd = usdToReverse;
+          if (filled === 0) holdingDrop = { symbol: t.symbol, strategy: t.strategy };
+        } else if (side === 'SELL' && unfilled > 0) {
+          // Reverse the cash credit. Holding row was already deleted in
+          // executeOrder; we don't try to reconstruct it (avg_cost lost).
+          // Operator gets a loud audit row to investigate manually.
+          cashDeltaUsd = -usdToReverse;
+          warning = 'SELL rejected after holding was already removed — manual cleanup required';
+        }
+        let r;
+        try {
+          r = await db.reconcileTradeAtomic({
+            id: t.id, fromStatuses: NON_TERMINAL, toStatus: brokerStatus,
+            cashDeltaUsd, deleteHolding: holdingDrop,
+          });
+        } catch (e) {
+          console.error('[Reconciler] atomic reversal failed:', e.message);
+          continue;
+        }
+        if (r.applied) {
+          await db.recordAudit({
+            event_type: 'TRADE_RECONCILED', symbol: t.symbol,
+            payload: { trade_id: t.id, order_id: t.order_id, from: t.status, to: brokerStatus,
+                       side, qty, filled_qty: filled, unfilled,
+                       reversed_cash_usd: cashDeltaUsd,
+                       dropped_holding: !!holdingDrop, warning },
+          });
+        }
+        continue;
+      }
+      // Non-terminal change (e.g. accepted → partially_filled). Status-only
+      // transition; no cash/holding side effects, so plain CAS via the same
+      // helper (cashDeltaUsd defaults to 0).
+      await db.reconcileTradeAtomic({
+        id: t.id, fromStatuses: NON_TERMINAL, toStatus: brokerStatus,
+      });
+    }
+  } catch (e) {
+    console.error('[Reconciler] sweep error:', e.message);
+  } finally {
+    _reconcilerRunning = false;
+  }
+}
+
+function startOrderReconciler() {
+  if (_reconcilerHandle) return;
+  _reconcilerHandle = setInterval(() => { reconcileOrders().catch(() => {}); }, RECONCILER_INTERVAL_MS);
+  if (_reconcilerHandle.unref) _reconcilerHandle.unref();
+  console.log(`[Reconciler] Started — interval ${RECONCILER_INTERVAL_MS / 1000}s`);
+}
+startOrderReconciler();
 
 // Process-level safety nets. unhandledRejection used to kill the process by
 // default; we log + audit, but DO NOT exit here (the watchdog will catch a

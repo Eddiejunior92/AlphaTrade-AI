@@ -389,6 +389,27 @@ export default function App() {
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-5 anim-fade">
         {tab === 'home' && (
           <div className="space-y-6">
+            {/* ASX trading temporarily disabled banner — shows whenever the
+                ASX master switch is OFF but the env-level ASX_ENABLED is ON
+                (i.e. operator-disabled, not env-disabled). Intelligence
+                layers (sentiment, premarket, regime, memory, knowledge graph)
+                continue to run in the background; only NEW ENTRIES are
+                blocked. */}
+            {state?.asxEnabled && state?.markets?.ASX && !state.markets.ASX.enabled && (
+              <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 flex items-start gap-3">
+                <span className="text-amber-300 text-lg leading-none">⚠️</span>
+                <div className="flex-1">
+                  <div className="text-sm font-semibold text-amber-200">
+                    ASX trading temporarily disabled for cost / stability
+                  </div>
+                  <div className="text-xs text-amber-200/80 mt-0.5">
+                    No new ASX entries or executions. Pre-market briefings,
+                    sentiment cache, regime learning, and historical
+                    intelligence continue to run.
+                  </div>
+                </div>
+              </div>
+            )}
             {/* Hero portfolio card */}
             <div className="glass-strong p-6 sm:p-8">
               <div className="text-[11px] text-[var(--text-dim)] uppercase tracking-wider mb-1">Portfolio Value</div>

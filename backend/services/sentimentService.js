@@ -17,10 +17,20 @@ const marketRegistry = require('./marketRegistry');
 
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-// 15 min default (was 10) — cuts Grok sentiment refreshes by ~33% at 20s
-// day cadence. News doesn't move that fast; the cycle still gets a fresh
-// pull whenever the cached entry expires.
-const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '900') * 1000;
+// 30 min default (was 15) — sentiment is the #1 LLM cost driver
+// ($33/day across markets at 15min TTL). News doesn't move that fast;
+// the cycle still gets a fresh pull whenever the cached entry expires.
+// Combined with the price-stable extension below, repeated calls during
+// quiet markets return cached payloads up to 60 min after fetch.
+const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '1800') * 1000;
+// Price-stable cache extension: if the symbol's price has moved less than
+// PRICE_STABLE_BPS basis points since the cached entry was written, treat
+// the entry as fresh up to PRICE_STABLE_TTL_MULT × TTL_MS. Idea: if nothing
+// is moving, the news/social view almost certainly hasn't shifted either.
+// Caller passes { currentPrice } into getSentiment / getSentimentBatch.
+// Default 10 bps (0.1%) and 2× extension — conservative.
+const PRICE_STABLE_BPS = parseFloat(process.env.SENTIMENT_PRICE_STABLE_BPS || '10');
+const PRICE_STABLE_TTL_MULT = parseFloat(process.env.SENTIMENT_PRICE_STABLE_TTL_MULT || '2');
 const TIMEOUT_MS = 15000;
 // Cap is sized for the full US (30) + ASX (27) universe with headroom; bumped
 // from 64 → 128 when the watchlist expanded so no entry gets evicted under
@@ -362,19 +372,44 @@ async function fetchFresh(symbol) {
   return blendProviderResults(symbol, results);
 }
 
-async function getSentiment(symbol, { force = false } = {}) {
+async function getSentiment(symbol, { force = false, currentPrice = null } = {}) {
   const sym = String(symbol).toUpperCase();
   const cached = cache.get(sym);
-  if (!force && cached && Date.now() - cached.ts < TTL_MS) {
-    touchCache(sym, cached);
-    return { ...cached.data, cached: true };
+  if (!force && cached) {
+    const age = Date.now() - cached.ts;
+    // Standard TTL hit — always reuse.
+    if (age < TTL_MS) {
+      touchCache(sym, cached);
+      return { ...cached.data, cached: true };
+    }
+    // Price-stable extension: if we have both a cached price and a current
+    // price, and price has moved less than PRICE_STABLE_BPS, extend cache
+    // life up to PRICE_STABLE_TTL_MULT × TTL_MS. Cuts sentiment calls
+    // during quiet/sideways markets without sacrificing freshness during
+    // moves. NEVER applies if price is missing — fail-open to refresh.
+    if (
+      Number.isFinite(currentPrice) &&
+      Number.isFinite(cached.price) &&
+      cached.price > 0 &&
+      age < TTL_MS * PRICE_STABLE_TTL_MULT
+    ) {
+      const movedBps = Math.abs((currentPrice - cached.price) / cached.price) * 10000;
+      if (movedBps < PRICE_STABLE_BPS) {
+        touchCache(sym, cached);
+        return { ...cached.data, cached: true, priceStableSkip: true };
+      }
+    }
   }
   if (inflight.has(sym)) return inflight.get(sym);
 
   const p = (async () => {
     try {
       const data = await fetchFresh(sym);
-      touchCache(sym, { ts: Date.now(), data });
+      touchCache(sym, {
+        ts: Date.now(),
+        data,
+        price: Number.isFinite(currentPrice) ? currentPrice : null,
+      });
       return data;
     } finally {
       inflight.delete(sym);
@@ -389,7 +424,7 @@ async function getSentiment(symbol, { force = false } = {}) {
 // coalesces multiple overlapping callers (agent cycle + boot refresh +
 // /api/markets backfill) so the second caller awaits the first instead of
 // getting an empty {} back.
-async function getSentimentBatch(symbols, { concurrency = 3 } = {}) {
+async function getSentimentBatch(symbols, { concurrency = 3, prices = null } = {}) {
   if (batchInflight) return batchInflight;
   const run = (async () => {
     const out = {};
@@ -397,7 +432,8 @@ async function getSentimentBatch(symbols, { concurrency = 3 } = {}) {
     async function worker() {
       while (queue.length) {
         const s = queue.shift();
-        try { out[s] = await getSentiment(s); }
+        const currentPrice = prices && Number.isFinite(prices[s]) ? prices[s] : null;
+        try { out[s] = await getSentiment(s, { currentPrice }); }
         catch (e) { out[s] = defaultPayload(s, `Batch error: ${e.message}`); }
       }
     }

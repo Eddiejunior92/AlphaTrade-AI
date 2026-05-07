@@ -72,6 +72,25 @@ class AlpacaService {
     } catch (e) { console.error('[Alpaca] getOrders error:', e.message); return []; }
   }
 
+  // Used by the order-reconciler to resolve a specific order id to its
+  // current terminal status. Returns the order body on 200, null on 404
+  // (order not found — reconciler will mark the trade unknown), throws on
+  // network/auth errors so the reconciler can back off.
+  async getOrder(orderId) {
+    if (!this.isConfigured()) return null;
+    if (!orderId) return null;
+    try {
+      const res = await axios.get(`${this.baseUrl}/v2/orders/${orderId}`, {
+        headers: this.headers, timeout: 10000,
+      });
+      return res.data;
+    } catch (e) {
+      if (e.response?.status === 404) return null;
+      console.error(`[Alpaca] getOrder(${orderId}) error:`, e.message);
+      throw e;
+    }
+  }
+
   async placeOrder({ symbol, qty, side, type = 'market', time_in_force = 'day' }) {
     // Last-line kill-switch defense — global guard at the broker sink itself.
     // executeOrder() in agent.js also guards, but hedgingService and any
