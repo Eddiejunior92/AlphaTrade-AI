@@ -864,14 +864,14 @@ export default function App() {
                 <Tooltip text="Switch US to paper trading (safe, simulated)">
                   <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'paper' }); }} disabled={mode === 'paper' || loading.mode}
                     className={`ios-btn w-full ${mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'}`}>
-                    🟡 Paper
+                    {mode === 'paper' ? '✓ Paper' : 'Switch to Paper'}
                   </button>
                 </Tooltip>
                 <Tooltip text={liveAvailable ? 'Switch US to LIVE — requires confirmation' : 'Add ALPACA_LIVE_API_KEY + SECRET to enable'}>
                   <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'live' }); }}
                     disabled={mode === 'live' || !liveAvailable || loading.mode}
                     className={`ios-btn w-full ${mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'}`}>
-                    🔴 Live
+                    {mode === 'live' ? '✓ Live' : 'Switch to Live'}
                   </button>
                 </Tooltip>
               </div>
@@ -1722,19 +1722,27 @@ function MarketsAndModesPanel({ markets, loading, tokenMissing, onToggleEnabled,
             </button>
           </Tooltip>
         </div>
+        <div className="flex items-center justify-between mb-2 px-1">
+          <span className="text-[10px] text-[var(--text-dim)]">Currently</span>
+          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+            isLive ? 'bg-[var(--red)]/15 text-[var(--red)]' : 'bg-[var(--yellow)]/15 text-[var(--yellow)]'
+          }`}>
+            {isLive ? '🔴 LIVE' : '🟡 PAPER'}
+          </span>
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <button
             disabled={tokenMissing || !enabled || m.mode === 'paper'}
             onClick={() => onOpenModeModal?.(market, 'paper')}
             className={`ios-btn ${m.mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'} text-[11px]`}>
-            🟡 Paper
+            {m.mode === 'paper' ? '✓ Paper' : 'Switch to Paper'}
           </button>
           <Tooltip text={liveBlocked ? 'Add ALPACA_LIVE_API_KEY + SECRET to enable' : `Switch ${market} to LIVE — requires confirmation`}>
             <button
               disabled={tokenMissing || !enabled || m.mode === 'live' || liveBlocked}
               onClick={() => onOpenModeModal?.(market, 'live')}
               className={`ios-btn w-full ${m.mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'} text-[11px]`}>
-              🔴 Live
+              {m.mode === 'live' ? '✓ Live' : 'Switch to Live'}
             </button>
           </Tooltip>
         </div>
