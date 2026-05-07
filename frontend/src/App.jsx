@@ -848,30 +848,38 @@ export default function App() {
             <div className="glass p-5">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <div className="font-semibold text-[14px]">Trading Mode</div>
+                  <div className="font-semibold text-[14px]">Trading Mode (US)</div>
                   <div className="text-[11px] text-[var(--text-dim)]">Paper = simulated · Live = real money via Alpaca</div>
                 </div>
                 <span className={`text-[10px] font-bold px-3 py-1.5 rounded-full ${
-                  mode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
-                }`}>{mode.toUpperCase()}</span>
+                  usMode === 'paper' ? 'bg-[var(--yellow)]/15 text-[var(--yellow)]' : 'bg-[var(--red)]/15 text-[var(--red)]'
+                }`}>{usMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}</span>
               </div>
               <div className="text-[11px] text-[var(--text-dim)] bg-white/3 rounded-xl p-3 mb-3">
-                {mode === 'paper'
+                {usMode === 'paper'
                   ? 'All orders simulated through the Alpaca paper account — your real money is safe.'
                   : '⚠ Real capital is at risk. All risk gates and circuit breakers still apply, but losses are real.'}
               </div>
+              <div className="flex items-center justify-between mb-2 px-1">
+                <span className="text-[10px] text-[var(--text-dim)]">Currently</span>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                  usMode === 'live' ? 'bg-[var(--red)]/15 text-[var(--red)]' : 'bg-[var(--yellow)]/15 text-[var(--yellow)]'
+                }`}>
+                  {usMode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}
+                </span>
+              </div>
               <div className="grid grid-cols-2 gap-2">
                 <Tooltip text="Switch US to paper trading (safe, simulated)">
-                  <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'paper' }); }} disabled={mode === 'paper' || loading.mode}
-                    className={`ios-btn w-full ${mode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'}`}>
-                    {mode === 'paper' ? '✓ Paper' : 'Switch to Paper'}
+                  <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'paper' }); }} disabled={usMode === 'paper' || loading['marketMode:US']}
+                    className={`ios-btn w-full ${usMode === 'paper' ? 'ios-btn-ghost' : 'ios-btn-success'}`}>
+                    {usMode === 'paper' ? '✓ Paper' : 'Switch to Paper'}
                   </button>
                 </Tooltip>
                 <Tooltip text={liveAvailable ? 'Switch US to LIVE — requires confirmation' : 'Add ALPACA_LIVE_API_KEY + SECRET to enable'}>
                   <button onClick={() => { setModeError(''); setModeModal({ market:'US', target:'live' }); }}
-                    disabled={mode === 'live' || !liveAvailable || loading.mode}
-                    className={`ios-btn w-full ${mode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'}`}>
-                    {mode === 'live' ? '✓ Live' : 'Switch to Live'}
+                    disabled={usMode === 'live' || !liveAvailable || loading['marketMode:US']}
+                    className={`ios-btn w-full ${usMode === 'live' ? 'ios-btn-ghost' : 'ios-btn-danger'}`}>
+                    {usMode === 'live' ? '✓ Live' : 'Switch to Live'}
                   </button>
                 </Tooltip>
               </div>
