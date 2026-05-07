@@ -215,8 +215,15 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // the stack because cross-asset stress is the broadest risk signal we have.
   const macroMult = Number.isFinite(dyn.macroAdjust?.sizeMult)
     ? Math.max(0.70, Math.min(1.00, dyn.macroAdjust.sizeMult)) : 1.0;
+  // Dip amplifier — strictly bounded sizing nudge for the day-strategy
+  // mean-reversion setup (price meaningfully below VWAP + positive flow).
+  // Hard clamp [1.00, 1.25]: can ONLY upsize and only by ≤25%. Defence-in
+  // depth on the agent-side gate that already requires dipVerdict.allow.
+  // Default 1.0 = no effect.
+  const dipSizingMult = Number.isFinite(dyn.dipSizingMult)
+    ? Math.max(1.00, Math.min(1.25, dyn.dipSizingMult)) : 1.0;
   const target = computeTargetRisk({ scale: sc, signal, dynamic: dyn });
-  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult * regimeMult * macroMult).toFixed(2);
+  const adjustedRiskUSD = +(target.targetRiskUSD * adaptiveMult * portfolioMult * mlMult * regimeMult * macroMult * dipSizingMult).toFixed(2);
 
   const qtyByRisk = Math.floor(adjustedRiskUSD / riskPerShare);
   const maxPositionUSD = equity * sc.maxPositionPct;
@@ -259,6 +266,7 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
       macroBoost,
       macroRegime: dyn.macroAdjust?.regime || null,
       macroForecast: dyn.macroAdjust?.forecastRegime || null,
+      dipSizingMult,
     },
   };
 }

@@ -1122,6 +1122,10 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
+    // Hoisted so the dip amplifier (after the day/asx_day block below) can
+    // read the verdict's pctBelowVwap/cumDeltaSlope. Stays undefined for
+    // non-day strategies, which the amplifier handles via optional chaining.
+    let dipVerdict;
     // -----------------------------------------------------------------------
     // Day-trading recovery buffer — operator-tunable cooldown on same-symbol
     // re-entries. Only applies to strategy='day' (swing & asx_swing trade on
@@ -1160,7 +1164,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // can only downgrade BUY→HOLD via TRADE_REJECTED, never upgrades or
       // relaxes any safety rail. Fails OPEN on missing indicators/orderFlow
       // so a data hiccup cannot wedge entries.
-      const dipVerdict = dipBuyService.checkDipConditions({
+      dipVerdict = dipBuyService.checkDipConditions({
         bars, indicators, orderFlow,
       });
       if (!dipVerdict.allow) {
@@ -1202,6 +1206,23 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       mlPrediction = await mlAdaptive.predict(mlFeatures);
     } catch (_) { /* swallow — never block trading */ }
 
+    // Dip-amplifier sizing multiplier (Phase 2 — May 2026). When a day-strategy
+    // BUY clears the dip gate AND the textbook mean-reversion setup is in
+    // play (price ≥0.5% below VWAP WITH cumulative delta turning positive =
+    // sellers exhausted, buyers stepping in), bump size by 1.25×. Hard-capped
+    // at 1.25× in riskManager. NEVER lowers any threshold or bypasses the
+    // dip gate; only fires when dipVerdict.allow was already true. Defaults
+    // to 1.0 for non-day strategies and when conditions aren't met.
+    let dipSizingMult = 1.0;
+    const dvPct = dipVerdict?.pctBelowVwap;
+    const dvSlope = dipVerdict?.cumDeltaSlope;
+    if ((sc.name === 'day' || sc.name === 'asx_day')
+        && dipVerdict?.allow === true
+        && Number.isFinite(dvPct) && dvPct >= 0.5
+        && Number.isFinite(dvSlope) && dvSlope > 0) {
+      dipSizingMult = 1.25;
+    }
+
     const dynamicWithUpgrades = {
       ...(dynamic || {}),
       adaptiveMult, portfolioMult,
@@ -1210,6 +1231,8 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // Macro-forecast layer — additively tightens the confidence gate AND
       // shrinks size. Hard-clamped in riskManager: boost ≥ 0, sizeMult ≤ 1.0.
       macroAdjust: macroAdjustForRisk || undefined,
+      // Dip amplifier — clamped at 1.25 in riskManager defence-in-depth.
+      dipSizingMult,
     };
     // [Upgrade #4] Atomic BUY critical section — re-read fresh cash +
     // holdings, run evaluateBuy, AND executeOrder all under a single lock

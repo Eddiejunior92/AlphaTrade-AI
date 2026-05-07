@@ -35,7 +35,10 @@ const STRATEGIES = {
     // ordinary intraday wiggle on 1Min bars.
     stopLossPct: 0.01,
     takeProfitPct: 0.02,
-    maxHoldings: 4,
+    // Bumped 4 → 6 (May 2026) to support a higher day-trade entry rate
+    // (target ~10/day) while still capping concurrent intraday exposure.
+    // 6 × 3% maxPositionPct = 18% of equity max held in day positions.
+    maxHoldings: 6,
     forceFlattenBeforeClose: true,
     holdOvernight: false,
     minDirectionalAgreement: 3, // quorum NEVER relaxed by risk scale

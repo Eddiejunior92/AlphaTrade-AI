@@ -78,3 +78,11 @@ externalPort = 5173
 deploymentTarget = "vm"
 run = ["npm", "start"]
 build = ["npm", "run", "build"]
+
+[userenv]
+
+[userenv.shared]
+AGENT_INTERVAL_SECONDS = "30"
+DAY_TRADING_DIP_REQUIREMENT_STRICTNESS = "1"
+LLM_SKIP_PRICE_BPS = "40"
+LLM_QUIET_SHORTCUT = "false"

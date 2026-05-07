@@ -205,12 +205,24 @@ function checkDipConditions({ bars, indicators, orderFlow, strictness }) {
   const conditionsMet = Object.values(conditions).filter(Boolean).length;
   const allow = conditionsMet >= profile.minConditions;
 
+  // Mean-reversion amplifier signal: how far below VWAP the current close
+  // sits, in percent. Positive = price below VWAP. The agent uses this
+  // (paired with positive cumDeltaSlope = sellers exhausted, buyers
+  // stepping in) to slightly UPSIZE the textbook dip-buy. NEVER used to
+  // override any safety gate — only feeds a clamped sizing multiplier in
+  // riskManager.evaluateBuy.
+  const pctBelowVwap = (vwap != null && vwap > 0)
+    ? +(((vwap - close) / vwap) * 100).toFixed(3)
+    : null;
+
   return {
     allow,
     strictness: s,
     requiredConditions: profile.minConditions,
     conditionsMet,
     conditions,
+    pctBelowVwap,
+    cumDeltaSlope: cdSlope,
     metrics: {
       close: +close.toFixed(4),
       swing_low:  Number.isFinite(swingLow)  ? +swingLow.toFixed(4)  : null,
@@ -218,6 +230,7 @@ function checkDipConditions({ bars, indicators, orderFlow, strictness }) {
       dist_from_low_pct:    distFromLowPct    != null ? +distFromLowPct.toFixed(2)    : null,
       dist_below_high_pct:  distBelowHighPct  != null ? +distBelowHighPct.toFixed(2)  : null,
       recent5_move_pct:     recentMovePct     != null ? +recentMovePct.toFixed(2)     : null,
+      pct_below_vwap:       pctBelowVwap,
       vwap, cum_delta_slope: cdSlope,
       rsi_now: rsiNow != null ? +rsiNow.toFixed(1) : null,
       rsi_prev: rsiPrev != null ? +rsiPrev.toFixed(1) : null,
