@@ -1,0 +1,35 @@
+Implement the complete Master Intelligence Upgrade with smart safety.
+1. Hybrid Strategy (reduce LLM usage ~60-70%)
+•  Sentiment: maximum 1 LLM call per symbol per day, 45-minute minimum cache.
+•  Regime detection: pure code first (macro + volatility + correlation). Only call LLM if statistical confidence <70%.
+•  Entry decisions: weighted hybrid score (60% statistical signals, 30% single fast model, 10% full ensemble only on borderline setups).
+•  Smart cache: reuse similar setups from the last 2 hours.
+2. Intelligence Council with Specialized Roles
+•  Four distinct roles:
+	•  Fundamental Analyst — macro, news, sector context
+	•  Technical Analyst — price action, VWAP, order flow, technical levels
+	•  Risk Manager — stress-tests position sizing, drawdown risk, circuit breaker impact
+	•  Judge / Referee — synthesizes the debate, gives final verdict with clear reasoning
+•  Add a short Reflection step where the Judge explains its final decision.
+3. Daily Meta-Review
+•  Run after US market close.
+•  Council debates the day’s performance.
+•  Each suggestion must be scored on: Expected Impact (High/Medium/Low), Implementation Effort (Easy/Medium/Hard), and Confidence level.
+•  Send clean, numbered suggestions to Discord.
+4. Dynamic LLM Router
+•  Track historical performance per task type and per model.
+•  Automatically route each task to the best-performing model for that specific task (fallback to Grok for speed/cost).
+•  Update router statistics after every trade.
+5. Discord Approval System
+•  All suggestions posted to Discord with clear numbering.
+•  Support simple commands: “Approve #2”, “Implement suggestion 3”, “Reject #1”.
+•  When approved, the system applies the change via the Agent.
+6. Smart Safety Layer
+•  Keep all hard safety rails completely untouched: 5% daily circuit breaker, kill switch, atomic cash/holdings updates, no averaging down, max 3% per position, audit log, recovery buffer.
+•  Make the confidence gate dynamic: Intelligence Council can lower it to 65% in high-edge regimes and raise it to 90% in low-edge/choppy regimes.
+•  Add auto-adaptive rule: if day-trading win rate <42% for 3 consecutive days, automatically raise confidence gate to 85% until performance recovers.
+Additional Requirements
+•  ASX trading remains temporarily disabled (learning still active).
+•  Never allow changes to safety-critical code (circuit breaker, risk limits, atomic cash logic, audit log, kill switch, recovery buffer, etc.) — even if approved.
+•  All code changes must be reviewed and applied through the Agent.
+After implementing, give me a short summary of the full upgraded system and how safety now works with intelligence.
