@@ -23,6 +23,7 @@ const dynamicGate = require('./dynamicGateService');
 const approval = require('./discordApprovalService');
 const discord = require('./discordService');
 const costTracker = require('./llmCostTracker');
+const calibration = require('./calibrationService');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const XAI_URL = 'https://api.x.ai/v1/chat/completions';
@@ -155,6 +156,11 @@ Respond with valid JSON:
 
 async function runReview(market = 'US') {
   const facts = await _gatherFacts(market);
+  // Phase B: run calibration audit FIRST so its output can be added to the
+  // facts the council reads + posted in the Discord summary. Best-effort.
+  let calibrationAudit = null;
+  try { calibrationAudit = await calibration.runDailyCalibrationAudit({ market }); } catch (_) {}
+  facts.calibration = calibrationAudit;
   const userPrompt = `MARKET: ${market}
 FACTS:
 ${JSON.stringify(facts, null, 2)}
@@ -201,12 +207,42 @@ Produce 3-5 numbered suggestions in JSON.`;
   // — left out by default to keep this a pure proposal layer; the per-cycle
   //   council deliberation is the live adjustment path.
 
+  // Phase B: if calibration audit flagged a chronically miscalibrated bucket,
+  // synthesize a numbered suggestion targeting confidence_gate_base. This is
+  // ALWAYS gated through the same Discord Approve flow — never auto-applied.
+  if (calibrationAudit && calibrationAudit.ok && calibrationAudit.flagged_buckets?.length) {
+    try {
+      const flagged = calibrationAudit.flagged_buckets[0];
+      // Direction: realized < predicted → over-confident → RAISE the gate.
+      // Realized > predicted → under-confident → keep gate (no relax suggested).
+      const realized = parseFloat(flagged.realized_wr);
+      const predicted = parseFloat(flagged.predicted_avg);
+      const gateNow = parseFloat(facts.gate?.base_gate || 0.80);
+      let suggestedGate = gateNow;
+      if (Number.isFinite(realized) && Number.isFinite(predicted) && realized < predicted) {
+        // Tighten by 2pp — bounded by SAFETY_CEIL (0.90) inside dynamicGate.
+        suggestedGate = Math.min(0.90, +(gateNow + 0.02).toFixed(2));
+      }
+      if (suggestedGate !== gateNow) {
+        const id = await approval.addSuggestion({
+          title: `Calibration miscalibration in ${flagged.bucket} bucket → tighten gate`,
+          target_key: 'confidence_gate_base',
+          target_value: String(suggestedGate),
+          impact: 'M', effort: 'E', confidence: 0.7,
+          rationale: `${calibrationAudit.flag_required_days}+ consecutive days of |gap|>${(calibrationAudit.gap_threshold*100).toFixed(0)}pp in the ${flagged.bucket} confidence bucket. Realized WR ${(realized*100).toFixed(0)}% vs predicted ${(predicted*100).toFixed(0)}%. Tightening base gate +2pp to demand more conviction.`,
+          source: `calibration_${market}`,
+        });
+        stored.push({ id, title: `Calibration: tighten gate to ${suggestedGate}`, target_key: 'confidence_gate_base', target_value: String(suggestedGate), impact: 'M', effort: 'E', confidence: 0.7, rationale: 'see audit table' });
+      }
+    } catch (_) {}
+  }
+
   // Post to Discord.
-  await _postReviewToDiscord(market, summary, stored, facts);
-  return { ok: true, summary, suggestions: stored, facts };
+  await _postReviewToDiscord(market, summary, stored, facts, calibrationAudit);
+  return { ok: true, summary, suggestions: stored, facts, calibration: calibrationAudit };
 }
 
-async function _postReviewToDiscord(market, summary, suggestions, facts) {
+async function _postReviewToDiscord(market, summary, suggestions, facts, calibrationAudit) {
   const flag = market === 'ASX' ? '🇦🇺' : '🇺🇸';
   const lines = [
     `🧠 **${flag} ${market} Daily Meta-Review**`,
@@ -222,6 +258,11 @@ async function _postReviewToDiscord(market, summary, suggestions, facts) {
     lines.push(`**#${s.id}** [${s.impact}/${s.effort}, conf ${(parseFloat(s.confidence)*100).toFixed(0)}%] ${s.title}`);
     lines.push(`   → \`${s.target_key}\` = \`${s.target_value}\``);
     lines.push(`   _${s.rationale}_`);
+  }
+  // Phase B: append calibration markdown table if audit ran.
+  if (calibrationAudit && calibrationAudit.ok) {
+    const md = calibration.renderCalibrationMarkdown(calibrationAudit);
+    if (md) lines.push(md);
   }
   lines.push('');
   lines.push('Reply `Approve #N` to apply, `Reject #N` to dismiss, or `Status` to list pending.');

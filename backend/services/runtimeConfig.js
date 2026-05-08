@@ -39,7 +39,10 @@ const DEFAULTS = Object.freeze({
   // strategies.js day.maxHoldings = 6
   max_holdings_day: 6,
   // strategies.js day.maxPositionPct / asx_day.maxPositionPct = 0.04
-  max_position_pct: 0.04,
+  // Phase B (May 2026): renamed `max_position_pct` → `max_position_pct_day`
+  // to make the day-strategy scope explicit. Swing strategies keep their
+  // own 5% cap from strategies.js — this key never affects them.
+  max_position_pct_day: 0.04,
 });
 
 // Bounds match the validators in discordApprovalService.SAFE_KEYS — the same
@@ -55,7 +58,7 @@ const BOUNDS = Object.freeze({
   // revision used 20 here, which would have allowed a corrupted DB row to
   // widen day-strategy exposure beyond the approval contract.
   max_holdings_day:           { min: 1,    max: 10,   parse: parseInt   },
-  max_position_pct:           { min: 0.005,max: 0.05, parse: parseFloat },
+  max_position_pct_day:       { min: 0.005,max: 0.05, parse: parseFloat },
 });
 
 function _coerce(key, raw) {
@@ -75,7 +78,7 @@ function _envFor(key) {
     case 'sentiment_ttl_seconds':      return process.env.SENTIMENT_TTL_SECONDS;
     case 'agent_interval_seconds':     return process.env.AGENT_INTERVAL_SECONDS;
     case 'max_holdings_day':           return null; // no env; portfolio col only
-    case 'max_position_pct':           return null; // no env; portfolio col only
+    case 'max_position_pct_day':       return null; // no env; portfolio col only
     default:                           return null;
   }
 }
@@ -102,7 +105,7 @@ async function _readDb() {
     if (row.sentiment_ttl_seconds      != null) out.sentiment_ttl_seconds      = row.sentiment_ttl_seconds;
     if (row.agent_interval_seconds     != null) out.agent_interval_seconds     = row.agent_interval_seconds;
     if (row.max_holdings_day           != null) out.max_holdings_day           = row.max_holdings_day;
-    if (row.max_position_pct_day       != null) out.max_position_pct           = row.max_position_pct_day;
+    if (row.max_position_pct_day       != null) out.max_position_pct_day       = row.max_position_pct_day;
   } catch (e) {
     console.warn('[RUNTIME-CONFIG] portfolio read failed, falling back:', e.message);
   }

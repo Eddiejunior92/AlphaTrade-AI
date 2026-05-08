@@ -38,6 +38,21 @@ const PIN_THRESHOLD_WINNING = 0.55; // 3-day WR above this → release pin
 const PIN_VALUE    = 0.85;
 const PIN_DAYS_REQUIRED = 3;
 
+// Phase B (May 2026): regime meta-layer. Raise-only adjustments to the gate
+// based on the LIVE regime classification. The four invariants enforced by
+// computeRegimeAdjustment + getCurrentGate compose:
+//   1. raise-only       — adjustment is always ≥ 0 (never relaxes the gate)
+//   2. capped at +0.05  — single-cycle regime tightening cannot exceed 5pp
+//   3. clamped [F, C]   — final gate stays inside [SAFETY_FLOOR, SAFETY_CEIL]
+//   4. pin precedence   — the auto-adaptive WR pin still wins (Math.max)
+const REGIME_ADJ_MAX = 0.05;
+const REGIME_RULES = Object.freeze({
+  high_vol:      0.03, // wider tape — demand more conviction
+  news_driven:   0.02, // headline risk — demand more conviction
+  low_liquidity: 0.02, // microstructure risk — demand more conviction
+  // any other regime label (trending, mean_reverting, normal, etc.) → 0
+});
+
 function clampGate(v) {
   if (!Number.isFinite(v)) return BASE_GATE;
   return Math.max(SAFETY_FLOOR, Math.min(SAFETY_CEIL, v));
@@ -68,13 +83,37 @@ async function _ensureState() {
   return _state;
 }
 
-// Returns the EFFECTIVE base gate after applying council delta + win-rate pin.
-// This is what callers pass to riskManager.checkQuorum's `gateOverride`.
-async function getCurrentGate({ strategy = 'day', market = 'US' } = {}) {
+// Phase B (May 2026): pure raise-only regime adjustment. Returns the # of pp
+// to ADD to the base+council gate based on the live regime classification.
+// CONTRACT (asserted by tests + final getCurrentGate clamps):
+//   • Always ≥ 0 (raise-only — can never loosen the gate)
+//   • Always ≤ REGIME_ADJ_MAX (single-cycle bound)
+//   • Pure / null-safe / never throws
+function computeRegimeAdjustment(regime) {
+  if (!regime) return 0;
+  // Accept either a regimeService output ({ primary, ... }) or a bare string.
+  const label = typeof regime === 'string'
+    ? regime
+    : String(regime.primary || regime.regime || '').toLowerCase();
+  if (!label) return 0;
+  const raw = REGIME_RULES[label];
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(REGIME_ADJ_MAX, Math.max(0, raw));
+}
+
+// Returns the EFFECTIVE base gate after composing:
+//   base + council_delta + regime_adjustment, then pin-max, then clamp.
+// Called per-signal (riskManager.checkQuorum gateOverride).
+//
+// Composition order MATTERS. Regime adj is applied BEFORE the pin so the pin
+// can still raise above a high regime adj but cannot LOWER below it. Final
+// clamp guarantees the [SAFETY_FLOOR, SAFETY_CEIL] band is sacrosanct.
+async function getCurrentGate({ strategy = 'day', market = 'US', regime = null } = {}) {
   const s = await _ensureState();
   const base = parseFloat(s.base_gate) || BASE_GATE;
   const delta = parseFloat(s.council_delta) || 0;
-  let gate = clampGate(base + delta);
+  const regimeAdj = computeRegimeAdjustment(regime);
+  let gate = clampGate(base + delta + regimeAdj);
   if (s.pinned && Number.isFinite(parseFloat(s.pin_value))) {
     // Pin is upward-only — never relax below the pin value.
     gate = Math.max(gate, parseFloat(s.pin_value));
@@ -155,14 +194,18 @@ async function evaluateAutoAdaptive({ strategy = null } = {}) {
   return { ok: true, action, n, w, winRate: +winRate.toFixed(3), pinned, pinValue };
 }
 
-async function getStatus() {
+async function getStatus({ regime = null } = {}) {
   const s = await _ensureState();
-  const effective = await getCurrentGate();
+  const effective = await getCurrentGate({ regime });
+  const regimeAdj = computeRegimeAdjustment(regime);
   return {
     safety_floor: SAFETY_FLOOR,
     safety_ceiling: SAFETY_CEIL,
     base_gate: parseFloat(s.base_gate) || BASE_GATE,
     council_delta: parseFloat(s.council_delta) || 0,
+    regime_adjustment: regimeAdj,
+    regime_adjustment_max: REGIME_ADJ_MAX,
+    regime_input: regime ? (typeof regime === 'string' ? regime : regime.primary || null) : null,
     pinned: !!s.pinned,
     pin_value: s.pin_value != null ? parseFloat(s.pin_value) : null,
     pin_reason: s.pin_reason || null,
@@ -212,6 +255,7 @@ module.exports = {
   evaluateAutoAdaptive,
   getStatus,
   clampGate,
+  computeRegimeAdjustment,
   initStateAtBoot,
-  SAFETY_FLOOR, SAFETY_CEIL, BASE_GATE,
+  SAFETY_FLOOR, SAFETY_CEIL, BASE_GATE, REGIME_ADJ_MAX, REGIME_RULES,
 };

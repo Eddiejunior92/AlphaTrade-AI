@@ -1,6 +1,10 @@
 require('dotenv').config();
 const llmService = require('./services/llmService');
 const hybridSignal = require('./services/hybridSignalService');
+// Phase B (May 2026): new layered intelligence services. All fail-open.
+const hybridCache = require('./services/hybridCacheService');
+const positionSizing = require('./services/positionSizingService');
+const expectancyService = require('./services/expectancyService');
 const councilService = require('./services/councilService');
 const dynamicGate = require('./services/dynamicGateService');
 const premarketService = require('./services/premarketService');
@@ -85,7 +89,7 @@ function startCycleInterval(intervalSeconds) {
 
 // Phase A.5: per-cycle strategy composition. Returns a NEW shallow-cloned
 // strategy object (riskScale-applied) with Discord-approved runtime overlays
-// for `max_holdings_day` and `max_position_pct` applied for the day
+// for `max_holdings_day` and `max_position_pct_day` applied for the day
 // strategies (`day` and `asx_day` only — swing strategies are pass-through).
 //
 // CRITICAL: never mutates STRATEGIES[name]. The base literal in strategies.js
@@ -124,11 +128,11 @@ function buildStrategyConfig(strategyName, scaleName) {
     console.warn(`[STRATEGY-OVERLAY] ${strategyName}: max_holdings_day=${rt.max_holdings_day} out of [1,10]; using base ${baseHoldings}`);
   }
 
-  if (rt.max_position_pct != null && Number.isFinite(rt.max_position_pct)
-      && rt.max_position_pct >= 0.005 && rt.max_position_pct <= 0.05) {
-    clone.maxPositionPct = rt.max_position_pct;
-  } else if (rt.max_position_pct != null) {
-    console.warn(`[STRATEGY-OVERLAY] ${strategyName}: max_position_pct=${rt.max_position_pct} out of [0.005,0.05]; using base ${basePosPct}`);
+  if (rt.max_position_pct_day != null && Number.isFinite(rt.max_position_pct_day)
+      && rt.max_position_pct_day >= 0.005 && rt.max_position_pct_day <= 0.05) {
+    clone.maxPositionPct = rt.max_position_pct_day;
+  } else if (rt.max_position_pct_day != null) {
+    console.warn(`[STRATEGY-OVERLAY] ${strategyName}: max_position_pct_day=${rt.max_position_pct_day} out of [0.005,0.05]; using base ${basePosPct}`);
   }
 
   // Log only on CHANGE so deploy logs aren't spammed every cycle.
@@ -500,6 +504,27 @@ async function executeOrder({ symbol, side, qty, price, signal, stop_loss, take_
   // REAL-TIME adaptive learning — feed USD P&L (the unified portfolio
   // measurement unit) so the multi-market track-record stays comparable.
   if (side === 'SELL' && usdPnl !== null && Number.isFinite(usdPnl)) {
+    // Phase B (May 2026): per-symbol expectancy bookkeeping. riskUSD comes
+    // from the originating BUY's audit row (via recordMLOutcomeForClose's
+    // lookup pattern); fall back to abs(pnl) so the R-calc never divides
+    // by zero. Best-effort — never blocks settlement.
+    (async () => {
+      let r = null;
+      try {
+        const { rows } = await db.query(`
+          SELECT (payload->>'ml_risk_usd')::float AS risk
+          FROM audit_log
+          WHERE event_type='TRADE_EXECUTED' AND symbol=$1 AND decision='BUY'
+            AND payload->>'strategy'=$2
+            AND created_at >= NOW() - INTERVAL '30 days'
+          ORDER BY created_at DESC LIMIT 1
+        `, [symbol, strategy]);
+        r = rows[0]?.risk || Math.max(Math.abs(usdPnl), 1);
+      } catch (_) { r = Math.max(Math.abs(usdPnl), 1); }
+      try { await expectancyService.recordTradeOutcome({ symbol, strategy, pnlUSD: usdPnl, riskUSD: r }); } catch (_) {}
+    })().catch(() => {});
+    // Phase B: trade execution invalidates this symbol's hybrid-cache route.
+    try { hybridCache.invalidateSymbol(symbol); } catch (_) {}
     adaptiveLearning.recordOutcome({ symbol, strategy, pnl: usdPnl, closedAt: new Date() })
       .catch(() => {});
     // ML adaptive layer — replay the originating BUY's feature vector and
@@ -1121,7 +1146,15 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     const stat = hybridSignal.computeStatisticalSignal({
       indicators, patterns, intraday, regime, newsSentiment,
     });
-    const route = hybridSignal.decideRoute({ stat, escalate, holding });
+    // Phase B: pass cache-key inputs so decideRoute can hit hybridCacheService.
+    const _gateNow = await dynamicGate.getCurrentGate({ strategy: sc.name, market: info.market, regime }).catch(() => 0.80);
+    const gateBucketVal = Math.round(_gateNow * 20) / 20; // 5pp granularity
+    const route = hybridSignal.decideRoute({
+      stat, escalate, holding,
+      symbol, strategy: sc.name,
+      regime: regime?.primary || null,
+      gateBucket: gateBucketVal,
+    });
     if (route.route === 'STATISTICAL_ONLY') {
       perfMetrics.ensembleQuietSkipped++;
       perfMetrics.ensembleQuietSkippedByMarket[_mktKey]++;
@@ -1247,6 +1280,26 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   };
 
   if (signal.consensus === 'BUY') {
+    // Phase B (May 2026): per-symbol expectancy auto-suspend. If this symbol
+    // hit the failing-edge threshold (≥10 trades AND avg expectancy ≤ -0.5R)
+    // any new BUY is rejected with a TRADE_REJECTED audit row until an
+    // operator runs `Reinstate <SYM>` on Discord. Fail-open: any DB hiccup
+    // returns allow:true so a transient outage cannot wedge the engine.
+    try {
+      const ent = await expectancyService.shouldAllowEntry(symbol, sc.name);
+      if (!ent.allow) {
+        await db.recordAudit({
+          event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
+          confidence: signal.confidence,
+          payload: {
+            reason: 'symbol_suspended',
+            strategy: sc.name, market: info.market,
+            n_trades: ent.n_trades, expectancy_r: ent.expectancy_r,
+          },
+        });
+        return;
+      }
+    } catch (_) { /* fail-open by design */ }
     // Hoisted so the dip amplifier (after the day/asx_day block below) can
     // read the verdict's pctBelowVwap/cumDeltaSlope. Stays undefined for
     // non-day strategies, which the amplifier handles via optional chaining.
@@ -1362,7 +1415,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       // 0.65-0.90 at the source AND re-clamped inside checkQuorum). When
       // present, REPLACES the strategy's static confidenceThreshold as the
       // base gate; existing regime/macro boosts still tighten on top.
-      gateOverride: await dynamicGate.getCurrentGate({ strategy: sc.name, market: info.market }).catch(() => undefined),
+      gateOverride: await dynamicGate.getCurrentGate({ strategy: sc.name, market: info.market, regime }).catch(() => undefined),
     };
     // [Upgrade #4] Atomic BUY critical section — re-read fresh cash +
     // holdings, run evaluateBuy, AND executeOrder all under a single lock
@@ -1376,9 +1429,33 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       const _cashNow   = Number.isFinite(parseFloat(_portFresh.cash_balance))
         ? parseFloat(_portFresh.cash_balance) : cash;
       const _allHFresh = await db.getHoldings();
+      // Phase B (May 2026): asymmetric sizing overlay. positionSizing produces
+      // a confidence-scaled maxPositionPct in [0.005, 0.05] for day strategies;
+      // swing strategies are pass-through. We OVERLAY onto a strategyConfig
+      // CLONE so the base STRATEGIES literal is never mutated. The result is
+      // STILL clamped by riskManager (the qty=min(qtyByRisk, qtyByPosition)
+      // path), defence-in-depth: even if the overlay returned out-of-range
+      // the qty cap by 4-5% holds.
+      let _scForBuy = sc;
+      try {
+        const sized = positionSizing.withAsymmetricSizing(sc, signal.confidence);
+        _scForBuy = sized.sc;
+        if (sized.sizing && sized.sizing.violatedBound) {
+          await db.recordAudit({
+            event_type: 'SIZING_BOUND_VIOLATED', symbol, decision: 'BUY',
+            confidence: signal.confidence,
+            payload: {
+              strategy: sc.name, market: info.market,
+              attempted_pct: sized.sizing.requested,
+              clamped_pct: sized.sizing.maxPositionPct,
+              bound: sized.sizing.violatedBound,
+            },
+          });
+        }
+      } catch (_) { _scForBuy = sc; }
       const eval_ = await riskManager.evaluateBuy({
         symbol, signal, price: latestUsd, equity, cash: _cashNow, holdings: _allHFresh,
-        strategyConfig: sc, dynamic: dynamicWithUpgrades,
+        strategyConfig: _scForBuy, dynamic: dynamicWithUpgrades,
       });
       if (!eval_.allow) {
         await db.recordAudit({ event_type: 'TRADE_REJECTED', symbol, decision: 'BUY',
@@ -2387,6 +2464,13 @@ async function setMarketMode(market, mode) {
   return { market: m, mode };
 }
 
+// Phase B (May 2026): hybrid cache stats — exposed via /api/hybrid/cache-stats
+// in server.js so the dashboard / Discord can sanity-check hit rate. Pure
+// pass-through to hybridCacheService.
+function getHybridCacheStats() {
+  try { return hybridCache.getStats(); } catch (e) { return { ok: false, reason: e.message }; }
+}
+
 async function dailyReset() {
   const holdings = await db.getHoldings();
   const priceMap = await buildPriceLookup(holdings);
@@ -2420,6 +2504,12 @@ async function dailyReset() {
     const r = await require('./services/sentimentService').cleanupPersistedCache();
     if (r?.ok) console.log(`[Agent] sentiment_cache cleanup: ${r.deleted || 0} rows`);
   } catch (e) { console.warn('[Agent] sentiment_cache cleanup failed:', e.message); }
+  // Phase B (May 2026): drop the entire hybrid route cache nightly so a
+  // stale daily routing decision can't carry into the next session.
+  try {
+    const dropped = hybridCache.invalidateAll();
+    console.log(`[Agent] hybrid cache nightly purge: dropped ${dropped} entries`);
+  } catch (_) {}
 }
 
 function scheduleDailyReset() {
@@ -3208,6 +3298,7 @@ setInterval(() => {
 module.exports = {
   startAgent, stopAgent, runCycle, getAgentSnapshot,
   emergencyPause, resetCircuitBreaker, setAutoBreakerReset, flattenAllPositions,
+  getHybridCacheStats,
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence, setMarketCadence,
   setMarketEnabled, setMarketMode,

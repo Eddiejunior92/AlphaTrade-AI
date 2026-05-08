@@ -11,7 +11,7 @@ const {
   cancelAllOpenOrders, killSwitch, isKillSwitchLatched,
   setStrategyEnabled, setTradingMode, setRiskScale, setRecoveryBuffer, setDayCadence,
   setMarketEnabled, setMarketMode, setMarketCadence,
-  buildPriceLookup, executeOrder,
+  buildPriceLookup, executeOrder, getHybridCacheStats,
 } = require('./agent');
 const discordChatService = require('./services/discordChatService');
 const complianceService = require('./services/complianceService');
@@ -195,6 +195,14 @@ app.get('/api/health', (req, res) => {
     status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime(),
     providers: llmService.getProviderStatus(), alpaca: alpacaService.isConfigured(),
   });
+});
+
+// Phase B (May 2026): hybrid route cache observability. Read-only — no
+// auth required (matches /api/state shape). Returns counters; never exposes
+// the cached payloads themselves.
+app.get('/api/hybrid/cache-stats', (req, res) => {
+  try { res.json(getHybridCacheStats()); }
+  catch (e) { res.status(500).json({ ok: false, reason: e.message }); }
 });
 
 app.get('/api/state', async (req, res) => {

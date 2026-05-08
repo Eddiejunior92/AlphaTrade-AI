@@ -624,7 +624,66 @@ async function ensureSchema() {
     console.warn('[DB] POSITION_CAP_INCREASED migration audit skipped:', e.message);
   }
 
-  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance + multi-market tables)');
+  // ---------------------------------------------------------------------
+  // Phase B (May 2026) — per-symbol expectancy auto-suspend.
+  // expectancyService rolls a windowed (avg_R, win_rate, n_trades) per
+  // (symbol, strategy). When n_trades >= MIN_TRADES_REQUIRED (10) AND
+  // expectancy_r <= AUTO_SUSPEND_R_THRESHOLD (-0.5R), the symbol is auto-
+  // suspended; new BUYs are skipped (TRADE_REJECTED reason='symbol_suspended').
+  // Operator can reinstate via Discord 'Reinstate <SYM>' (authz fail-closed).
+  // SAFETY: this layer can ONLY block entries — it cannot widen risk, lift
+  // any other gate, or affect open positions. Never overrides quorum/CB.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS symbol_expectancy (
+      id            SERIAL PRIMARY KEY,
+      symbol        TEXT NOT NULL,
+      strategy      TEXT NOT NULL,
+      n_trades      INTEGER NOT NULL DEFAULT 0,
+      n_wins        INTEGER NOT NULL DEFAULT 0,
+      sum_r         NUMERIC(14,4) NOT NULL DEFAULT 0,
+      expectancy_r  NUMERIC(10,4) NOT NULL DEFAULT 0,
+      win_rate      NUMERIC(6,4)  NOT NULL DEFAULT 0,
+      suspended     BOOLEAN NOT NULL DEFAULT FALSE,
+      suspended_at  TIMESTAMPTZ,
+      reinstated_at TIMESTAMPTZ,
+      reinstated_by TEXT,
+      last_trade_at TIMESTAMPTZ,
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(symbol, strategy)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS symbol_expectancy_suspended_idx ON symbol_expectancy (suspended)`);
+
+  // ---------------------------------------------------------------------
+  // Phase B — calibration audit. metaReviewService.calibrationAudit() reads
+  // the last 30d of SIGNAL + TRADE_EXECUTED rows, buckets by predicted
+  // confidence, computes realized win rate per bucket, and persists the
+  // gap. 5+ consecutive days of |gap| > 15pp in any bucket triggers a
+  // numbered suggestion targeting confidence_gate_base (Discord-approvable).
+  // INFORMATIONAL ONLY — never auto-modifies the gate.
+  // ---------------------------------------------------------------------
+  await query(`
+    CREATE TABLE IF NOT EXISTS calibration_history (
+      id              SERIAL PRIMARY KEY,
+      market          TEXT NOT NULL DEFAULT 'US',
+      audit_date      DATE NOT NULL,
+      bucket_low      NUMERIC(4,3) NOT NULL,
+      bucket_high     NUMERIC(4,3) NOT NULL,
+      n_signals       INTEGER NOT NULL DEFAULT 0,
+      n_trades        INTEGER NOT NULL DEFAULT 0,
+      n_wins          INTEGER NOT NULL DEFAULT 0,
+      predicted_avg   NUMERIC(6,4),
+      realized_wr     NUMERIC(6,4),
+      gap             NUMERIC(6,4),
+      flagged         BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(market, audit_date, bucket_low, bucket_high)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS calibration_history_date_idx ON calibration_history (audit_date DESC)`);
+
+  console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance + multi-market + Phase B expectancy/calibration tables)');
 }
 
 async function getPortfolio() {

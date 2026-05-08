@@ -146,18 +146,39 @@ function computeStatisticalSignal({ indicators, patterns, intraday, regime, news
 // strong setup, breakout). When true we ALWAYS run the council regardless of
 // statistical confidence — those are the high-stakes calls.
 // ---------------------------------------------------------------------------
-function decideRoute({ stat, escalate, holding }) {
+function decideRoute({ stat, escalate, holding, symbol, strategy, regime, gateBucket }) {
   // Holding open: always go to council so SELL/HOLD reasoning gets full
   // depth (we never want to exit on a stats-only quirky read).
   if (holding) return { route: 'COUNCIL', reason: 'open_position' };
   if (escalate) return { route: 'COUNCIL', reason: 'escalate_flagged' };
+  // Phase B (May 2026): hybrid cache check. If a recent route decision for
+  // (symbol, strategy, regime, gateBucket, statBucket) is still warm, reuse
+  // it to skip recomputation. Cache invalidates on trade execution, regime
+  // change, or gate change. ALWAYS safe — the cache only stores the routing
+  // verdict, never the LLM signal itself.
+  let cache = null;
+  try { cache = require('./hybridCacheService'); } catch (_) {}
+  const statBucket = stat.confidence >= STAT_HIGH_CONF ? 'high'
+                   : stat.confidence <  STAT_LOW_CONF  ? 'low'
+                   : 'mid';
+  // composeKey's 5th dim is named `newsBucket` in hybridCacheService — we
+  // pass our statBucket through that slot so the cache key fully discriminates
+  // on statistical confidence band (0.78↑ / 0.55–0.78 / <0.55).
+  const cacheKey = cache ? cache.composeKey({ symbol, strategy, regime, gateBucket, newsBucket: statBucket }) : null;
+  if (cache && cacheKey) {
+    const hit = cache.get(cacheKey);
+    if (hit) return { ...hit, _fromCache: true };
+  }
+  let decision;
   if (stat.confidence >= STAT_HIGH_CONF) {
-    return { route: 'STATISTICAL_ONLY', reason: `stat_conf=${stat.confidence.toFixed(2)}≥${STAT_HIGH_CONF}` };
+    decision = { route: 'STATISTICAL_ONLY', reason: `stat_conf=${stat.confidence.toFixed(2)}≥${STAT_HIGH_CONF}` };
+  } else if (stat.confidence < STAT_LOW_CONF) {
+    decision = { route: 'HOLD', reason: `stat_conf=${stat.confidence.toFixed(2)}<${STAT_LOW_CONF}` };
+  } else {
+    decision = { route: 'COUNCIL', reason: `borderline_stat_conf=${stat.confidence.toFixed(2)}` };
   }
-  if (stat.confidence < STAT_LOW_CONF) {
-    return { route: 'HOLD', reason: `stat_conf=${stat.confidence.toFixed(2)}<${STAT_LOW_CONF}` };
-  }
-  return { route: 'COUNCIL', reason: `borderline_stat_conf=${stat.confidence.toFixed(2)}` };
+  if (cache && cacheKey) cache.set(cacheKey, decision);
+  return decision;
 }
 
 // Build a synthetic signal shape compatible with riskManager.evaluateBuy.

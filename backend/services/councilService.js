@@ -59,7 +59,7 @@ Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<1-2 sentences>
   { id: 'technical', task: 'council_technical',
     pool: ['gemini', 'grok', 'gpt4o', 'claude'],
     prompt: (ctx) => `You are the TECHNICAL ANALYST. Read price/indicators/patterns/intraday tape for ${ctx.symbol}.
-Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<1-2 sentences>","setup":"<dip/breakout/range/exhaustion/none>"}` },
+${ctx.mtfConsensusBlock ? ctx.mtfConsensusBlock + '\n' : ''}Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<1-2 sentences>","setup":"<dip/breakout/range/exhaustion/none>","mtf_aligned":<true|false|null>}` },
   { id: 'risk', task: 'council_risk',
     pool: ['claude', 'gpt4o', 'grok', 'gemini'],
     prompt: (ctx) => `You are the RISK MANAGER. Focus on downside, correlation, drawdown, capital usage. ${ctx.symbol}.
@@ -76,6 +76,16 @@ Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<2 sentences>",
     pool: ['grok', 'gpt4o', 'claude', 'gemini'],
     prompt: (ctx) => `You are FUTURE PREDICTION. Use the scenario simulator + macro forecast + IV/options structure to estimate the 1-3d distribution for ${ctx.symbol}.
 Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<2 sentences>","upside_pct":<num or null>,"downside_pct":<num or null>}` },
+  // Phase B (May 2026): 8th role — ADVERSARIAL. The other 7 analysts can
+  // suffer from confirmation bias toward the statistical pre-score and the
+  // regime-tagged base case. The Adversarial analyst is REQUIRED to argue
+  // the opposite case and surface failure modes the council might be
+  // dismissing. Cost: +1 LLM call per Council deliberation (~$0.001-0.003
+  // depending on routed model). Quorum threshold rises to 4-of-8 below.
+  { id: 'adversarial', task: 'council_adversarial',
+    pool: ['claude', 'gpt4o', 'grok', 'gemini'],
+    prompt: (ctx) => `You are the ADVERSARIAL ANALYST. Your sole job is to ARGUE THE OPPOSITE of the obvious tape read for ${ctx.symbol}. If the stat score and indicators lean BUY, find the strongest BEAR/HOLD case and explicitly name the failure modes (liquidity trap, headline risk, exhaustion, regime change, factor crowding). If the read leans SELL, find the strongest BUY/HOLD case. NEVER simply mirror the consensus — your value is friction.
+Answer JSON: {"vote":"BUY|SELL|HOLD","confidence":0..1,"reason":"<2 sentences naming the strongest counter-thesis>","failure_modes":["<mode 1>","<mode 2>"]}` },
 ];
 
 const JUDGE = {
@@ -163,9 +173,20 @@ function _renderContextBlock(ctx) {
   return parts.join('\n');
 }
 
-// Fan out 6 analysts in parallel, then run Judge.
+// Fan out N analysts in parallel, then run Judge.
 async function deliberate(ctx) {
   const market = ctx.market || 'US';
+  // Phase B: compute MTF consensus block once and inject only into the
+  // Technical analyst's prompt context. Pure function; ok:false degrades
+  // gracefully (the prompt simply omits the block).
+  try {
+    const mtfSvc = require('./mtfConsensusService');
+    const mtf = mtfSvc.computeMtfConsensus({
+      tf5m: ctx.indicators_5m, tf15m: ctx.indicators_15m, tf1h: ctx.indicators_1h,
+    });
+    ctx.mtfConsensus = mtf;
+    ctx.mtfConsensusBlock = mtfSvc.renderForPrompt(mtf);
+  } catch (_) { /* swallow — mtf is informational only */ }
   const baselineBlock = _renderContextBlock(ctx);
   const analystPromises = ROLES.map(async (role) => {
     const pick = await router.pickModel(role.task, role.pool);
@@ -194,8 +215,12 @@ async function deliberate(ctx) {
   const leadingVote = votes[0][0];
   const agreementCount = votes[0][1];
 
-  // Need at least 3 valid analysts to even attempt a Judge. Otherwise emit HOLD.
-  if (verdicts.length < 3) {
+  // Phase B (May 2026): with 8 roles we need at least Math.ceil(8/2)=4 to
+  // proceed to Judge, so a degraded run with only 3 analysts no longer pads
+  // through. Math.ceil keeps the formula correct if a future task adds/
+  // removes a role.
+  const MIN_ANALYSTS_FOR_JUDGE = Math.ceil(ROLES.length / 2);
+  if (verdicts.length < MIN_ANALYSTS_FOR_JUDGE) {
     return {
       consensus: 'HOLD',
       confidence: 0.50,
@@ -221,7 +246,7 @@ async function deliberate(ctx) {
 ANALYST VERDICTS:
 ${verdicts.map(v => `• ${v.role.toUpperCase()} (${v.modelId}): ${v.vote} @ ${(v.confidence*100).toFixed(0)}% — ${v.reason}`).join('\n')}
 
-You are the JUDGE. Synthesise the 6 analyst verdicts above and the statistical pre-score. Weight DEEP_RESEARCH, HISTORICAL, FUTURE heavily for borderline calls — they carry the long-horizon/distribution view. The RISK analyst's veto matters for high capital-at-risk reads.
+You are the JUDGE. Synthesise the ${ROLES.length} analyst verdicts above (FUNDAMENTAL, TECHNICAL, RISK, DEEP_RESEARCH, HISTORICAL, FUTURE, ADVERSARIAL) and the statistical pre-score. Weight DEEP_RESEARCH, HISTORICAL, FUTURE heavily for borderline calls — they carry the long-horizon/distribution view. The RISK analyst's veto matters for high capital-at-risk reads. The ADVERSARIAL analyst's failure modes MUST be addressed in your reason — if the counter-thesis is plausible, lower confidence or vote HOLD.
 
 Respond JSON: {
   "consensus":"BUY|SELL|HOLD",
@@ -276,4 +301,4 @@ Respond JSON: {
   };
 }
 
-module.exports = { deliberate, ROLES, MODEL_REGISTRY };
+module.exports = { deliberate, ROLES, MODEL_REGISTRY, _callModel };

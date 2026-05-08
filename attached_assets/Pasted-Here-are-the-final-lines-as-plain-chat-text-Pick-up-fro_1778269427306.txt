@@ -1,0 +1,102 @@
+Here are the final lines as plain chat text. Pick up from where Task 8 was cut off:
+
+…NEVER auto-apply — operator must Approve via Discord. The suggestion target_key should be a documentation-only key like ‘calibration_review’ that has no apply() function — purely informational, requires manual investigation.
+	8.	Post the daily calibration summary to Discord as part of the meta-review post. Include a markdown table with columns: Bucket | Count | Actual WR | Expected WR | Divergence | Flag. Use ⚠️ for flagged rows.
+Wire into runReview(): call calibrationAudit() after the existing facts gathering. Pass its return value into the existing Discord post construction so the table appears in the same daily post.
+Tests in tests/calibration.test.js — pure function tests on the bucketing logic:
+	•	Bucket assignment: confidence 0.72 returns [0.70, 0.75)
+	•	Bucket assignment: confidence 0.85 returns [0.85, 0.90)
+	•	Edge case: confidence exactly at boundary 0.70 goes to [0.70, 0.75) (half-open intervals)
+	•	Edge case: confidence 0.65 goes to [0.65, 0.70)
+	•	Edge case: confidence 1.00 goes to [0.90, 1.00] — last bucket is closed at top
+	•	Divergence calculation: actual 0.60, bucket [0.70, 0.80), midpoint 0.75 returns -0.15
+	•	Flag triggered when abs(divergence) > 0.10 AND count >= 10
+	•	Flag NOT triggered when count is 9 even if divergence is huge (small sample protection)
+	•	Flag NOT triggered when divergence is exactly 0.10 (strict greater-than, not greater-than-or-equal)
+TASK 9 — Rename max_position_pct to max_position_pct_day
+The SAFE_KEY name max_position_pct is misleading because it only applies to day strategies (Section 9 finding from Phase A.5). Rename for clarity.
+	1.	discordApprovalService.js: rename the SAFE_KEYS entry max_position_pct to max_position_pct_day. Update the description text and any example messages or docstrings.
+	2.	runtimeConfig.js: rename the property max_position_pct to max_position_pct_day. Update DEFAULTS, BOUNDS, and JSDoc.
+	3.	agent.js buildStrategyConfig: rename the read from rt.max_position_pct to rt.max_position_pct_day. Update related warning log messages.
+	4.	The DB column portfolio.max_position_pct_day is already correctly named — no DB migration needed.
+	5.	Backwards compatibility: if any pending suggestion in pending_suggestions has target_key=‘max_position_pct’ (from before this rename), auto-rewrite it to ‘max_position_pct_day’ on read in discordApprovalService. Log a one-time deprecation warning [DEPRECATED] target_key ‘max_position_pct’ rewritten to ‘max_position_pct_day’ on suggestion ID N. This protects against ambiguity if a pre-rename suggestion is still in the queue at deploy time.
+This is a pure rename. No behaviour changes. Add a brief test in tests/runtimeConfig.test.js confirming that the new name resolves correctly through the DB → env → default fallback chain.
+VERIFICATION REPORT (mandatory)
+After completing all nine tasks, produce a single markdown report:
+Section 1 — Test scaffolding
+	•	Vitest version installed
+	•	Output of npm test (all tests passing)
+	•	Total test count and breakdown by file
+Section 2 — Hybrid cache
+	•	File path and line count
+	•	Cache key examples for 3 different inputs (showing how RSI and VWAP buckets work)
+	•	Hit/miss invalidation hooks (where wired)
+	•	Cache stats endpoint URL and example response
+Section 3 — Regime meta-layer
+	•	Diff summary of dynamicGateService.js changes
+	•	Confirmation of the four invariants asserted in code with line numbers
+	•	Example log line for a regime transition
+	•	getStatus() output now includes regimeAdjustment, regimeLabel, regimeConfidence
+Section 4 — Adversarial Analyst
+	•	Council role count: 7 specialists + 1 Judge = 8 LLM calls per deliberation
+	•	Quorum threshold: confirm verdicts.length >= 4
+	•	Updated cost projection per deliberation and monthly at current cycle volume
+	•	System prompt excerpt for Adversarial (first 200 chars)
+	•	Judge system prompt change excerpt showing the Adversarial weighting instruction
+Section 5 — Multi-timeframe consensus
+	•	Honest report: is real 5m/15m/1h data fetched or stubbed? If stubbed, where are the TODOs and what’s required to wire real data later?
+	•	The pure function for mtfConsensus
+	•	Technical Analyst prompt update excerpt
+Section 6 — Asymmetric sizing
+	•	Formula with the four worked examples (0.65, 0.75, 0.85, 0.90)
+	•	File path of positionSizingService.js
+	•	Where the overlay happens in agent.js (file:line)
+	•	Defence-in-depth assertion location and the [0.005, 0.05] bound
+	•	Confirmation that statistical-only signals do NOT receive asymmetric sizing (and how this is verified)
+Section 7 — Per-symbol expectancy
+	•	Schema confirmation
+	•	Auto-suspend trigger logic walk-through with a worked example
+	•	Discord Reinstate command location and auth check
+	•	Wiring point in agent.js where isSuspended is called in the hot path
+	•	All trade-close paths that call recordTradeOutcome (list every one — there should be 3 or more)
+Section 8 — Calibration audit
+	•	Bucketing logic with edge cases tested
+	•	5-day flag threshold logic
+	•	Where the suggestion is emitted and confirmation it is NEVER auto-applied
+	•	Sample Discord output format showing the markdown table
+Section 9 — Rename
+	•	Confirmation of all rename sites (file:line for each)
+	•	Backwards-compat handling for in-flight pending suggestions
+Section 10 — Files touched
+Complete list with one-line summary per file. Distinguish NEW files from MODIFIED files.
+Section 11 — Things you noticed
+Anything fragile, surprising, or worth fixing later. Be honest. If something is held together with duct tape, say so.
+Section 12 — What did NOT change
+Explicit confirmation that the following are byte-for-byte identical to before this phase:
+	•	riskManager.js function bodies (computeDynamicScaling, computeTargetRisk, evaluateBuy, evaluateSell, evaluateStops, computeTrailingUpdate, checkQuorum, checkCircuitBreaker)
+	•	audit chain code in db.js (recordAudit, verifyAuditChain)
+	•	kill switch logic in agent.js
+	•	atomic cash logic
+	•	DENIED_KEYS list in discordApprovalService.js
+Section 13 — Paper trading verification plan
+A checklist for the operator to run during the 2-week paper trading window. Include:
+	•	Daily: confirm [GATE-REGIME], [SIZING], [STRATEGY-OVERLAY] log lines fire when expected
+	•	After first week: query symbol_expectancy table, confirm rows exist for actively traded symbols
+	•	After first week: check calibration_history, list any flagged buckets
+	•	Daily Discord meta-review: confirm calibration summary table appears
+	•	Spot-check: pick a Council deliberation from logs, verify all 8 analyst verdicts present (7 specialists + Judge synthesis)
+	•	Spot-check: pick a high-confidence trade and a low-confidence trade from the trades table, confirm their position sizes match the asymmetric formula
+	•	Spot-check: induce a regime change in a paper environment (or wait for one to occur naturally) and confirm the gate raises
+	•	Trigger a Reinstate command from Discord and confirm the suspension clears and audit row writes
+CONSTRAINTS — re-emphasised
+	•	riskManager.js function bodies: do not modify. You may add new optional parameters with defaults that preserve existing behaviour when unset.
+	•	Audit chain: do not modify. You may write new audit row event_types via the existing recordAudit function.
+	•	Tests cover NEW math only. Existing untested code stays untested for now.
+	•	If you find a tenth subtle bug along the way, report it in Section 11. Do not fix outside scope.
+	•	All new features ship enabled by default — operator is paper-only and will observe for 2 weeks before live.
+	•	Ship Phase B as one cohesive checkpoint. Do not partially commit Tasks 1-4 and leave 5-9 for later. Verify all nine tasks land before declaring complete.
+When the report is complete, stop and wait for further instructions.
+
+That’s the full end of the brief. You now have everything needed to execute Phase B end-to-end.
+One small thing worth knowing — I see your earlier message inferred that Task 9 was “the day-strategy position cap reconciliation.” It’s not — Task 9 is just the rename of max_position_pct to max_position_pct_day for clarity (the misleading name issue from Phase A.5’s Section 9 finding). The actual position cap value (3% vs 4%) is left as-is because Phase A’s Constants table already showed it’s set to 4% in strategies.js. We’re not changing the number in this phase — only the SAFE_KEY name. Good catch on noticing the cross-reference; the wording “being reconciled in Task 9” in Task 6 was meant in the sense of “becoming clearly named” rather than “value changing.” If you want to actually drop the cap back to 3% to match the brochure, that’s a separate decision worth its own phase.
+When the agent’s verification report comes back, paste it here and we’ll go through it together.​​​​​​​​​​​​​​​​

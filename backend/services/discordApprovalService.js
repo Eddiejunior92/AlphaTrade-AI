@@ -190,8 +190,14 @@ const SAFE_KEYS = {
   // for the day strategies (US `day` and `asx_day`); swing strategies keep
   // their own 5% cap from strategies.js. Persisted to portfolio override
   // column; strategy loader picks it up if present.
-  max_position_pct: {
-    description: 'Per-name position cap as fraction of equity (0.01-0.05)',
+  // Phase B (May 2026): renamed `max_position_pct` → `max_position_pct_day`
+  // to make the DAY-STRATEGY scope explicit. Swing strategies still use their
+  // own 5% cap from strategies.js; this key has NO effect on them. The legacy
+  // name `max_position_pct` is honored by KEY_ALIASES below so that any
+  // in-flight pending_suggestion rows from the previous Phase A.5 path still
+  // resolve to this entry on Approve.
+  max_position_pct_day: {
+    description: 'Per-name DAY-STRATEGY position cap as fraction of equity (0.01-0.05). Does not affect swing.',
     validate: (v) => {
       const n = parseFloat(v);
       if (!Number.isFinite(n)) return { ok: false, reason: 'not a number' };
@@ -226,6 +232,10 @@ const KEY_ALIASES = {
   'interval': 'agent_interval_seconds',
   'cycle_interval': 'agent_interval_seconds',
   'max_day_holdings': 'max_holdings_day',
+  // Phase B back-compat: Phase A.5 used the bare name `max_position_pct`.
+  // Any in-flight pending_suggestions row created before this rename will
+  // still resolve via this alias on Approve.
+  'max_position_pct': 'max_position_pct_day',
 };
 
 // DENIED keys — explicit denylist (some are also implicitly denied by NOT
@@ -372,10 +382,14 @@ async function rejectSuggestion(id, { discordUser } = {}) {
 // command (caller should fall through to chat). Otherwise returns a string
 // to post back.
 // ---------------------------------------------------------------------------
-const APPROVE_RE = /^\s*approve\s*#?\s*(\d+)\s*$/i;
-const REJECT_RE  = /^\s*reject\s*#?\s*(\d+)\s*$/i;
-const STATUS_RE  = /^\s*(status|pending|suggestions)\s*$/i;
-const GATE_RE    = /^\s*gate\s*(status)?\s*$/i;
+const APPROVE_RE   = /^\s*approve\s*#?\s*(\d+)\s*$/i;
+const REJECT_RE    = /^\s*reject\s*#?\s*(\d+)\s*$/i;
+const STATUS_RE    = /^\s*(status|pending|suggestions)\s*$/i;
+const GATE_RE      = /^\s*gate\s*(status)?\s*$/i;
+// Phase B: Reinstate command for per-symbol auto-suspend (expectancyService).
+//   "Reinstate AAPL"           → reinstate AAPL across all strategies
+//   "Reinstate AAPL day"       → reinstate AAPL on the day strategy only
+const REINSTATE_RE = /^\s*reinstate\s+([A-Za-z0-9.\-]{1,12})(?:\s+([A-Za-z_]+))?\s*$/i;
 
 async function tryHandle(text, msg) {
   const t = String(text || '').trim();
@@ -422,6 +436,29 @@ async function tryHandle(text, msg) {
     const lines = list.map(s => `**#${s.id}** [${s.impact}/${s.effort}, ${(parseFloat(s.confidence)*100).toFixed(0)}%] ${s.title}\n   → \`${s.target_key}\`=\`${s.target_value}\``);
     return `📋 **Pending Suggestions** (${list.length})\n${lines.join('\n')}\n\nReply \`Approve #N\` or \`Reject #N\`.`;
   }
+  m = t.match(REINSTATE_RE);
+  if (m) {
+    const sym = m[1].toUpperCase();
+    const strat = m[2] ? m[2].toLowerCase() : null;
+    if (!isApprover) {
+      try {
+        await db.recordAudit({
+          event_type: 'REINSTATE_UNAUTHORIZED',
+          payload: { symbol: sym, strategy: strat, attempted: 'reinstate', discord_user: discordUser, source: 'discord_approval' },
+        });
+      } catch (_) {}
+      return `🔒 Not authorized. Only operators in \`DISCORD_APPROVER_IDS\` can reinstate suspended symbols.`;
+    }
+    try {
+      const expectancy = require('./expectancyService');
+      const r = await expectancy.reinstate({ symbol: sym, strategy: strat, approver: discordUser });
+      return r.ok
+        ? `✅ Reinstated ${sym}${strat ? ' (' + strat + ')' : ' (all strategies)'} — ${r.count} row(s) updated. Logged to audit.`
+        : `❌ Could not reinstate ${sym}: ${r.reason}`;
+    } catch (e) {
+      return `❌ Reinstate failed: ${e.message}`;
+    }
+  }
   if (GATE_RE.test(t)) {
     const s = await dynamicGate.getStatus();
     return `🛡️ **Dynamic Gate**\n• Effective: **${(s.effective_gate*100).toFixed(0)}%** (floor ${(s.safety_floor*100).toFixed(0)}%, ceil ${(s.safety_ceiling*100).toFixed(0)}%)\n• Base: ${(s.base_gate*100).toFixed(0)}%  •  Council Δ: ${s.council_delta >= 0 ? '+' : ''}${(s.council_delta*100).toFixed(1)}pp\n• Pinned: ${s.pinned ? `YES @ ${(s.pin_value*100).toFixed(0)}% — ${s.pin_reason}` : 'no'}`;
@@ -432,5 +469,5 @@ async function tryHandle(text, msg) {
 module.exports = {
   tryHandle,
   addSuggestion, listPending, applySuggestion, rejectSuggestion,
-  SAFE_KEYS, DENIED_KEYS,
+  SAFE_KEYS, DENIED_KEYS, KEY_ALIASES, normaliseKey,
 };
