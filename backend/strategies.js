@@ -37,12 +37,16 @@ const STRATEGIES = {
     takeProfitPct: 0.02,
     // Bumped 4 → 6 (May 2026) to support a higher day-trade entry rate
     // (target ~10/day) while still capping concurrent intraday exposure.
-    // 6 × 3% maxPositionPct = 18% of equity max held in day positions.
+    // 6 × 4% maxPositionPct = 24% of equity max held in day positions.
+    // (Bumped 3% → 4% per operator decision May 2026 — see audit row
+    // POSITION_CAP_INCREASED. Hard ceiling enforced in approval validator
+    // remains 5%; all other rails — quorum, gate, breaker, kill switch,
+    // recovery buffer, atomic cash, no-averaging-in — untouched.)
     maxHoldings: 6,
     forceFlattenBeforeClose: true,
     holdOvernight: false,
     minDirectionalAgreement: 3, // quorum NEVER relaxed by risk scale
-    maxPositionPct: 0.03,
+    maxPositionPct: 0.04,
     trailingStopPct: null,           // not used intraday
     trailingActivatePct: null,
   },
@@ -96,7 +100,9 @@ const STRATEGIES = {
     forceFlattenBeforeClose: true,
     holdOvernight: false,
     minDirectionalAgreement: 3,
-    maxPositionPct: 0.03,
+    // Bumped 3% → 4% (May 2026) to mirror the US day strategy. Hard ceiling
+    // enforced in approval validator remains 5%. All other rails untouched.
+    maxPositionPct: 0.04,
     trailingStopPct: null,
     trailingActivatePct: null,
     minNotionalAUD: 5000,

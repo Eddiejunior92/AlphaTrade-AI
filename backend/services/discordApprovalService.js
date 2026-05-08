@@ -134,6 +134,38 @@ const SAFE_KEYS = {
       await db.query(`UPDATE portfolio SET max_holdings_day = $1`, [n]);
     },
   },
+  // Per-name position cap, in equity %. Operator-decision May 2026: moved
+  // from DENIED → SAFE with a HARD upper bound of 5%. The validator below
+  // is the ONLY gate that can change this via Discord; every other safety
+  // rail (quorum, confidence floor, daily-loss budget, drawdown breaker,
+  // kill switch, recovery buffer, atomic cash) is untouched. Effective only
+  // for the day strategies (US `day` and `asx_day`); swing strategies keep
+  // their own 5% cap from strategies.js. Persisted to portfolio override
+  // column; strategy loader picks it up if present.
+  max_position_pct: {
+    description: 'Per-name position cap as fraction of equity (0.01-0.05)',
+    validate: (v) => {
+      const n = parseFloat(v);
+      if (!Number.isFinite(n)) return { ok: false, reason: 'not a number' };
+      // HARD UPPER BOUND — 5%. Anything bigger requires a code change AND
+      // an architect review; Discord cannot push past this.
+      if (n < 0.01 || n > 0.05) return { ok: false, reason: 'must be 0.01-0.05 (1-5%)' };
+      return { ok: true, normalised: n };
+    },
+    apply: async (n) => {
+      await db.query(`ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS max_position_pct_day NUMERIC`);
+      await db.query(`UPDATE portfolio SET max_position_pct_day = $1`, [n]);
+      // Audit the change with the dedicated event type the operator asked for.
+      await db.recordAudit({
+        event_type: 'POSITION_CAP_INCREASED',
+        payload: {
+          new_cap_pct: n,
+          source: 'discord_approval',
+          reason: 'operator-approved suggestion via Discord',
+        },
+      });
+    },
+  },
 };
 
 // Key normalisation — accept variations like "Confidence Gate" → "confidence_gate_base"
@@ -150,8 +182,11 @@ const KEY_ALIASES = {
 
 // DENIED keys — explicit denylist (some are also implicitly denied by NOT
 // being in SAFE_KEYS, but a hardcoded list lets us return a clear message).
+// `max_position_pct` was previously DENIED; moved to SAFE_KEYS May 2026 with
+// a HARD upper bound of 5% in its validator. All other safety rails remain
+// in this denylist and CANNOT be changed via Discord under any circumstances.
 const DENIED_KEYS = new Set([
-  'kill_switch', 'circuit_breaker', 'max_position_pct', 'max_daily_loss_usd',
+  'kill_switch', 'circuit_breaker', 'max_daily_loss_usd',
   'max_daily_drawdown_pct', 'recovery_buffer_seconds', 'min_directional_agreement',
   'safety_floor', 'atomic_cash', 'audit_chain', 'asx_execution_wired',
 ]);

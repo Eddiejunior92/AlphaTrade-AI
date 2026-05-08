@@ -577,6 +577,35 @@ async function ensureSchema() {
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD'`);
   await query(`ALTER TABLE holdings ADD COLUMN IF NOT EXISTS fx_rate_at_entry NUMERIC(12,6) NOT NULL DEFAULT 1.0`);
 
+  // ---------------------------------------------------------------------
+  // One-shot operator-decision migration audit (May 2026):
+  // POSITION_CAP_INCREASED — day-strategy per-name cap raised 3% → 4%.
+  // Idempotent: only writes the audit row once, on the first boot after
+  // the change. Subsequent boots see the existing row and skip the insert.
+  // ---------------------------------------------------------------------
+  try {
+    const existing = await query(
+      `SELECT 1 FROM audit_log WHERE event_type = 'POSITION_CAP_INCREASED' AND payload->>'migration_id' = 'cap_3_to_4_may_2026' LIMIT 1`
+    );
+    if (existing.rowCount === 0) {
+      await recordAudit({
+        event_type: 'POSITION_CAP_INCREASED',
+        payload: {
+          migration_id: 'cap_3_to_4_may_2026',
+          previous_cap_pct: 0.03,
+          new_cap_pct: 0.04,
+          affected_strategies: ['day', 'asx_day'],
+          hard_ceiling_pct: 0.05,
+          source: 'code_migration',
+          reason: 'Operator-approved cap increase from 3% → 4% per name. All other safety rails (3-of-N quorum, confidence floor 65%, daily-loss budget, drawdown circuit breaker, kill switch, recovery buffer, atomic cash, no-averaging-in, audit chain) untouched. Hard upper bound of 5% enforced in discordApprovalService SAFE_KEYS validator.',
+        },
+      });
+      console.log('[DB] One-shot audit POSITION_CAP_INCREASED written (3% → 4%).');
+    }
+  } catch (e) {
+    console.warn('[DB] POSITION_CAP_INCREASED migration audit skipped:', e.message);
+  }
+
   console.log('[DB] Schema ensured (strategy + intel + adaptive + backtest + compliance + multi-market tables)');
 }
 
