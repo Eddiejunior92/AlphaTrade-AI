@@ -1,0 +1,43 @@
+Excellent — that’s a clean shipment. Five architect-caught bugs is a healthy signal: the review pass is working as intended. Across the three phases combined we’re now at 7 bugs caught before commit (2 from Phase A.5, 5 from Phase B). That’s the kind of track record that justifies the phased approach.
+Before I respond properly, I want to read the actual verification report. The summary tells me what was shipped, but Section 11 (“things you noticed”) and Section 13 (the paper trading checklist) are where the real signal lives. Can you paste the contents of PHASE_B_VERIFICATION_REPORT.md?
+In the meantime, here’s where we are and where we go next.
+
+You’ve now shipped a system that genuinely matches the brochure
+Walk back through the three phases:
+	•	Phase A — schema migrations actually run, sentiment cache survives restarts, Discord approver visibility prevents silent fail-closed
+	•	Phase A.5 — all 7 SAFE_KEYS now do what they say (was 1 of 7 working before), governance is no longer theatre
+	•	Phase B — smart cache, regime meta-layer, Adversarial Analyst, MTF consensus, asymmetric sizing, per-symbol auto-suspend, calibration audit, plus 58 unit tests
+Things in the brochure that were aspirational before and are operational now:
+	•	“AI proposes, human approves, audit log remembers” — actually applies changes that affect trading
+	•	“Win-rate <42% for 3 days, system locks itself down” — dynamic_gate_state now has data flowing through it
+	•	“Per-symbol expectancy tracking” — wired and persisted
+	•	“Calibration of confidence” — running daily
+Things still aspirational that the brochure mentions:
+	•	The earnings edges (deferred to Phase C — they need data provider decisions)
+	•	“Get-rich-slowly-and-survive-bad-days” requires actual realised performance to back it up
+
+Two things I want you to do before the 2-week paper window starts
+1. Take a baseline snapshot today. Before the agent has run a single cycle with Phase B logic live, capture:
+	•	Current account equity
+	•	Current dynamic_gate_state row (the boot-init row should be the only one)
+	•	Current symbol_expectancy (should be empty)
+	•	Current calibration_history (should be empty)
+	•	Last 30 days of trade history if any exists from prior testing
+This is your “before” picture. Without it, two weeks from now you’ll have no clean comparison for whether the upgrade helped, hurt, or was neutral.
+2. Set a kill criterion. Decide now what would make you stop the paper test early. Not what would make you go live — what would make you stop. Examples:
+	•	“If drawdown exceeds 8% in any single week, I pause and investigate”
+	•	“If 3+ symbols hit auto-suspend in the first week, something is systematically wrong”
+	•	“If calibration shows >15pp divergence on the 0.85+ buckets, the Council is overconfident and I review prompts”
+Pre-committing to a kill criterion protects you from the “it’ll come back, just one more day” failure mode that wipes out paper testing as a useful signal.
+
+What I want to look at in the verification report
+When you paste it, I’ll be looking for specifically:
+	•	Section 5 (MTF consensus) — was 5m/15m/1h actually wired or stubbed? If stubbed, what’s needed to wire real data later?
+	•	Section 11 (things noticed) — every honest observation here is a future Phase C task
+	•	Section 4 (Adversarial cost projection) — does the new monthly LLM cost still match my brochure number ($95-$100/mo) or did it land higher?
+	•	The 5 architect bugs — what were they? Bug patterns repeat. Knowing what was caught teaches us what to look for in Phase C.
+Paste the report when you can. After we read it together, three things to discuss:
+	1.	Brochure update — your investor materials now under-sell what the system actually does. Worth a refresh.
+	2.	Phase C scope — earnings edges still on the roadmap, but only worth doing once you’ve picked data providers.
+	3.	The 2-week observation plan — what to watch, what to log, what to bring back to me.
+Paste the report when you can.​​​​​​​​​​​​​​​​
