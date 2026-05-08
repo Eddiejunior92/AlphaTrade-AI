@@ -1,0 +1,64 @@
+Prompt for Replit Agent:
+I need a complete read-only diagnostic of the AlphaTrade codebase before any changes are made. Do not modify, create, or delete any files. Only read and report.
+Please produce a structured report covering the following. Use code blocks for file paths and function signatures. Be exhaustive — I need to understand the full system, not a summary.
+1. File inventory
+List every file in the project, organised by folder. For each file, give a one-line description of what it does. Pay special attention to:
+	•	/services/ — list every service file
+	•	/routes/ or /api/ if they exist
+	•	/db/ or any database schema files
+	•	/config/ and any .env references
+	•	Root-level files (agent.js, index.js, server.js, package.json)
+2. Service layer deep-dive
+For each of these services, if they exist, report: file path, exported functions with signatures, key internal functions, what it imports from other services, what other services import from it.
+	•	hybridSignalService.js
+	•	councilService.js
+	•	llmRouterService.js
+	•	dynamicGateService.js
+	•	sentimentService.js
+	•	riskManager.js
+	•	metaReviewService.js (does this file exist? if not, say so)
+	•	llmCostTracker.js
+	•	agent.js
+	•	Any other files in /services/ not listed above — list them too
+3. Database schema
+What database is used (Postgres, SQLite, Replit DB, other)? List every table and its columns. Specifically confirm whether these tables exist and their schemas:
+	•	llm_router_perf
+	•	trades or equivalent
+	•	audit_log or audit_chain
+	•	config or any config-storage table
+	•	positions, orders, pnl, or equivalent
+	•	sentiment_cache or any cache tables
+4. Configuration & constants
+Where are these defined (file path + line number if possible)?
+	•	The 3% per-name position cap
+	•	The 5% daily drawdown circuit breaker
+	•	The 65% confidence floor
+	•	The [65%, 90%] gate clamp
+	•	The 42% / 55% pin/release win-rate thresholds
+	•	The kill switch flag
+	•	MAX_DAILY_LOSS_USD
+	•	DISCORD_APPROVER_IDS
+	•	SAFE_KEYS allowlist
+	•	ASX_TRADING_ENABLED or equivalent flag
+	•	LLM API keys (just confirm they exist as env vars — do not print values)
+5. The Council roles
+In councilService.js (or wherever roles are defined): list each of the 6 specialist roles plus the Judge. For each, show the prompt template snippet (first 200 chars), the default model, and how the role is invoked.
+6. Risk & safety
+In riskManager.js: list every check/rail in execution order. For each, show the function name and a one-line description. Confirm the audit chain implementation (which file, what hashing scheme, what fields).
+7. Trading loop
+In agent.js (or main loop): describe the cycle from start to finish. What runs every cycle? What runs daily? What’s the cadence (60s? 5min?)? Where does the loop poll for Discord approval commands?
+8. External integrations
+List every external API/service the system calls:
+	•	Brokers (Alpaca, IBKR — which endpoints?)
+	•	LLM providers (OpenAI, Anthropic, Google, OpenRouter, xAI — which models?)
+	•	Market data sources
+	•	Discord (which library, which channel IDs are referenced?)
+	•	Any others
+9. Existing tests
+Does the project have tests? If yes, what framework (Jest, Mocha, Vitest, none)? Where are they? What coverage exists for the safety rails?
+10. Known issues & TODOs
+Search the entire codebase for TODO, FIXME, HACK, and XXX comments. List them with file:line and the comment text.
+11. Recent changes
+If git is available, show the last 10 commits (git log --oneline -10). If not, just note “git not available”.
+12. What you’d flag
+Based on your read of the codebase, flag anything that looks fragile, inconsistent, or risky to modify. Be honest — if something is held together with duct tape, say so.
