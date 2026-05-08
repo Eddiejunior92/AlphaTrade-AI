@@ -1,0 +1,112 @@
+Phase A hygiene is complete. The diagnostic revealed that 6 of 7 SAFE_KEYS are silent no-ops: operators approve config changes via Discord, audit rows are written, and trading behaviour does not change. This phase fixes that. Do not modify safety-critical code: riskManager.js core math (computeDynamicScaling, computeTargetRisk, evaluateBuy/Sell/Stops, computeTrailingUpdate, the audit chain in db.js, the kill switch, atomic cash logic, or any DENIED_KEYS parameters). The goal is wiring, not policy changes. After completing all six tasks, produce the verification report at the end.
+CONTEXT FROM PHASE A AUDIT
+The seven SAFE_KEYS and their current bugs:
+	1.	confidence_gate_base — Discord apply() writes to portfolio.confidence_gate_base. Live read path is dynamicGateService.getCurrentGate() which reads dynamic_gate_state.base_gate. Wrong table. Fix: redirect Discord apply to INSERT into dynamic_gate_state (matching the path Council/auto-adaptive already uses).
+	2.	day_trading_dip_strictness — Discord apply writes to portfolio.day_trading_dip_strictness. dipBuyService.js:102 reads from process.env.DAY_TRADING_DIP_REQUIREMENT_STRICTNESS. Fix: read from portfolio with env fallback.
+	3.	llm_skip_price_bps — Module-load const at agent.js:128. Even reading from DB requires converting to a live-read or getter.
+	4.	sentiment_ttl_seconds — Module-load const at sentimentService.js:25. Same issue. Also: TTL_MS is used by both the in-process Map and the DB cache write path, so a runtime change must propagate to both consistently.
+	5.	agent_interval_seconds — Module-load const at agent.js:68, used in setInterval at agent.js:1928. Changing this requires tearing down and recreating the interval.
+	6.	max_holdings_day — Discord apply writes to portfolio.max_holdings_day. riskManager.js:216-217 reads sc.maxHoldings from strategies.js literal. Fix: overlay portfolio value onto sc per cycle.
+	7.	max_position_pct — Same pattern as max_holdings_day. riskManager.js:258 reads sc.maxPositionPct. Note that this overloads with backtestService.js (unrelated, ignore).
+TASK 1 — Build a getRuntimeConfig() helper
+Create a new helper module backend/services/runtimeConfig.js. This becomes the single source of truth for “operator-tunable parameter at runtime”. Behaviour:
+	1.	Export a function getRuntimeConfig() that returns an object with the seven SAFE_KEYS as properties.
+	2.	Each property reads from the portfolio table (or for confidence_gate_base, dynamic_gate_state — see Task 2). For each key, fall back to the environment variable, then to the documented default if neither is set.
+	3.	Cache the result for 5 seconds in-process to avoid hammering the DB on every cycle. Invalidate the cache when invalidateRuntimeConfig() is called (export this too).
+	4.	Document each field with JSDoc indicating: the SAFE_KEY name, the source-of-truth (DB column or table), the env-var fallback, and the default.
+	5.	Never throw. On any DB error, log [RUNTIME-CONFIG] error reading X, falling back to env/default and return the fallback. Trading must never be blocked by this helper failing.
+	6.	Do not import this from riskManager.js. Treat riskManager as untouchable; the overlay in Task 5 will pass values through agent.js.
+TASK 2 — Fix confidence_gate_base apply path
+The Discord apply path for confidence_gate_base currently writes to the wrong table.
+	1.	In discordApprovalService.js, locate the SAFE_KEYS.confidence_gate_base.apply() function.
+	2.	Change its implementation: instead of UPDATE portfolio SET confidence_gate_base = $1, it must INSERT a new row into dynamic_gate_state mirroring the structure already used by dynamicGateService.applyCouncilSuggestion(). Use source = ‘discord_approval’, and include the audit row reference (suggestion ID) in the inserted row’s reason or source field.
+	3.	Call dynamicGateService.invalidateCache() (or equivalent — there’s already cache invalidation logic; reuse it) so the new value is read on the next getCurrentGate().
+	4.	Update the SAFE_KEYS description text to accurately describe what the apply does (“INSERTs a new row into dynamic_gate_state”).
+	5.	Leave the existing portfolio.confidence_gate_base column alone — do not drop it. It might be read by future code; removing it is a separate decision.
+TASK 3 — Convert module-load constants to live reads
+Three SAFE_KEYS are captured at module load: llm_skip_price_bps (agent.js:128), sentiment_ttl_seconds (sentimentService.js:25), agent_interval_seconds (agent.js:68).
+For llm_skip_price_bps:
+	1.	Remove the module-level const LLM_SKIP_PRICE_BPS at agent.js:128.
+	2.	At the call site (agent.js:1005), replace the constant reference with a fresh read: const llmSkipPriceBps = getRuntimeConfig().llm_skip_price_bps. The 5-second cache in runtimeConfig means this is cheap.
+For sentiment_ttl_seconds:
+	1.	Remove the module-level const TTL_MS at sentimentService.js:25.
+	2.	Add a function _getTtlMs() that returns getRuntimeConfig().sentiment_ttl_seconds * 1000.
+	3.	Replace every read of TTL_MS in the file with _getTtlMs(). This includes the in-process Map TTL check, the price-stable check window, and the _writePersistedCache expires_at calculation.
+	4.	Critical: ensure the DB cache and Map cache always agree on TTL. If TTL is changed, existing cached entries (Map and DB) keep their original expires_at — they expire on their own timeline. Only new writes use the new TTL. Document this in a comment.
+For agent_interval_seconds:
+	1.	Remove the module-level const BASE_INTERVAL_SECONDS at agent.js:68.
+	2.	Add a module-level let intervalHandle = null and let currentIntervalSeconds = null at the top of the file.
+	3.	Wrap setInterval(runCycle, …) at agent.js:1928 in a function startCycleInterval(intervalSeconds) that: clearIntervals the existing handle, sets currentIntervalSeconds, starts a new setInterval, stores the handle.
+	4.	On agent boot, call startCycleInterval(getRuntimeConfig().agent_interval_seconds).
+	5.	At the top of each runCycle, read getRuntimeConfig().agent_interval_seconds. If it differs from currentIntervalSeconds, call startCycleInterval() with the new value at the END of the current cycle (not mid-cycle). Log [AGENT] interval changed: X -> Y seconds.
+	6.	Update agent.js:2807 and agent.js:3092 (the other read sites identified in the audit) to use the same live-read pattern. Do not preserve the const reference.
+Verification: after these changes, a runtime change to portfolio.agent_interval_seconds via Discord must take effect within 2 cycles, with no restart.
+TASK 4 — Wire day_trading_dip_strictness
+In dipBuyService.js, the read at line 102 currently does:
+const strictness = parseFloat(process.env.DAY_TRADING_DIP_REQUIREMENT_STRICTNESS || ‘0.5’)
+Replace with:
+const strictness = getRuntimeConfig().day_trading_dip_strictness
+The runtimeConfig fallback chain (DB > env > default) handles the original behaviour. Update the runtimeConfig defaults so the documented default matches the previous ‘0.5’ (or whatever the actual prior default was — confirm by re-reading the original line).
+TASK 5 — Per-cycle strategy overlay for max_holdings_day and max_position_pct
+This is the most surgically delicate task. Read carefully.
+The strategy config object sc comes from strategies.js as a literal. It is passed by reference into riskManager.js functions. Mutating sc in place would create cross-cycle leakage. Instead, agent.js must construct a per-cycle copy with overlays applied.
+In agent.js, in runCycle, find the line where sc is selected for the day strategy (look for ‘day’ strategy logic — likely a sc = STRATEGIES.day or similar reference). For both day and asx_day strategies:
+	1.	Replace the direct strategy reference with a new helper buildStrategyConfig(strategyName) defined in agent.js (not in strategies.js — this is runtime composition).
+	2.	buildStrategyConfig returns a shallow clone of the base strategy object with overlays:
+	•	If strategyName is ‘day’ or ‘asx_day’:
+	•	rt = getRuntimeConfig()
+	•	clone = { …STRATEGIES[strategyName] }
+	•	if rt.max_holdings_day is non-null and within [1, 20], clone.maxHoldings = rt.max_holdings_day
+	•	if rt.max_position_pct is non-null and within [0.005, 0.05] (the SAFE_KEYS hard cap), clone.maxPositionPct = rt.max_position_pct
+	•	return clone
+	•	For ‘swing’ and ‘asx_swing’: return base strategy unchanged (these aren’t in SAFE_KEYS yet)
+	3.	Pass the cloned object into all downstream calls (evaluateBuy, evaluateSell, etc.). Do not mutate STRATEGIES[strategyName] itself.
+	4.	Critical: log every overlay application once per change. Track the previously-applied overlay values in agent.js module state. When buildStrategyConfig produces values that differ from the last-logged values, emit [STRATEGY-OVERLAY] day: maxHoldings 6 -> 8, maxPositionPct 0.04 -> 0.045. This makes runtime changes visible in deploy logs without log spam.
+	5.	Bounds-check defensively. If runtimeConfig returns out-of-range values (corrupted DB row, env-var typo), log a warning and use the base strategy value. Never let a bad config widen risk.
+TASK 6 — Wire invalidateRuntimeConfig() into the Discord apply path
+When a Discord approval applies a SAFE_KEY change, the 5-second runtimeConfig cache should be invalidated immediately so the new value takes effect on the next cycle.
+	1.	In discordApprovalService.js, at the end of every apply() function for the seven SAFE_KEYS, call runtimeConfig.invalidateRuntimeConfig() before returning success.
+	2.	Also call it once at startup, after dynamicGateService.initStateAtBoot(), to ensure the first cycle reads fresh values.
+VERIFICATION REPORT (mandatory)
+After completing all six tasks, produce a single markdown report with these sections:
+Section 1 — runtimeConfig module
+	•	File path and line count of new module
+	•	The seven properties with their fallback chain documented (DB source -> env var -> default)
+	•	How invalidation works
+	•	How errors are handled (proof that trading is never blocked)
+Section 2 — confidence_gate_base fix
+	•	Diff of discordApprovalService.SAFE_KEYS.confidence_gate_base.apply()
+	•	Confirmation that dynamic_gate_state INSERTs are now happening for both Council suggestions and Discord approvals
+	•	How the audit row references the original suggestion
+Section 3 — Module-load const elimination
+For each of llm_skip_price_bps, sentiment_ttl_seconds, agent_interval_seconds: file:line of removed const, file:line of replacement live-read. For agent_interval_seconds specifically, describe the interval-recreation logic and the cycle-boundary check.
+Section 4 — Sentiment TTL consistency
+Confirmation that Map cache and DB cache use the same _getTtlMs() value. What happens to entries already cached when TTL changes (expected: keep their original expires_at).
+Section 5 — Strategy overlay
+	•	Code listing of buildStrategyConfig in full
+	•	Where it’s called in runCycle
+	•	Bounds-check ranges used
+	•	Example log line showing an overlay application
+Section 6 — Invalidation wiring
+	•	All call sites of invalidateRuntimeConfig()
+	•	Confirmation that boot path invalidates before first cycle
+Section 7 — End-to-end test plan
+A step-by-step test an operator can run after deploy to prove each SAFE_KEY now works:
+	1.	Approve a confidence_gate_base change via Discord. Within 1 cycle, dynamicGateService.getCurrentGate() returns the new value AND a new dynamic_gate_state row is visible.
+	2.	Approve a max_holdings_day change. Within 1 cycle, [STRATEGY-OVERLAY] log line appears AND riskManager rejects/accepts based on the new cap.
+	3.	Approve a sentiment_ttl_seconds change. Next sentiment cache write uses the new TTL (visible in DB expires_at).
+	4.	Approve an agent_interval_seconds change. Within 2 cycles, [AGENT] interval changed log appears AND the next setInterval period uses the new value.
+	5.	(and so on for the remaining three)
+Section 8 — Files touched
+Complete list with one-line summary per file.
+Section 9 — Things you noticed
+Anything fragile, inconsistent, or broken in adjacent code that you noticed while doing this work. Be honest.
+Section 10 — What did NOT change
+Explicit confirmation that the following are byte-for-byte identical to before: riskManager.js core math (the functions listed at the top of this prompt), audit chain code in db.js, kill switch logic, atomic cash logic, DENIED_KEYS list. Identify any of these you had to read or import from but did not modify.
+CONSTRAINTS — re-emphasised
+	•	No changes to riskManager.js function bodies. Reading sc fields is fine; mutating riskManager is not.
+	•	No new SAFE_KEYS added. Phase A.5 fixes existing keys; new keys come in Phase B.
+	•	No regime meta-layer. No asymmetric sizing. No Council role changes. No earnings stubs. Phase B.
+	•	If runtimeConfig becomes complicated enough that you want to add a getter pattern, fine — but document why.
+	•	If you find a sixth or seventh subtle bug along the way, report it in Section 9 but do not fix it. Scope discipline.
+When the report is complete, stop and wait for further instructions.

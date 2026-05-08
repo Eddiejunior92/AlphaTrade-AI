@@ -22,7 +22,17 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 // the cycle still gets a fresh pull whenever the cached entry expires.
 // Combined with the price-stable extension below, repeated calls during
 // quiet markets return cached payloads up to 60 min after fetch.
-const TTL_MS = parseInt(process.env.SENTIMENT_TTL_SECONDS || '1800') * 1000;
+// Phase A.5: TTL is now read live via runtimeConfig so a Discord-approved
+// `sentiment_ttl_seconds` change takes effect on the next read without a
+// restart. Existing cached entries (Map AND DB) keep their original
+// expires_at — they age out on their own timeline. Only NEW writes use the
+// new TTL. The Map cache and the DB cache always read the same _getTtlMs()
+// at write time, so they remain consistent.
+const { getRuntimeConfig: _getRtCfg } = require('./runtimeConfig');
+function _getTtlMs() {
+  const s = _getRtCfg().sentiment_ttl_seconds;
+  return (Number.isFinite(s) && s > 0 ? s : 1800) * 1000;
+}
 // Price-stable cache extension: if the symbol's price has moved less than
 // PRICE_STABLE_BPS basis points since the cached entry was written, treat
 // the entry as fresh up to PRICE_STABLE_TTL_MULT × TTL_MS. Idea: if nothing
@@ -412,7 +422,7 @@ async function _readPersistedCache(symbol) {
 async function _writePersistedCache(symbol, data, price) {
   const db = _getDb(); if (!db) return;
   try {
-    const expiresMs = Date.now() + TTL_MS;
+    const expiresMs = Date.now() + _getTtlMs();
     await db.query(`
       INSERT INTO sentiment_cache (symbol, payload, price_at_fetch, expires_at)
       VALUES ($1, $2::jsonb, $3, to_timestamp($4 / 1000.0))
@@ -475,7 +485,8 @@ async function getSentiment(symbol, { force = false, currentPrice = null } = {})
   if (!force && cached) {
     const age = Date.now() - cached.ts;
     // Standard TTL hit — always reuse.
-    if (age < TTL_MS) {
+    const _ttl = _getTtlMs();
+    if (age < _ttl) {
       touchCache(sym, cached);
       return { ...cached.data, cached: true };
     }
@@ -488,7 +499,7 @@ async function getSentiment(symbol, { force = false, currentPrice = null } = {})
       Number.isFinite(currentPrice) &&
       Number.isFinite(cached.price) &&
       cached.price > 0 &&
-      age < TTL_MS * PRICE_STABLE_TTL_MULT
+      age < _ttl * PRICE_STABLE_TTL_MULT
     ) {
       const movedBps = Math.abs((currentPrice - cached.price) / cached.price) * 10000;
       if (movedBps < PRICE_STABLE_BPS) {

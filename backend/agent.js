@@ -65,7 +65,84 @@ const WATCHLIST = getWatchlist();
 // often — no extra LLM calls, no extra trades, no extra risk.
 // Default tick stays 20s; only lowered if AGENT_INTERVAL_SECONDS env is set
 // or if the operator picks a sub-20s day cadence (handled implicitly here).
-const BASE_INTERVAL_SECONDS = Math.max(5, parseInt(process.env.AGENT_INTERVAL_SECONDS || '60'));
+// Phase A.5: master cycle interval is now LIVE-READ from runtimeConfig so a
+// Discord-approved `agent_interval_seconds` change takes effect within 2
+// cycles without a restart. The setInterval handle is recreated at cycle
+// boundaries (never mid-cycle) by `startCycleInterval()`.
+const _runtimeConfig = require('./services/runtimeConfig');
+let currentIntervalSeconds = null;
+function _resolveIntervalSeconds() {
+  const n = parseInt(_runtimeConfig.getRuntimeConfig().agent_interval_seconds);
+  return Math.max(5, Number.isFinite(n) ? n : 60);
+}
+function startCycleInterval(intervalSeconds) {
+  const sec = Math.max(5, parseInt(intervalSeconds) || 60);
+  if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+  currentIntervalSeconds = sec;
+  intervalHandle = setInterval(runCycle, sec * 1000);
+  return sec;
+}
+
+// Phase A.5: per-cycle strategy composition. Returns a NEW shallow-cloned
+// strategy object (riskScale-applied) with Discord-approved runtime overlays
+// for `max_holdings_day` and `max_position_pct` applied for the day
+// strategies (`day` and `asx_day` only — swing strategies are pass-through).
+//
+// CRITICAL: never mutates STRATEGIES[name]. The base literal in strategies.js
+// remains the single source of truth; overlays live here and are recomputed
+// every cycle from the runtimeConfig snapshot.
+//
+// CRITICAL: bounds-checks defensively. If a corrupted DB row or env-var typo
+// pushes a value out of [1,20] holdings or [0.005, 0.05] position-pct, the
+// base value is used instead. Bad config can never WIDEN risk — only the
+// validators in discordApprovalService.SAFE_KEYS can do that, and they cap
+// at 5%/10 already.
+const _lastOverlayLogged = {}; // { day: {maxHoldings, maxPositionPct}, asx_day: {...} }
+function buildStrategyConfig(strategyName, scaleName) {
+  const base = STRATEGIES[strategyName];
+  if (!base) return null;
+  const scaled = applyRiskScale(base, scaleName);
+  // Only the day strategies get runtime overlays. Swing strategies are
+  // pass-through until/unless we add their own SAFE_KEYS.
+  if (strategyName !== 'day' && strategyName !== 'asx_day') return scaled;
+
+  const clone = { ...scaled };
+  let rt;
+  try { rt = _runtimeConfig.getRuntimeConfig(); }
+  catch (e) { return scaled; /* config read failed — never widen risk */ }
+
+  const baseHoldings = scaled.maxHoldings;
+  const basePosPct   = scaled.maxPositionPct;
+
+  // Bounds [1,10] match the SAFE_KEYS validator in discordApprovalService.
+  // Earlier revision used [1,20]; aligned to the approval contract so a
+  // bad DB row cannot widen risk past what an operator could ever approve.
+  if (rt.max_holdings_day != null && Number.isFinite(rt.max_holdings_day)
+      && rt.max_holdings_day >= 1 && rt.max_holdings_day <= 10) {
+    clone.maxHoldings = rt.max_holdings_day;
+  } else if (rt.max_holdings_day != null) {
+    console.warn(`[STRATEGY-OVERLAY] ${strategyName}: max_holdings_day=${rt.max_holdings_day} out of [1,10]; using base ${baseHoldings}`);
+  }
+
+  if (rt.max_position_pct != null && Number.isFinite(rt.max_position_pct)
+      && rt.max_position_pct >= 0.005 && rt.max_position_pct <= 0.05) {
+    clone.maxPositionPct = rt.max_position_pct;
+  } else if (rt.max_position_pct != null) {
+    console.warn(`[STRATEGY-OVERLAY] ${strategyName}: max_position_pct=${rt.max_position_pct} out of [0.005,0.05]; using base ${basePosPct}`);
+  }
+
+  // Log only on CHANGE so deploy logs aren't spammed every cycle.
+  const last = _lastOverlayLogged[strategyName];
+  if (!last || last.maxHoldings !== clone.maxHoldings || last.maxPositionPct !== clone.maxPositionPct) {
+    if (last) {
+      console.log(`[STRATEGY-OVERLAY] ${strategyName}: maxHoldings ${last.maxHoldings} -> ${clone.maxHoldings}, maxPositionPct ${last.maxPositionPct} -> ${clone.maxPositionPct}`);
+    } else {
+      console.log(`[STRATEGY-OVERLAY] ${strategyName}: initial maxHoldings=${clone.maxHoldings} (base ${baseHoldings}), maxPositionPct=${clone.maxPositionPct} (base ${basePosPct})`);
+    }
+    _lastOverlayLogged[strategyName] = { maxHoldings: clone.maxHoldings, maxPositionPct: clone.maxPositionPct };
+  }
+  return clone;
+}
 const FORCE_FLATTEN_MINUTES_BEFORE_CLOSE = parseInt(process.env.FORCE_FLATTEN_MINUTES_BEFORE_CLOSE || '5');
 
 // =============================================================================
@@ -125,7 +202,9 @@ function _pushBounded(arr, val, cap = 60) { arr.push(val); if (arr.length > cap)
 // where the previous decision was HOLD. BUY/SELL signals and held positions
 // always re-evaluate fresh on the next tick.
 const LLM_SKIP_TTL_MS = parseInt(process.env.LLM_SKIP_TTL_SECONDS || '120') * 1000;
-const LLM_SKIP_PRICE_BPS = parseFloat(process.env.LLM_SKIP_PRICE_BPS || '70');
+// Phase A.5: LLM_SKIP_PRICE_BPS removed as a module-load const. Read live
+// at the call site via runtimeConfig so a Discord-approved change takes
+// effect on the next cycle without a restart.
 const _llmSkipCache = new Map(); // `${strategy}:${symbol}` → { signal, ts, price }
 
 // Quiet-market shortcut thresholds. When the tape is genuinely sleepy on a
@@ -995,6 +1074,10 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
   const priceDriftBps = skipCached
     ? Math.abs((latest - skipCached.price) / skipCached.price) * 10000
     : Infinity;
+  // Phase A.5: live read of llm_skip_price_bps so an operator-approved
+  // change via Discord takes effect on the next cycle. The 5s in-process
+  // cache in runtimeConfig keeps this cheap inside a tight loop.
+  const llmSkipPriceBps = _runtimeConfig.getRuntimeConfig().llm_skip_price_bps;
   const canSkip = (
     sc.name === 'day' &&
     !holding &&
@@ -1002,7 +1085,7 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
     skipCached &&
     skipCached.signal.consensus === 'HOLD' &&
     Date.now() - skipCached.ts < LLM_SKIP_TTL_MS &&
-    priceDriftBps < LLM_SKIP_PRICE_BPS
+    priceDriftBps < llmSkipPriceBps
   );
 
   // Quiet-market shortcut runs BEFORE the skip-cache check — it doesn't
@@ -1601,7 +1684,10 @@ async function runCycle() {
     // of its individual day/swing/asx_swing toggle.
     const usMarketOn  = portfolio.us_market_enabled  !== false;
     const asxMarketOn = portfolio.asx_market_enabled !== false;
-    const dayScaled = applyRiskScale(STRATEGIES.day, scaleName);
+    // Phase A.5: route every strategy through buildStrategyConfig so the day
+    // strategies pick up Discord-approved `max_holdings_day` and
+    // `max_position_pct` overlays. Swing strategies are pass-through.
+    const dayScaled = buildStrategyConfig('day', scaleName);
     // CRITICAL: per-market master switches gate NEW ENTRIES ONLY. Existing
     // positions still run through evaluateExistingPositions (stop-loss,
     // take-profit, trailing stops) and forceFlatten-before-close — turning
@@ -1611,18 +1697,18 @@ async function runCycle() {
     // a strategy entirely.
     const strategies = [
       { sc: { ...dayScaled, intervalSeconds: dayCadenceLive }, enabled: portfolio.day_enabled,      marketOpen: clock.is_open, clock, noNewEntries: !usMarketOn },
-      { sc: applyRiskScale(STRATEGIES.swing, scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock, noNewEntries: !usMarketOn },
+      { sc: buildStrategyConfig('swing', scaleName),     enabled: portfolio.swing_enabled,      marketOpen: clock.is_open, clock, noNewEntries: !usMarketOn },
       // ASX gated by env-var master switch (ASX_ENABLED). When disabled,
       // marketRegistry.isAsxOpen() returns false anyway → strategy is never
       // eligible. The asxMarketOn switch only blocks new entries; exits
       // continue so any existing ASX position can still be managed.
-      { sc: { ...applyRiskScale(STRATEGIES.asx_swing, scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
+      { sc: { ...buildStrategyConfig('asx_swing', scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_swing_enabled !== false, marketOpen: asxOpen,       clock: null, noNewEntries: !asxMarketOn },
       // ASX day strategy. Same ASX cadence as swing (operator picked 120s
       // — wide enough to keep IBKR happy, fast enough to be intraday).
       // Gets a real ASX clock so its forceFlattenBeforeClose hook can
       // compute minutes-until 16:00 Sydney, exactly mirroring how the US
       // day strategy uses Alpaca's clock to flatten before NYSE close.
-      { sc: { ...applyRiskScale(STRATEGIES.asx_day, scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_day_enabled !== false, marketOpen: asxOpen, clock: marketRegistry.getAsxClock(), noNewEntries: !asxMarketOn },
+      { sc: { ...buildStrategyConfig('asx_day', scaleName), intervalSeconds: asxCadenceLive }, enabled: marketRegistry.isAsxEnabled() && portfolio.asx_day_enabled !== false, marketOpen: asxOpen, clock: marketRegistry.getAsxClock(), noNewEntries: !asxMarketOn },
     ];
     // [Upgrade #4 / Scale & Speed] Run US-bucket and ASX-bucket strategies
     // CONCURRENTLY. Within the US bucket, day + swing remain SEQUENTIAL (they
@@ -1709,6 +1795,18 @@ async function runCycle() {
     _pushBounded(perfMetrics.cycleDurationsMs, dt);
     cycleInProgress = false;
     tradingLock = false;
+    // Phase A.5: cycle-boundary check for live agent_interval_seconds change.
+    // We deliberately reschedule HERE (in finally, after cycle done) so we
+    // never tear down the interval mid-cycle. Recreating setInterval also
+    // resets its phase, but that's harmless — a one-tick drift is fine.
+    try {
+      const desired = _resolveIntervalSeconds();
+      if (intervalHandle && desired !== currentIntervalSeconds) {
+        const prev = currentIntervalSeconds;
+        startCycleInterval(desired);
+        console.log(`[AGENT] interval changed: ${prev} -> ${desired} seconds`);
+      }
+    } catch (e) { /* swallow — interval reschedule must never break a cycle */ }
   }
 }
 
@@ -1924,9 +2022,14 @@ async function startAgent() {
     throw e;
   }
   await db.updatePortfolio({ agent_running: true });
-  await db.recordAudit({ event_type: 'AGENT_STARTED', payload: { intervalSeconds: BASE_INTERVAL_SECONDS } });
-  if (!intervalHandle) intervalHandle = setInterval(runCycle, BASE_INTERVAL_SECONDS * 1000);
-  console.log(`[Agent] Started — base interval ${BASE_INTERVAL_SECONDS}s`);
+  // Phase A.5: read the interval live from runtimeConfig and start (or
+  // restart) the master setInterval via startCycleInterval(). This is the
+  // ONLY place setInterval(runCycle, ...) is created on Start; the
+  // auto-resume branch below uses the same helper.
+  const startSec = _resolveIntervalSeconds();
+  await db.recordAudit({ event_type: 'AGENT_STARTED', payload: { intervalSeconds: startSec } });
+  startCycleInterval(startSec);
+  console.log(`[Agent] Started — base interval ${startSec}s`);
   runCycle();
 }
 
@@ -2804,7 +2907,7 @@ async function getAgentSnapshot() {
     providers: llmService.getProviderStatus(),
     watchlist: WATCHLIST,
     sentiment: sentimentService.getAllCached(),
-    intervalSeconds: BASE_INTERVAL_SECONDS,
+    intervalSeconds: currentIntervalSeconds || _resolveIntervalSeconds(),
     forceFlattenMinutesBeforeClose: FORCE_FLATTEN_MINUTES_BEFORE_CLOSE,
   };
 }
@@ -3089,7 +3192,8 @@ setInterval(() => {
     if (portfolio?.trading_mode) alpacaService.setMode(portfolio.trading_mode);
     if (portfolio.agent_running && !intervalHandle) {
       console.log('[Agent] Auto-resuming from previous session');
-      intervalHandle = setInterval(runCycle, BASE_INTERVAL_SECONDS * 1000);
+      const sec = _resolveIntervalSeconds();
+      startCycleInterval(sec);
       runCycle();
     }
     // Fire-and-forget: ensure today's intelligence cache is warm. Skips any

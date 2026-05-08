@@ -75,8 +75,13 @@ function getApproverIds() { return Array.from(_getApproverAllowlist()); }
 // ---------------------------------------------------------------------------
 const SAFE_KEYS = {
   // Dynamic gate base — clamped 0.65-0.90 in dynamicGateService anyway.
+  // Phase A.5: INSERTs a new row into `dynamic_gate_state` (mirroring the
+  // Council/auto-adaptive write path). This is the table that
+  // dynamicGateService.getCurrentGate() reads, so the change actually
+  // takes effect on the next cycle. Also invalidates the 30s in-memory
+  // gate cache so callers don't see stale state.
   confidence_gate_base: {
-    description: 'Base confidence gate (clamped 0.65-0.90)',
+    description: 'Base confidence gate (clamped 0.65-0.90). INSERTs a new row into dynamic_gate_state.',
     validate: (v) => {
       const n = parseFloat(v);
       if (!Number.isFinite(n)) return { ok: false, reason: 'not a number' };
@@ -84,11 +89,35 @@ const SAFE_KEYS = {
       return { ok: true, normalised: n };
     },
     apply: async (n) => {
-      // Implemented as a council suggestion delta from current base.
-      const cur = await dynamicGate.getStatus();
-      const delta = n - (parseFloat(cur.base_gate) || 0.80);
-      await dynamicGate.applyCouncilSuggestion({
-        delta, reason: `Discord approval: set gate to ${n}`, source: 'discord_approval',
+      // Phase A.5 fix: write the EXACT approved gate value directly into
+      // dynamic_gate_state. Earlier revision routed through
+      // applyCouncilSuggestion(), but that helper clamps delta to ±0.10
+      // around BASE_GATE=0.80, making approved values below 0.70
+      // unreachable. Direct INSERT preserves the latest pin state and
+      // resets council_delta to 0 (the operator just set the absolute
+      // base, so any prior delta is superseded). Audit correlation: the
+      // CONFIG_CHANGE_APPROVED row written by applySuggestion() carries
+      // suggestion_id; the DYNAMIC_GATE_ADJUSTED row written below
+      // carries source='discord_approval' for cross-reference.
+      // Final value is still hard-clamped to SAFETY_FLOOR / SAFETY_CEIL
+      // by getCurrentGate() — defence-in-depth.
+      await db.query(`
+        INSERT INTO dynamic_gate_state (base_gate, council_delta, pinned, pin_value, pin_reason, source, reason, updated_at)
+        SELECT $1, 0,
+               COALESCE((SELECT pinned    FROM dynamic_gate_state ORDER BY id DESC LIMIT 1), FALSE),
+               (SELECT pin_value  FROM dynamic_gate_state ORDER BY id DESC LIMIT 1),
+               (SELECT pin_reason FROM dynamic_gate_state ORDER BY id DESC LIMIT 1),
+               'discord_approval', $2, NOW()
+      `, [n, `Discord approval: set base_gate to ${n}`]);
+      dynamicGate.invalidateCache();
+      await db.recordAudit({
+        event_type: 'DYNAMIC_GATE_ADJUSTED',
+        payload: {
+          source: 'discord_approval',
+          new_base_gate: n,
+          reason: `Discord approval: set base_gate to ${n}`,
+          effective_gate: await dynamicGate.getCurrentGate(),
+        },
       });
     },
   },
@@ -315,6 +344,14 @@ async function applySuggestion(id, { discordUser } = {}) {
       discord_user: discordUser || null,
     },
   });
+  // Phase A.5: drop the 5s runtimeConfig cache so the next cycle re-reads
+  // DB values for every SAFE_KEY. Cheap (single timestamp reset). Failures
+  // are swallowed — config invalidation must never block an approval.
+  try {
+    require('./runtimeConfig').invalidateRuntimeConfig();
+  } catch (e) {
+    console.warn('[DISCORD-APPROVAL] runtimeConfig invalidate failed:', e.message);
+  }
   return { ok: true, applied: { key: norm.key, value: validation.normalised } };
 }
 

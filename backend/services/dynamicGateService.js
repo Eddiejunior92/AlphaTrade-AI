@@ -201,7 +201,12 @@ async function initStateAtBoot() {
   }
 }
 
+// Phase A.5: external callers (Discord apply path, runtimeConfig invalidation)
+// can force the next getCurrentGate() to bypass the 30s in-memory cache.
+function invalidateCache() { _stateTs = 0; }
+
 module.exports = {
+  invalidateCache,
   getCurrentGate,
   applyCouncilSuggestion,
   evaluateAutoAdaptive,

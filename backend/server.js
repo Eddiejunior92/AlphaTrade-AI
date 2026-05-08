@@ -1834,6 +1834,15 @@ server.listen(PORT, '0.0.0.0', () => {
     try { await db.verifyT002Schema(); } catch (e) { console.error('[Boot] verifyT002Schema failed:', e.message); }
     try { await require('./services/dynamicGateService').initStateAtBoot(); }
     catch (e) { console.error('[Boot] dynamicGate.initStateAtBoot failed:', e.message); }
+    // Phase A.5: warm the runtimeConfig cache and invalidate so the very
+    // first runCycle reads DB-backed SAFE_KEY values rather than the cold
+    // _bootSnapshot() (which only knows env+default).
+    try {
+      const rt = require('./services/runtimeConfig');
+      await rt.warmRuntimeConfig();
+      rt.invalidateRuntimeConfig();
+      console.log('[Boot] runtimeConfig warmed');
+    } catch (e) { console.error('[Boot] runtimeConfig warm failed:', e.message); }
   })();
   premarketService.ensureSchema()
     .then(() => {

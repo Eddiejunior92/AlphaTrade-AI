@@ -99,11 +99,15 @@ const PROFILES = {
 };
 
 function getStrictness() {
-  const raw = process.env.DAY_TRADING_DIP_REQUIREMENT_STRICTNESS;
-  if (raw === undefined || raw === null || raw === '') return STRICTNESS_MEDIUM;
-  const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0 || n > 3) return STRICTNESS_MEDIUM;
-  return n;
+  // Phase A.5: read via runtimeConfig (DB col → env → default 2 = MEDIUM).
+  // runtimeConfig already coerces, bounds-checks (0-3), and falls back, so
+  // the env-var path that used to live here is now centralised.
+  try {
+    const { getRuntimeConfig } = require('./runtimeConfig');
+    const n = getRuntimeConfig().day_trading_dip_strictness;
+    if (Number.isFinite(n) && n >= 0 && n <= 3) return n;
+  } catch (_) { /* fall through to default */ }
+  return STRICTNESS_MEDIUM;
 }
 
 // Pure: takes the same context the BUY-path already has, returns a verdict.
