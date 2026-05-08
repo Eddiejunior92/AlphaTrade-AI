@@ -71,6 +71,7 @@ Autonomous multi-LLM high-frequency trading agent for US and ASX markets.
 ## Gotchas
 
 *   `OPERATOR_TOKEN` is mandatory for live trading and certain API operations.
+*   **Operator session is persistent**: the dashboard's "Operator Token" panel calls `POST /api/auth/login` which validates the token and sets a 1-year `op_token` httpOnly + Secure + SameSite=Lax cookie. After ONE successful save in a browser, the operator never needs to paste the token again on that device — every subsequent visit is auto-authenticated via the cookie. The token is wiped from `localStorage` after a successful login (no longer reachable from JS, immune to XSS exfil). `requireOperator`/`requireOperatorStrict` accept the token via header, query, OR cookie. `POST /api/auth/logout` clears the cookie. `viaCookie:true` in `/api/auth/status` indicates a cookie-backed session.
 *   ASX trading requires `IBKR_BASE_URL` and `IBKR_ACCOUNT_ID` env vars; otherwise, it operates in mock mode.
 *   `ASX_ENABLED=true` must be set to activate ASX functionality.
 *   The system enforces a strict 3-of-4 LLM quorum for trade execution.

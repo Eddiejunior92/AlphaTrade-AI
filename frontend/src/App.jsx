@@ -1050,7 +1050,9 @@ export default function App() {
                 </div>
               )}
               <div className="text-[10px] text-[var(--text-dim)] mt-2">
-                Stored locally in your browser only. Sent as <span className="font-mono">x-operator-token</span> header on every protected request.
+                {authStatus?.viaCookie
+                  ? <>🔒 Signed in via secure 1-year session cookie — no re-entry needed on this browser. Click <button onClick={async () => { await setOperatorToken(''); setTokenInput(''); }} className="underline">sign out</button> to clear.</>
+                  : <>Saved as a 1-year secure <span className="font-mono">httpOnly</span> cookie. Paste once and the browser remembers it — you won't need to enter it again on this device.</>}
               </div>
             </div>
 

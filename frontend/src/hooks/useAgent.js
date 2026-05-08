@@ -35,6 +35,7 @@ function authHeaders() {
 async function apiPost(path, body) {
   const res = await fetch(`${API}${path}`, {
     method: 'POST',
+    credentials: 'include', // send op_token cookie if browser holds one
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -42,7 +43,10 @@ async function apiPost(path, body) {
 }
 
 async function apiGet(path) {
-  const res = await fetch(`${API}${path}`, { headers: authHeaders() });
+  const res = await fetch(`${API}${path}`, {
+    credentials: 'include',
+    headers: authHeaders(),
+  });
   return res.json();
 }
 
@@ -70,8 +74,39 @@ export function useAgent() {
   }, []);
 
   const setOperatorToken = useCallback(async (tok) => {
-    setStoredOperatorToken((tok || '').trim());
+    const trimmed = (tok || '').trim();
+    // First try the new "stay signed in" login flow — POSTs the token to the
+    // server which validates it and sets a 1-year httpOnly cookie. After this
+    // succeeds, the token is wiped from localStorage and the browser is
+    // auto-authenticated on every future visit (no re-paste needed).
+    if (trimmed) {
+      try {
+        const r = await fetch(`${API}/auth/login`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: trimmed }),
+        });
+        if (r.ok) {
+          // Cookie is now set. Clear localStorage so the token isn't lying
+          // around in JS-readable storage anymore.
+          setStoredOperatorToken('');
+          await refreshAuthStatus();
+          return { ok: true, persisted: true };
+        }
+      } catch {}
+    } else {
+      // Empty input → log out (clear cookie + localStorage).
+      try { await fetch(`${API}/auth/logout`, { method: 'POST', credentials: 'include' }); } catch {}
+      setStoredOperatorToken('');
+      await refreshAuthStatus();
+      return { ok: true, persisted: false };
+    }
+    // Fallback for legacy/unconfigured servers — keep the old localStorage
+    // header behaviour so nothing breaks if /api/auth/login isn't present.
+    setStoredOperatorToken(trimmed);
     await refreshAuthStatus();
+    return { ok: true, persisted: false };
   }, [refreshAuthStatus]);
 
   const setLoad = (key, val) => setLoading(l => ({ ...l, [key]: val }));

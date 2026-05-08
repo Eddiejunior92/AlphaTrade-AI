@@ -58,9 +58,55 @@ if (!OPERATOR_TOKEN) {
   console.warn('[Server] ⚠ OPERATOR_TOKEN not set — control-plane endpoints are UNAUTHENTICATED. Set it before exposing this server publicly.');
 }
 
+// ---------------------------------------------------------------------------
+// "Sign in once, stay signed in" — operator token can arrive via:
+//   1. `x-operator-token` HTTP header (legacy / API clients)
+//   2. `?token=` query string (legacy)
+//   3. `op_token` httpOnly cookie set by POST /api/auth/login
+// The cookie is httpOnly + Secure + SameSite=Lax + 1-year maxAge so once the
+// operator pastes the token in the dashboard's Settings panel ONCE, every
+// subsequent visit from that browser is auto-authenticated. The token never
+// touches JavaScript on the client side, so it can't be exfiltrated by an
+// XSS bug. Cleared via POST /api/auth/logout.
+// ---------------------------------------------------------------------------
+const OPERATOR_COOKIE = 'op_token';
+const OPERATOR_COOKIE_MAX_AGE_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
+function _parseCookies(req) {
+  const out = {};
+  const raw = req.get('cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    if (k) out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+function _providedToken(req) {
+  return req.get('x-operator-token')
+      || req.query?.token
+      || _parseCookies(req)[OPERATOR_COOKIE]
+      || '';
+}
+function _cookieAttrs() {
+  // Secure flag only when behind HTTPS (production / Replit deployment).
+  // Lax SameSite lets the dashboard's same-origin fetches send the cookie
+  // automatically without enabling CSRF on cross-site form posts.
+  const secure = IS_PRODUCTION ? '; Secure' : '';
+  return `Path=/; HttpOnly; SameSite=Lax${secure}`;
+}
+function setOperatorCookie(res, token) {
+  const expires = new Date(Date.now() + OPERATOR_COOKIE_MAX_AGE_MS).toUTCString();
+  res.setHeader('Set-Cookie', `${OPERATOR_COOKIE}=${encodeURIComponent(token)}; Expires=${expires}; Max-Age=${Math.floor(OPERATOR_COOKIE_MAX_AGE_MS/1000)}${_cookieAttrs()}`);
+}
+function clearOperatorCookie(res) {
+  res.setHeader('Set-Cookie', `${OPERATOR_COOKIE}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0${_cookieAttrs()}`);
+}
+
 function requireOperator(req, res, next) {
   if (!OPERATOR_TOKEN) return next();
-  const provided = req.get('x-operator-token') || req.query.token;
+  const provided = _providedToken(req);
   if (provided !== OPERATOR_TOKEN) {
     return res.status(401).json({ success: false, error: 'Unauthorized — operator token required' });
   }
@@ -76,7 +122,7 @@ function requireOperatorStrict(req, res, next) {
         error: 'Switching to LIVE mode requires OPERATOR_TOKEN to be configured on the server.',
       });
     }
-    const provided = req.get('x-operator-token') || req.query.token;
+    const provided = _providedToken(req);
     if (provided !== OPERATOR_TOKEN) {
       return res.status(401).json({ success: false, error: 'Operator token required for LIVE mode switch' });
     }
@@ -160,10 +206,34 @@ app.get('/api/state', async (req, res) => {
 // token. Reports whether the request's currently-supplied token (if any) is
 // valid. Read-only; safe to call unauthenticated.
 app.get('/api/auth/status', (req, res) => {
-  const provided = req.get('x-operator-token') || req.query.token;
+  const provided = _providedToken(req);
   const tokenRequired = !!OPERATOR_TOKEN;
   const authenticated = !tokenRequired || provided === OPERATOR_TOKEN;
-  res.json({ tokenRequired, authenticated });
+  // `viaCookie:true` means the dashboard doesn't need to re-prompt for the
+  // token — the browser already has the persistent session cookie.
+  const viaCookie = !!_parseCookies(req)[OPERATOR_COOKIE] && authenticated;
+  res.json({ tokenRequired, authenticated, viaCookie });
+});
+
+// Operator login — accept the token in the request body, validate it,
+// then set the persistent httpOnly cookie. After this returns 200 the
+// browser is "signed in for a year" and never needs the token in JS again.
+app.post('/api/auth/login', (req, res) => {
+  if (!OPERATOR_TOKEN) {
+    return res.status(400).json({ success: false, error: 'Server has no OPERATOR_TOKEN configured — login not required.' });
+  }
+  const provided = (req.body?.token || '').trim();
+  if (!provided || provided !== OPERATOR_TOKEN) {
+    return res.status(401).json({ success: false, error: 'Invalid operator token.' });
+  }
+  setOperatorCookie(res, provided);
+  res.json({ success: true, persisted: true, maxAgeDays: 365 });
+});
+
+// Operator logout — clear the cookie. Idempotent.
+app.post('/api/auth/logout', (req, res) => {
+  clearOperatorCookie(res);
+  res.json({ success: true });
 });
 
 app.post('/api/agent/start', async (req, res) => {
