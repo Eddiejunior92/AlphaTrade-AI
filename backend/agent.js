@@ -1,5 +1,8 @@
 require('dotenv').config();
 const llmService = require('./services/llmService');
+const hybridSignal = require('./services/hybridSignalService');
+const councilService = require('./services/councilService');
+const dynamicGate = require('./services/dynamicGateService');
 const premarketService = require('./services/premarketService');
 const alpacaService = require('./services/alpacaService');
 const ibkrService = require('./services/ibkrService');
@@ -1023,39 +1026,78 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       reason: `[skip-cache] ${skipCached.signal.reason} (age ${((Date.now() - skipCached.ts)/1000).toFixed(0)}s, drift ${priceDriftBps.toFixed(1)}bps)`,
     };
   } else {
-    perfMetrics.ensembleCalls++;
-    perfMetrics.ensembleCallsByMarket[_mktKey]++;
-    if (escalate) {
-      perfMetrics.ensembleEscalated++;
-      perfMetrics.ensembleEscalatedByMarket[_mktKey]++;
-    }
-    signal = await llmService.getEnsembleDecision({
-      symbol, priceData, sentiment, newsSentiment, holding, portfolio,
-      patterns, fundamentals, indicators, intraday, historical,
-      strategyName: sc.name, premarket,
-      adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
-      earningsTranscript,
-      // [Capital & Risk Capacity] new prompt-context blocks
-      varStress: varBlock, dynamicHedging: hedgeBlock, liquidityProfile: liquidityLine,
-      regimeContext, knowledgeContext, macroForecast, scenarioSim,
-      // Dynamic-weighting + meta-reasoner context. Both are strictly
-      // informational; raw quorum + confidence gate retain full veto.
-      regime, market: info.market,
-      // Causal + counterfactual + experience-replay + cross-market propagation
-      // prompt blocks. Pre-rendered text or null — all strictly informational,
-      // never gating.
-      causalContext, counterfactualContext, experienceContext, propagationContext,
-      // Human-in-the-Loop layer: prompt summary + bounded shrinkage factor.
-      // Both can ONLY tighten the existing gate, never relax it.
-      feedbackContext, feedbackShrinkage,
-      // Self-Supervised Market Pre-Training prior. Strictly informational.
-      marketPriorContext,
-      // Tier routing — cheap by default; agent decides when to escalate.
-      escalate, routingReason,
+    // -----------------------------------------------------------------------
+    // Master Intelligence Upgrade — hybrid 60/30/10 routing
+    //   60% statistical (this block) → if confident, skip LLM entirely
+    //   30% council/ensemble (deliberation when borderline OR escalated)
+    //   10% sentiment (already blended into stat layer above)
+    // SAFETY: every emitted signal still flows through riskManager →
+    //   3-of-N quorum, dynamic confidence gate (clamped 0.65-0.90),
+    //   daily-loss budget, drawdown breaker, kill switch, atomic cash math.
+    // -----------------------------------------------------------------------
+    const stat = hybridSignal.computeStatisticalSignal({
+      indicators, patterns, intraday, regime, newsSentiment,
     });
+    const route = hybridSignal.decideRoute({ stat, escalate, holding });
+    if (route.route === 'STATISTICAL_ONLY') {
+      perfMetrics.ensembleQuietSkipped++;
+      perfMetrics.ensembleQuietSkippedByMarket[_mktKey]++;
+      signal = hybridSignal.buildStatisticalSignal(stat, symbol);
+      signal._hybridRoute = route;
+    } else if (route.route === 'HOLD') {
+      perfMetrics.ensembleQuietSkipped++;
+      perfMetrics.ensembleQuietSkippedByMarket[_mktKey]++;
+      signal = hybridSignal.buildHoldSignal(stat, route.reason);
+      signal._hybridRoute = route;
+    } else if (route.route === 'COUNCIL') {
+      // High-stakes path — Intelligence Council (6 analysts + Judge).
+      perfMetrics.ensembleCalls++;
+      perfMetrics.ensembleCallsByMarket[_mktKey]++;
+      if (escalate) {
+        perfMetrics.ensembleEscalated++;
+        perfMetrics.ensembleEscalatedByMarket[_mktKey]++;
+      }
+      try {
+        signal = await councilService.deliberate({
+          symbol, strategy: sc.name, market: info.market, holding,
+          priceData, indicators, patterns, intraday, newsSentiment,
+          regimeContext, knowledgeContext, macroForecast, scenarioSim,
+          historical: typeof historical === 'string' ? historical : null,
+          earningsSignal, earningsTranscript, optionsFlow,
+          statisticalScore: stat,
+          routingReason: route.reason,
+        });
+        signal._hybridRoute = route;
+        // Council suggests gate delta — feed into dynamicGate (clamped 0.65-0.90).
+        const gateDelta = signal._council?.gateSuggestionDelta || 0;
+        if (Math.abs(gateDelta) >= 0.005) {
+          dynamicGate.applyCouncilSuggestion({
+            delta: gateDelta,
+            reason: signal._council?.gateReason || 'council_judgment',
+            source: `council:${symbol}`,
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.error(`[Council:${symbol}] failed: ${e.message} — falling back to ensemble`);
+        signal = await llmService.getEnsembleDecision({
+          symbol, priceData, sentiment, newsSentiment, holding, portfolio,
+          patterns, fundamentals, indicators, intraday, historical,
+          strategyName: sc.name, premarket,
+          adaptiveHints, portfolioRisk: portfolioRiskBlock, orderFlow, optionsActivity, optionsFlow, earningsSignal,
+          earningsTranscript,
+          varStress: varBlock, dynamicHedging: hedgeBlock, liquidityProfile: liquidityLine,
+          regimeContext, knowledgeContext, macroForecast, scenarioSim,
+          regime, market: info.market,
+          causalContext, counterfactualContext, experienceContext, propagationContext,
+          feedbackContext, feedbackShrinkage,
+          marketPriorContext,
+          escalate, routingReason,
+        });
+      }
+    }
     // Cache only flat HOLDs with no open position. BUY/SELL and held
     // positions must always re-evaluate fresh on the next cycle.
-    if (signal.consensus === 'HOLD' && !holding) {
+    if (signal && signal.consensus === 'HOLD' && !holding) {
       _llmSkipCache.set(skipKey, { signal, ts: Date.now(), price: latest });
       // Bound cache size so a long-running process doesn't leak.
       if (_llmSkipCache.size > 256) {
@@ -1233,6 +1275,11 @@ async function analyzeAndTradeSymbol(symbol, portfolio, holdings, equity, cash, 
       macroAdjust: macroAdjustForRisk || undefined,
       // Dip amplifier — clamped at 1.25 in riskManager defence-in-depth.
       dipSizingMult,
+      // Smart Safety Layer — current effective dynamic gate (clamped
+      // 0.65-0.90 at the source AND re-clamped inside checkQuorum). When
+      // present, REPLACES the strategy's static confidenceThreshold as the
+      // base gate; existing regime/macro boosts still tighten on top.
+      gateOverride: await dynamicGate.getCurrentGate({ strategy: sc.name, market: info.market }).catch(() => undefined),
     };
     // [Upgrade #4] Atomic BUY critical section — re-read fresh cash +
     // holdings, run evaluateBuy, AND executeOrder all under a single lock

@@ -32,6 +32,7 @@
 // =============================================================================
 
 const brokerService = require('./brokerService');
+const approvalService = require('./discordApprovalService');
 
 let _client = null;
 let _started = false;
@@ -158,6 +159,27 @@ async function start({ getSnapshot, getRecentTrades }) {
       if (!isDM && !isTargetChannel) { console.log(`[DiscordChat] skip: wrong channel (got ${msg.channel?.id}, want ${channelId} or DM)`); return; }
       const text = String(msg.content || '').trim();
       if (!text) { console.log('[DiscordChat] skip: empty content (Message Content Intent may be OFF in Developer Portal)'); return; }
+
+      // Approval-command interceptor — Approve/Reject/Status/Gate. Returns
+      // null if the message wasn't an approval command (fall through to
+      // chat). All actual config changes go through SAFE_KEYS allowlist
+      // inside discordApprovalService and produce a CONFIG_CHANGE_APPROVED
+      // (or CONFIG_CHANGE_DENIED) audit row.
+      try {
+        const approvalReply = await approvalService.tryHandle(text, msg);
+        if (approvalReply) {
+          console.log('[DiscordChat] handled as approval command');
+          for (const part of chunkReply(approvalReply)) {
+            try { await msg.reply(part); }
+            catch (_) { try { await msg.channel.send(part); } catch {} }
+          }
+          return;
+        }
+      } catch (e) {
+        console.error('[DiscordChat] approval handler error:', e.message);
+        // Fall through to chat on error — never block conversation.
+      }
+
       console.log(`[DiscordChat] handling: routing to brokerService.chat()`);
 
       // Show "typing…" while Grok thinks. Best-effort — ignore failures.

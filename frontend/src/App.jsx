@@ -37,6 +37,54 @@ const TABS = [
 
 function fmt(n) { return typeof n === 'number' ? n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }
 
+// Smart Safety Layer banner — small read-only strip showing the current
+// effective dynamic gate (clamped 0.65-0.90 server-side) and pending
+// Discord-approval suggestion count. Click "Pending" to scroll to /api docs;
+// suggestions are approved via Discord ("Approve #N").
+function IntelligenceStatusBanner() {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch('/api/intelligence-status');
+        if (!r.ok) return;
+        const j = await r.json();
+        if (alive) setData(j);
+      } catch (_) {}
+    };
+    load();
+    const t = setInterval(load, 30_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  if (!data?.gate) return null;
+  const g = data.gate;
+  const eff = Math.round((g.effective_gate || 0) * 100);
+  const base = Math.round((g.base_gate || 0) * 100);
+  const delta = ((g.council_delta || 0) * 100);
+  const deltaTxt = delta === 0 ? '' : ` (${delta > 0 ? '+' : ''}${delta.toFixed(1)}pp council)`;
+  const pinTxt = g.pinned ? ` • PINNED @ ${Math.round((g.pin_value || 0) * 100)}%` : '';
+  const pinColor = g.pinned ? 'text-[var(--orange)]' : 'text-[var(--text-dim)]';
+  return (
+    <div className="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-[12px] flex flex-wrap items-center gap-x-4 gap-y-1">
+      <span className="font-semibold text-[var(--text)]">🧠 Intelligence</span>
+      <span>
+        Gate: <strong className="text-[var(--green)]">{eff}%</strong>
+        <span className="text-[var(--text-dim)]"> (base {base}%{deltaTxt})</span>
+        <span className={pinColor}>{pinTxt}</span>
+      </span>
+      <span className="text-[var(--text-dim)]">
+        Floor 65% • Ceil 90%
+      </span>
+      {data.pendingSuggestions > 0 && (
+        <span className="px-2 py-0.5 rounded-full bg-[var(--orange)]/20 border border-[var(--orange)]/40 text-[var(--orange)] font-semibold">
+          {data.pendingSuggestions} pending suggestion{data.pendingSuggestions === 1 ? '' : 's'} — approve via Discord
+        </span>
+      )}
+    </div>
+  );
+}
+
 function LiveBadge({ connected, pulseAt }) {
   // Briefly flash brighter for 1.2s after each new live entry arrives.
   const [flash, setFlash] = useState(false);
@@ -478,6 +526,12 @@ export default function App() {
               onToggleEnabled={async (m, en) => setMarketEnabled(m, en)}
               onOpenModeModal={(market, target) => { setModeError(''); setModeModal({ market, target }); }}
             />
+
+            {/* Smart Safety Layer banner — current dynamic gate + pending
+                Discord-approval suggestion count. Polls every 30s. Strictly
+                informational; gate enforcement happens server-side in
+                riskManager.checkQuorum (clamped 0.65-0.90). */}
+            <IntelligenceStatusBanner />
 
             {/* Live market clocks. ASX panel renders only when master switch
                 (ASX_ENABLED env) is on — otherwise solo full-width US clock. */}

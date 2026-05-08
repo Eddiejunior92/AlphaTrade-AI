@@ -681,6 +681,22 @@ app.get('/api/data-depth/:symbol', async (req, res) => {
 // bypass any existing safety check. Returns the fresh refresh on demand if
 // no cache is present yet. The dynamic-hedging block is computed on-the-fly
 // off the same VaR snapshot so the two are always self-consistent.
+// Smart Safety Layer status — current dynamic gate + pending suggestion count.
+// Read-only; the actual gate enforcement lives in riskManager.checkQuorum.
+app.get('/api/intelligence-status', async (_req, res) => {
+  try {
+    const dynamicGate = require('./services/dynamicGateService');
+    const db = require('./services/db');
+    const gate = await dynamicGate.getStatus();
+    let pendingCount = 0;
+    try {
+      const r = await db.query(`SELECT COUNT(*)::int AS n FROM pending_suggestions WHERE status = 'pending'`);
+      pendingCount = r.rows[0]?.n || 0;
+    } catch (_) {}
+    res.json({ gate, pendingSuggestions: pendingCount, ts: Date.now() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/risk-capacity', async (_req, res) => {
   try {
     const varStressService = require('./services/varStressService');

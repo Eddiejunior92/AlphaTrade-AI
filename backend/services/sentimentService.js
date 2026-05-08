@@ -353,7 +353,49 @@ function blendProviderResults(symbol, providerResults) {
   };
 }
 
+// Per-symbol per-UTC-day hard cap on LLM sentiment fetches. Ensures we
+// never spend more than (PROVIDERS.length × MAX_DAILY_CALLS_PER_SYMBOL)
+// LLM calls on any single symbol's sentiment in a 24-hour window. The
+// TTL+price-stable cache covers the in-day cadence; this is the safety
+// net against unexpected high-frequency calls (e.g. a buggy refresher
+// loop or a watchlist that suddenly grew). Falls open on DB error so
+// sentiment can never be wedged by an infrastructure hiccup.
+const MAX_DAILY_CALLS_PER_SYMBOL = parseInt(process.env.SENTIMENT_MAX_DAILY_CALLS_PER_SYMBOL || '1');
+let _db = null;
+function _getDb() { if (_db === null) { try { _db = require('./db'); } catch (_) { _db = false; } } return _db || null; }
+async function _getDailyCallCount(symbol) {
+  const db = _getDb(); if (!db) return 0;
+  try {
+    const r = await db.query(`
+      SELECT n_calls FROM sentiment_daily_calls
+      WHERE symbol = $1 AND utc_date = CURRENT_DATE
+    `, [symbol]);
+    return r.rows[0]?.n_calls || 0;
+  } catch (_) { return 0; }
+}
+async function _incrementDailyCallCount(symbol) {
+  const db = _getDb(); if (!db) return;
+  try {
+    await db.query(`
+      INSERT INTO sentiment_daily_calls (symbol, utc_date, n_calls, last_at)
+      VALUES ($1, CURRENT_DATE, 1, NOW())
+      ON CONFLICT (symbol, utc_date) DO UPDATE SET
+        n_calls = sentiment_daily_calls.n_calls + 1, last_at = NOW()
+    `, [symbol]);
+  } catch (_) { /* swallow */ }
+}
+
 async function fetchFresh(symbol) {
+  // Per-day cap check — if we've already done MAX_DAILY_CALLS_PER_SYMBOL
+  // ensemble calls today for this symbol, return whatever's cached (stale
+  // OR fresh) instead of issuing another one. Cost-control hard cap.
+  const dailyCount = await _getDailyCallCount(symbol);
+  if (dailyCount >= MAX_DAILY_CALLS_PER_SYMBOL) {
+    const cached = cache.get(symbol);
+    if (cached) return { ...cached.data, cached: true, dailyCapHit: true, ageMs: Date.now() - cached.ts };
+    // Nothing cached AND cap hit — degrade to neutral default with a tag.
+    return { ...defaultPayload(symbol, `Daily LLM cap reached (${dailyCount}/${MAX_DAILY_CALLS_PER_SYMBOL})`), dailyCapHit: true };
+  }
   const prompt = buildPrompt(symbol);
   const market = marketRegistry.getSymbolInfo(symbol)?.market || 'US';
   // Fan out to all providers in parallel; allSettled so one slow/failed
@@ -369,7 +411,11 @@ async function fetchFresh(symbol) {
     console.warn(`[Sentiment:${symbol}] ${failed.length}/${PROVIDERS.length} providers failed: ` +
       failed.map(r => `${r.id}=${r.reason}`).join('; '));
   }
-  return blendProviderResults(symbol, results);
+  const blended = blendProviderResults(symbol, results);
+  // Increment per-day counter only when at least one provider responded
+  // — otherwise we shouldn't burn the cap on a no-op outage.
+  if (results.some(r => r.ok)) await _incrementDailyCallCount(symbol);
+  return blended;
 }
 
 async function getSentiment(symbol, { force = false, currentPrice = null } = {}) {

@@ -494,6 +494,29 @@ async function runDailyPerformanceJob({ tradingDate, perfMetrics, sendDiscord = 
     catch (e) { discordError = e.message; console.error('[DailyPerf] Discord send failed:', e.message); }
   }
 
+  // -------------------------------------------------------------------------
+  // Smart Safety Layer hooks — fire AFTER Discord report, best-effort:
+  //   1. Auto-adaptive gate evaluation (3-day rolling win-rate pin)
+  //   2. Daily meta-review (council deliberation → numbered suggestions)
+  // Both swallow errors so a hiccup in either never breaks the daily report.
+  // -------------------------------------------------------------------------
+  if (market === 'US' || !market) {
+    try {
+      const dynamicGate = require('./dynamicGateService');
+      const gateRes = await dynamicGate.evaluateAutoAdaptive({});
+      console.log('[DailyPerf] auto-adaptive gate:', JSON.stringify(gateRes));
+    } catch (e) {
+      console.error('[DailyPerf] auto-adaptive gate failed:', e.message);
+    }
+    try {
+      const metaReview = require('./metaReviewService');
+      const reviewRes = await metaReview.runReview(market || 'US');
+      console.log('[DailyPerf] meta-review:', reviewRes.ok ? `${reviewRes.suggestions?.length || 0} suggestions posted` : `failed: ${reviewRes.reason}`);
+    } catch (e) {
+      console.error('[DailyPerf] meta-review failed:', e.message);
+    }
+  }
+
   return {
     success: !storeError && !discordError,
     stage: storeError ? 'store_failed' : (discordError ? 'discord_failed' : 'ok'),

@@ -66,16 +66,39 @@ async function checkCircuitBreaker(equity) {
   return { tripped: portfolio.circuit_breaker, drawdown, lossUSD };
 }
 
+// Hard safety floor — even the dynamic gate (Smart Safety Layer) can never
+// authorise a confidence threshold below this value. Defence-in-depth: the
+// dynamicGateService also clamps at this floor at its source, but we re-check
+// here so a buggy upstream caller can't bypass safety by passing a lower
+// gateOverride. NEVER lower this constant.
+const SAFETY_FLOOR = 0.65;
+const SAFETY_CEIL  = 0.90;
+
 function checkQuorum(signal, sc, opts = {}) {
   // Regime meta layer can ONLY tighten — never lower — the confidence gate.
   // We take max(base, base + boost) with boost ≥ 0 enforced at the source
   // (metaLearningService returns boost in [0, 0.10]). This double-defense
   // means a buggy upstream value can't accidentally relax safety.
   const boost = Math.max(0, Number(opts.confidenceBoost) || 0);
-  const effectiveThreshold = sc.confidenceThreshold + boost;
+  // Smart Safety Layer — dynamic gate override. When provided, REPLACES the
+  // strategy's static confidenceThreshold as the BASE gate (existing boosts
+  // still tighten on top). Hard-clamped to [SAFETY_FLOOR, SAFETY_CEIL] here
+  // as defence-in-depth — even if the source ever passes a value outside
+  // this band, this clamp guarantees the gate cannot go below 0.65 or above
+  // 0.90. SAFETY_FLOOR is the absolute minimum quorum stringency permitted.
+  let baseGate = sc.confidenceThreshold;
+  if (Number.isFinite(opts.gateOverride)) {
+    baseGate = Math.max(SAFETY_FLOOR, Math.min(SAFETY_CEIL, opts.gateOverride));
+  } else {
+    // Even without an override, never let a misconfigured static threshold
+    // dip below the safety floor.
+    baseGate = Math.max(SAFETY_FLOOR, baseGate);
+  }
+  const effectiveThreshold = baseGate + boost;
   if (signal.confidence < effectiveThreshold) {
     const tag = boost > 0 ? ` (regime +${(boost * 100).toFixed(0)}pp)` : '';
-    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(effectiveThreshold * 100).toFixed(1)}% gate${tag}` };
+    const gateTag = Number.isFinite(opts.gateOverride) ? ` [dyn-gate ${(baseGate*100).toFixed(0)}%]` : '';
+    return { ok: false, reason: `Avg confidence ${(signal.confidence * 100).toFixed(1)}% < ${(effectiveThreshold * 100).toFixed(1)}% gate${tag}${gateTag}` };
   }
   const agreement = signal.agreementCount ?? 0;
   if (agreement < sc.minDirectionalAgreement) {
@@ -161,7 +184,13 @@ async function evaluateBuy({ symbol, signal, price, equity, cash, holdings, stra
   // Source clamps boost to ≤5pp; we re-floor at 0 here as defence-in-depth so
   // a buggy upstream value can never RELAX the threshold.
   const macroBoost = Math.max(0, Number(dynForGate.macroAdjust?.confidenceBoost) || 0);
-  const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost + macroBoost });
+  // Smart Safety Layer — dynamic gate override (clamped 0.65-0.90 inside
+  // checkQuorum as defence-in-depth). Council can suggest a delta to the
+  // base gate; auto-adaptive 3-day win-rate guard can pin it upward when
+  // we're in a losing streak. If absent, the strategy's static threshold
+  // is used (still re-floored to 0.65 inside checkQuorum).
+  const gateOverride = Number.isFinite(dynForGate.gateOverride) ? dynForGate.gateOverride : undefined;
+  const q = checkQuorum(signal, sc, { confidenceBoost: regimeBoost + macroBoost, gateOverride });
   if (!q.ok) return { allow: false, reason: q.reason };
   // Automated Strategy Discovery overlays — operator-applied additive filters.
   // Strictly TIGHTENING: can only return allow:false (downgrade BUY→HOLD),
@@ -343,6 +372,7 @@ module.exports = {
   effectiveDailyLossBudget,
   computeDynamicScaling, computeTargetRisk,
   computeTrailingUpdate,
+  SAFETY_FLOOR, SAFETY_CEIL,
   // tunables exported for UI introspection
-  tunables: { GROWTH_STEP, GROWTH_BUMP, GROWTH_MIN, GROWTH_MAX, PERF_TRADE_WINDOW, PERF_GAIN_GAIN, PERF_MIN, PERF_MAX, ABS_RISK_CEILING_MULT },
+  tunables: { GROWTH_STEP, GROWTH_BUMP, GROWTH_MIN, GROWTH_MAX, PERF_TRADE_WINDOW, PERF_GAIN_GAIN, PERF_MIN, PERF_MAX, ABS_RISK_CEILING_MULT, SAFETY_FLOOR, SAFETY_CEIL },
 };

@@ -201,6 +201,74 @@ async function ensureSchema() {
     )
   `);
 
+  // -------------------------------------------------------------------------
+  // Master Intelligence Upgrade — new tables (May 2026)
+  // -------------------------------------------------------------------------
+  // Per-(task_type, model_id) router perf — drives llmRouterService.pickModel.
+  await query(`
+    CREATE TABLE IF NOT EXISTS llm_router_perf (
+      task_type        TEXT NOT NULL,
+      model_id         TEXT NOT NULL,
+      n_calls          INTEGER NOT NULL DEFAULT 0,
+      n_success        INTEGER NOT NULL DEFAULT 0,
+      avg_quality      DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+      last_success_at  TIMESTAMPTZ,
+      last_error_at    TIMESTAMPTZ,
+      last_latency_ms  INTEGER,
+      PRIMARY KEY (task_type, model_id)
+    )
+  `);
+  // Dynamic gate state — append-only history of gate adjustments (council
+  // suggestions + auto-adaptive pin changes). The latest row is the active
+  // state. Hard-clamped to [0.65, 0.90] in dynamicGateService.
+  await query(`
+    CREATE TABLE IF NOT EXISTS dynamic_gate_state (
+      id              SERIAL PRIMARY KEY,
+      base_gate       NUMERIC(4,3) NOT NULL DEFAULT 0.80,
+      council_delta   NUMERIC(5,3) NOT NULL DEFAULT 0,
+      pinned          BOOLEAN NOT NULL DEFAULT FALSE,
+      pin_value       NUMERIC(4,3),
+      pin_reason      TEXT,
+      source          TEXT,
+      reason          TEXT,
+      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS dynamic_gate_state_updated_idx ON dynamic_gate_state (updated_at DESC)`);
+  // Pending suggestions from the daily meta-review. Operator approves/rejects
+  // each via Discord. Status flow: pending → applied | rejected | failed.
+  // Only suggestions whose target_key is in discordApprovalService.SAFE_KEYS
+  // can ever be 'applied' — the rest get auto-rejected by applySuggestion.
+  await query(`
+    CREATE TABLE IF NOT EXISTS pending_suggestions (
+      id            SERIAL PRIMARY KEY,
+      title         TEXT NOT NULL,
+      target_key    TEXT NOT NULL,
+      target_value  TEXT NOT NULL,
+      impact        TEXT,
+      effort        TEXT,
+      confidence    NUMERIC(4,3),
+      rationale     TEXT,
+      source        TEXT,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      apply_result  JSONB,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      applied_at    TIMESTAMPTZ
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS pending_suggestions_status_idx ON pending_suggestions (status, created_at DESC)`);
+  // Per-symbol, per-day sentiment-LLM call counter. Used by sentimentService
+  // to enforce the hard cap of 1 LLM ensemble call per symbol per UTC day.
+  await query(`
+    CREATE TABLE IF NOT EXISTS sentiment_daily_calls (
+      symbol     TEXT NOT NULL,
+      utc_date   DATE NOT NULL,
+      n_calls    INTEGER NOT NULL DEFAULT 0,
+      last_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (symbol, utc_date)
+    )
+  `);
+
   // Regime-aware meta-learning layer (metaLearningService) — per-regime,
   // per-strategy closed-trade rollup. Drives the regime-conditional
   // confidence-threshold tightening and sizing nudge.
