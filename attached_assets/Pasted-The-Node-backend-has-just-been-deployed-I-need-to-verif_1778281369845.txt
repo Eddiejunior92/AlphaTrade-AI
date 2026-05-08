@@ -1,0 +1,34 @@
+The Node backend has just been deployed. I need to verify the boot sequence completed cleanly and re-capture the baseline now that schema migrations have run. This is read-only diagnostic — do not modify any code or data.
+	1.	Read the most recent deploy logs (last 200 lines from the deployment, not the Vite frontend). Look for and report whether each of the following log lines appeared:
+	•	[SCHEMA-OK] T002 tables verified: llm_router_perf, dynamic_gate_state, pending_suggestions, sentiment_daily_calls
+	•	[SCHEMA-MISSING] (any occurrence — this would be a problem, report the table name)
+	•	[DYNAMIC-GATE] inserted default state row (base_gate=0.8) — first boot only, may not appear if a row already existed
+	•	[DYNAMIC-GATE] state row present — boot init skipped — appears on subsequent boots
+	•	[DISCORD-APPROVERS] parsed N approver IDs — report the actual N
+	•	[DISCORD-APPROVERS] WARNING: zero approvers configured (this would be a problem)
+	•	[Boot] runtimeConfig warmed (or equivalent log line)
+	•	First Cycle complete or [Agent] cycle log line — confirms the trading loop started
+Quote the actual log lines you find. If any expected line is missing, say so explicitly.
+	2.	Run the following read-only queries against the production Postgres DB and capture results:
+	•	SELECT NOW() AS captured_at;
+	•	SELECT cash_balance, starting_balance, day_start_equity, agent_running, circuit_breaker, emergency_pause, trading_mode FROM portfolio;
+	•	SELECT * FROM dynamic_gate_state ORDER BY id DESC LIMIT 1;
+	•	SELECT COUNT(*) AS dynamic_gate_rows FROM dynamic_gate_state;
+	•	SELECT COUNT(*) AS expectancy_rows FROM symbol_expectancy;
+	•	SELECT COUNT(*) AS calibration_rows FROM calibration_history;
+	•	SELECT COUNT(*) AS pending_suggestions FROM pending_suggestions WHERE status=‘pending’;
+	•	SELECT COUNT(*) AS sentiment_cache_rows FROM sentiment_cache;
+	•	SELECT COUNT(*) AS llm_router_perf_rows FROM llm_router_perf;
+	•	SELECT COUNT(*) AS sentiment_daily_calls_rows FROM sentiment_daily_calls;
+	•	SELECT event_type, payload, created_at FROM audit_log WHERE event_type IN (‘DYNAMIC_GATE_INITIALISED’, ‘POSITION_CAP_INCREASED’, ‘SCHEMA_VERIFIED’) ORDER BY id DESC LIMIT 10;
+	•	SELECT COUNT(*) AS audit_rows, MAX(id) AS latest_audit_id FROM audit_log;
+	•	SELECT COUNT(*) AS trades_today FROM trades WHERE created_at::date = CURRENT_DATE;
+	3.	Format the results as a markdown report. Save to a new file at the repo root: BASELINE_POST_DEPLOY_2026-05-08.md
+	4.	The report should include three sections:
+Section 1 — Boot log verification: which expected log lines were found, which were missing, and any unexpected errors or warnings in the boot sequence.
+Section 2 — Schema state: confirmation that each Phase A.5 and Phase B table now exists and is queryable. For tables that should be empty (symbol_expectancy, calibration_history, pending_suggestions), confirm count is zero. For dynamic_gate_state, confirm exactly one row with source=‘boot_init’. For sentiment_cache, llm_router_perf, sentiment_daily_calls, report current row counts (these may be non-zero if cycles have already fired).
+Section 3 — Observation window start: report the timestamp of the first runCycle log entry after the deploy. This timestamp is the official T-zero for the 14-day kill-criteria window committed in OPERATOR_KILL_CRITERIA.md.
+	5.	Reply with the full contents of BASELINE_POST_DEPLOY_2026-05-08.md so I can review.
+If anything looks wrong in the boot sequence — missing tables, missing log lines, errors during ensureSchema, zero approvers, etc. — flag it explicitly in Section 1 with the word PROBLEM in caps. Do not attempt to fix anything; reporting only.
+If the boot sequence completed cleanly with all expected log lines present, conclude the report with: “Boot verification complete. Observation window T-zero: [timestamp].”
+Do not modify any other files. Do not run any other code.
