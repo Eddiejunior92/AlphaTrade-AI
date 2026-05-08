@@ -1,0 +1,280 @@
+Phase A and Phase A.5 are complete. The schema is migrated, the Discord governance loop actually works, the SAFE_KEYS are wired through runtimeConfig, and riskManager.js is byte-for-byte unchanged. This phase adds the intelligence upgrade itself: smart cache, regime meta-layer, Adversarial Analyst, multi-timeframe consensus, asymmetric sizing, per-symbol expectancy auto-suspend, calibration audit, and unit tests for the new math.
+Trading mode is PAPER on US and ASX. New features ship enabled by default. After deploy, the operator will paper-trade for at least 2 weeks before considering live.
+Do not modify safety-critical code: riskManager.js core math (the function bodies of computeDynamicScaling, computeTargetRisk, evaluateBuy, evaluateSell, evaluateStops, computeTrailingUpdate, checkQuorum, checkCircuitBreaker), the audit chain in db.js (recordAudit and verifyAuditChain), the kill switch logic in agent.js, atomic cash logic, or any DENIED_KEYS parameters. You may READ from these freely. You may add NEW arguments to riskManager functions only by extending optional parameters with defaults that preserve existing behaviour when unset.
+Defence-in-depth on gate clamping at read time must be preserved. The 65% floor and 90% ceiling are hard-clamped in getCurrentGate() and that must remain untouched.
+Architecture preference: when adding new logic, prefer adding helpers to existing services or creating focused new service files. Do not add 200+ lines of new logic to agent.js. The 3,116-line god-file is an existing tech debt; this phase should not make it worse.
+Test scaffolding: this phase adds Vitest. Test files live under tests/ at the repo root. Only the new math added in this phase needs tests. Existing untested code stays untested for now.
+TASK 1 — Set up Vitest
+Add Vitest to the project for unit testing the new math.
+	1.	Add vitest as a devDependency in the root package.json. Pin to a recent stable version.
+	2.	Add npm scripts: test (runs vitest run), test:watch (runs vitest), test:ui (runs vitest –ui).
+	3.	Create vitest.config.js at the repo root with: globals: false, environment: ‘node’, include: [‘tests/**/*.test.js’], testTimeout: 5000, no setup files needed.
+	4.	Create the tests/ directory at repo root. Add a tests/README.md explaining: what’s tested (new math from Phase B only), why other code isn’t tested (existing tech debt), how to run.
+	5.	Create a placeholder tests/smoke.test.js with one test that imports from backend/services/runtimeConfig.js and asserts the module loads without throwing. This proves the test runner can resolve the existing codebase.
+	6.	Run npm test once and confirm the smoke test passes. If module resolution fails because of ESM/CJS mismatch, fix the vitest config (most likely server.js is CJS — match that).
+Output a Section 1 in the report confirming all tests pass.
+TASK 2 — Smart cache for hybrid signal
+The hybrid signal pipeline currently re-runs the full 60/30/10 evaluation every cycle for every symbol. Most cycles produce identical results because indicator values barely move. A small cache eliminates redundant LLM escalations.
+Create a new file backend/services/hybridCacheService.js with this surface:
+	•	getCachedDecision(cacheKey) → { route, signal, cachedAt } | null
+	•	setCachedDecision(cacheKey, route, signal) → void
+	•	buildCacheKey({ symbol, regime, rsi, vwapDistance }) → string
+	•	invalidateCacheForSymbol(symbol) → void (used after trade execution)
+	•	getCacheStats() → { size, hitsToday, missesToday, hitRate }
+Cache key format: {regime}|rsi{vwapBucket} where:
+	•	rsiBucket = Math.floor(rsi / 10) * 10 (so 47.3 becomes 40, 52.1 becomes 50)
+	•	vwapBucket = Math.round(vwapDistance * 200) / 200 (so 0.0073 becomes 0.005, 0.012 becomes 0.010)
+	•	regime is the discrete label from regimeService (RISK_ON, RISK_OFF, NEUTRAL, etc.)
+TTL: 120 minutes. Implementation: in-process Map with timestamp. Eviction on read when expires_at < now. Maximum 5,000 entries; LRU eviction on insert when at limit.
+Cache scope: only cache the decideRoute() output AND the buildStatisticalSignal() / buildHoldSignal() output. Do NOT cache full Council deliberations — those are too expensive to risk staleness on.
+Wire into hybridSignalService.js: at the top of the route-decision logic, compute the cache key and check getCachedDecision(). On hit, return the cached route + signal directly. On miss, run the full pipeline, then setCachedDecision() with the result before returning.
+Cache invalidation hooks:
+	•	On any trade execution for a symbol, call invalidateCacheForSymbol(symbol). Wire this into agent.js’s executeOrder() success path.
+	•	On regime transition (regimeService publishes a different label than the previous cycle), invalidate the entire cache. Wire this in agent.js where regime is read each cycle.
+	•	On any Discord-approved config change to confidence_gate_base, invalidate. Wire this into discordApprovalService.js after invalidateRuntimeConfig().
+Stats: track hitsToday and missesToday (in-process counters, reset at daily reset in dailyReset()). Expose via a new endpoint GET /api/hybrid/cache-stats in server.js (gated by requireOperator).
+Tests in tests/hybridCache.test.js:
+	•	buildCacheKey produces stable keys for stable inputs (idempotent)
+	•	buildCacheKey distinguishes inputs that should be distinct (different symbol, different RSI bucket, different VWAP bucket)
+	•	get returns null on miss, returns cached value on hit
+	•	TTL expiry: set, advance time (use vi.useFakeTimers), get returns null after 121 minutes
+	•	LRU eviction: fill to 5,000, insert one more, oldest is evicted
+	•	invalidateCacheForSymbol removes only that symbol’s entries
+Documentation: in the file header, note that this cache is in-process only. A backend restart wipes it. This is acceptable because the upstream signals will quickly re-populate it within the first few cycles after restart.
+TASK 3 — Regime meta-layer (raise-only)
+Wire regimeService into dynamicGateService so that high-volatility or correlation-spike regimes can RAISE the confidence gate. The regime meta-layer can never lower the gate — only tighten safety.
+Add a new function to dynamicGateService.js:
+computeRegimeAdjustment(regimeData) → number (always >= 0)
+regimeData is the object returned by regimeService.getCurrentRegime() (or equivalent — read regimeService to find the actual API). The adjustment rules:
+	•	Default: 0 (no adjustment)
+	•	If regime label is HIGH_VOLATILITY or VIX_SPIKE: +0.05
+	•	If regime label is CORRELATION_SPIKE or RISK_OFF: +0.05
+	•	If both conditions are true: +0.08 (capped, not additive to +0.10 which would push over the ceiling)
+	•	If statistical confidence in regime classification is below 0.7: 0 (don’t trust ambiguous signals)
+Important: this function returns the RAISE delta only. The actual gate computation is in getCurrentGate() and that’s where it gets composed with the base_gate, council_delta, and pin logic.
+Modify getCurrentGate() in dynamicGateService.js:
+The existing function returns clamp(base_gate + council_delta, [0.65, 0.90]) with pin override if active. The new behaviour:
+effectiveGate = base_gate + council_delta + regimeAdjustment
+clamped = clamp(effectiveGate, [0.65, 0.90])
+finalGate = pinned ? max(clamped, pin_value) : clamped
+Critical invariants — assert these in code with descriptive errors:
+	•	regimeAdjustment >= 0 (never negative — would loosen the gate)
+	•	finalGate >= 0.65 (defence-in-depth)
+	•	finalGate <= 0.90 (defence-in-depth)
+	•	If pinned, finalGate >= pin_value (pin can’t be undermined by regime drop)
+Read the regime once per call. If regimeService throws or returns null, regimeAdjustment defaults to 0. Trading must never be blocked by a regime read failure. Log [REGIME-ADJUST] failure: <reason> on errors.
+Logging: when regimeAdjustment changes from the previous cycle’s value, log [GATE-REGIME] adjustment 0.00 -> 0.05 (HIGH_VOLATILITY). Don’t log on every cycle; only on transitions, like the strategy overlay logging in Phase A.5.
+Expose adjustment in getStatus() output: add regimeAdjustment, regimeLabel, regimeConfidence fields.
+Tests in tests/regimeAdjustment.test.js:
+	•	0 adjustment when regime is null/undefined
+	•	0 adjustment when regime is NEUTRAL or RISK_ON
+	•	+0.05 for HIGH_VOLATILITY
+	•	+0.05 for RISK_OFF
+	•	+0.08 for both HIGH_VOLATILITY and RISK_OFF
+	•	0 when regime confidence < 0.7 regardless of label
+	•	Effective gate respects clamp: base 0.85 + regime 0.08 = 0.93, clamps to 0.90
+	•	Effective gate respects pin: pinned at 0.85, regime adds 0.05, returns 0.90 (pin floor + regime, clamped)
+	•	Negative adjustments are rejected (assertion fires) — this should never happen but the test proves the invariant
+TASK 4 — Adversarial Analyst (8th Council role)
+Add Adversarial Analyst to councilService.js. Council goes from 6 specialists + 1 Judge to 7 specialists + 1 Judge. Cost increases by approximately $0.005 per Council deliberation (router-adjusted), or about $20/mo at current cycle volume.
+In councilService.js:
+	1.	Add the new ROLES entry. Place it AFTER Future Prediction in the ROLES array so it deliberates with full context of the existing six analyst verdicts not yet visible (they run in parallel via Promise.all, so this is ordering for readability only). Role definition:
+	•	id: ‘adversarial’
+	•	taskType: ‘council_adversarial’
+	•	displayName: ‘Adversarial Analyst’
+	•	pool: [‘claude’, ‘gpt4o’, ‘grok’, ‘gemini’] — Claude first because adversarial reasoning is one of its strongest modes
+	•	systemPrompt: must instruct the model to actively look for failure modes, contradictions in the bullish thesis, hidden risks, base-rate concerns, and reasons the trade fails. Tell it explicitly: “Your job is not to be balanced. Your job is to find the strongest case AGAINST this trade. If the trade fails, why?” Also instruct: “If you cannot find a meaningful failure mode, vote HOLD with low confidence and explain why the bull case is robust.”
+	2.	Update the Judge’s system prompt at council_judge to weight Adversarial input. Specifically: “The ADVERSARIAL analyst’s argument deserves serious weight — they are tasked with finding failure modes and their concerns should not be casually dismissed. If Adversarial raises a concrete, verifiable risk, this should lower confidence even if other analysts are bullish.”
+	3.	Update the deliberate(ctx) Promise.all to include the Adversarial role. Verify quorum still works: ROLES.length will be 7 (excluding Judge), so verdicts.length >= ROLES.length / 2 means at least 4 verdicts required to proceed. This is strictly more conservative than before.
+	4.	Cost projection update: the brochure financials assumed 6 specialists + Judge. Add a comment block at the top of deliberate() noting the new 7+1 cost structure with router-adjusted estimate ~$0.045-$0.050 per deliberation.
+	5.	Test in tests/councilRoles.test.js (mock _callModel):
+	•	All 8 roles run when deliberate() is called (verify by counting mock invocations)
+	•	Quorum requires >= 4 verdicts (test rejects when only 3 succeed)
+	•	Adversarial vote with HIGH confidence pushes Judge confidence down (verify via Judge prompt — this is a prompt-level test, just confirm the Judge system prompt mentions Adversarial)
+	•	If Adversarial throws/times out, the other 7 roles still produce a verdict and Judge proceeds (graceful degradation)
+TASK 5 — Multi-timeframe consensus for Technical Analyst
+Currently the Technical Analyst votes once based on a single timeframe of indicators. Multi-timeframe consensus requires the analyst to consider 5m, 15m, and 1h alignment.
+This task is implemented in two parts: a data prep step and a prompt update.
+Data prep — in agent.js’s analyzeAndTradeSymbol or wherever indicators are gathered for Council context:
+	1.	When building the context object passed to councilService.deliberate(), add an indicators_mtf field with three sub-objects: tf_5m, tf_15m, tf_1h. Each contains: rsi, vwap, vwapDistance, momentum, trend (UP/DOWN/SIDEWAYS).
+	2.	If indicators are not available for one or more timeframes (e.g. early market open), set that timeframe’s value to null and the analyst will note its absence.
+	3.	Compute a derived field mtfConsensus: if 2 of 3 timeframes show same trend label, return that trend with consensus=‘2of3’. If all 3 agree, consensus=‘3of3’. Otherwise consensus=‘split’, trend=‘SIDEWAYS’.
+Prompt update — in councilService.js, modify the Technical Analyst’s system prompt to:
+	1.	Explicitly mention the three timeframes (5m, 15m, 1h) and the mtfConsensus field.
+	2.	Instruct: “Vote BUY only if at least 2 of 3 timeframes show UP consensus. Vote SELL only if at least 2 of 3 show DOWN. Otherwise HOLD. Confidence should reflect alignment strength: 3of3 alignment = high confidence, 2of3 = moderate, split = always HOLD.”
+If you cannot easily fetch 5m/15m/1h bars from the existing alpacaService without restructuring, use the existing single-timeframe data and stub the other two as null with a TODO comment. Document this clearly. The Technical Analyst’s prompt should still mention the framework even if data is partial — the model will note unavailability in its reasoning.
+Tests in tests/mtfConsensus.test.js:
+	•	Pure-function test of the mtfConsensus computation
+	•	3 UP timeframes → ‘3of3’, UP
+	•	2 UP, 1 SIDEWAYS → ‘2of3’, UP
+	•	1 UP, 1 DOWN, 1 SIDEWAYS → ‘split’, SIDEWAYS
+	•	Two timeframes null, one UP → ‘split’ (insufficient data)
+	•	All null → ‘split’ (no data)
+TASK 6 — Asymmetric sizing by confidence
+Currently position size is computed as a fixed percentage of equity (4% for day, 5% for swing). The new behaviour scales position size by Council confidence: higher confidence = larger size, within hard caps.
+Formula: positionSize = 1.0 + 2.0 * ((confidence - 0.65) / 0.25), clamped to [1.0%, 3.0%]
+Where confidence is the Judge’s final confidence from Council deliberation, expressed as a fraction (0.65 to 0.90). Examples:
+	•	confidence 0.65 → size 1.0%
+	•	confidence 0.75 → size 1.8%
+	•	confidence 0.85 → size 2.6%
+	•	confidence 0.90 → size 3.0% (clamped — the hard cap)
+This applies ONLY to day strategies (day, asx_day). Swing strategies keep their existing literal sizing (5% for swing, 5% for asx_swing).
+Important: this REPLACES the existing 4% per-name cap on day strategies in normal operation, but the 4% cap (now reconciled to 3% — see Task 8) still acts as a hard ceiling. Defence-in-depth: even if the formula returns a value outside [1%, 3%] due to a bug, the existing position-cap math in riskManager.js (qty = min(qtyByRisk, qtyByPosition)) still enforces the strategy’s maxPositionPct.
+Implementation approach:
+	1.	Create a new helper function in a new file backend/services/positionSizingService.js: computeAsymmetricSize(confidence, baseStrategy) → number (decimal percentage).
+	•	If baseStrategy.name is not ‘day’ and not ‘asx_day’, return baseStrategy.maxPositionPct unchanged (swing pass-through).
+	•	If confidence is null/undefined/NaN, return 0.01 (the floor — fail safe small).
+	•	Apply the formula, clamp to [0.01, 0.03].
+	2.	The existing flow is: agent.js builds sc via buildStrategyConfig(), passes sc into riskManager.evaluateBuy(). Modify agent.js so that for day/asx_day strategies, it overlays the asymmetric size onto sc.maxPositionPct BEFORE calling evaluateBuy. The overlay happens after Council deliberation when confidence is known, in the call site between Council and evaluateBuy.
+	3.	Do not modify riskManager.js. The function continues to read sc.maxPositionPct as before — it just receives a different value depending on confidence.
+	4.	Statistical-only signals (where _statisticalOnly: true and agreementCount: 1) should NOT receive asymmetric sizing — they fail quorum by design and never reach evaluateBuy with a BUY signal. This is preserved automatically since the overlay only applies to Council-driven BUYs. Verify by inspection.
+	5.	Logging: when sizing differs from base, log [SIZING] AAPL day: confidence 0.82 → size 2.36% (base 0.04). Log per trade decision, not per cycle.
+	6.	Defence-in-depth: in agent.js after computing the asymmetric size but before calling evaluateBuy, assert the result is within [0.005, 0.05] (broader than the formula range to allow for future rule changes). If out of range, log a critical error, fall back to base, and write an audit row event_type: ‘SIZING_BOUND_VIOLATED’.
+Tests in tests/positionSizing.test.js:
+	•	confidence 0.65 → 0.01
+	•	confidence 0.75 → 0.018
+	•	confidence 0.85 → 0.026
+	•	confidence 0.90 → 0.03 (clamped)
+	•	confidence 0.50 (below floor — shouldn’t happen but defensive) → 0.01
+	•	confidence 0.95 (above ceiling — shouldn’t happen but defensive) → 0.03
+	•	confidence null → 0.01
+	•	confidence NaN → 0.01
+	•	swing strategy pass-through: returns sc.maxPositionPct unchanged
+	•	formula is monotonic: size at 0.80 > size at 0.75 > size at 0.70
+TASK 7 — Per-symbol expectancy tracking with auto-suspend
+Track rolling expectancy per (symbol, strategy) pair. Auto-suspend any pair whose expectancy is negative across the last 30 closed trades. Suspension means: that pair cannot enter new trades. Existing positions are unaffected — they exit normally.
+New service: backend/services/expectancyService.js
+Surface:
+	•	recordTradeOutcome({ symbol, strategy, pnlPct }) → void (called from agent’s trade-close path)
+	•	getExpectancy(symbol, strategy) → { trades: number, winRate: number, avgWin: number, avgLoss: number, expectancy: number, suspended: boolean, suspensionReason: string | null }
+	•	isSuspended(symbol, strategy) → boolean (fast check, used in pre-trade hook)
+	•	listSuspended() → Array<{ symbol, strategy, since, expectancy }>
+	•	reinstate(symbol, strategy, operatorId) → void (manual reinstatement via Discord)
+Storage: new table symbol_expectancy in db.js ensureSchema:
+	•	id SERIAL PRIMARY KEY
+	•	symbol TEXT NOT NULL
+	•	strategy TEXT NOT NULL
+	•	last_30_pnls JSONB NOT NULL DEFAULT ‘[]’ (array of decimal percentages, oldest first)
+	•	expectancy NUMERIC
+	•	suspended BOOLEAN DEFAULT FALSE
+	•	suspended_at TIMESTAMPTZ
+	•	suspended_reason TEXT
+	•	updated_at TIMESTAMPTZ DEFAULT NOW()
+	•	UNIQUE(symbol, strategy)
+Index: (suspended) WHERE suspended = TRUE for fast listing.
+Expectancy formula (for each (symbol, strategy) row):
+expectancy = winRate * avgWin - lossRate * abs(avgLoss)
+Where winRate is fraction of trades with pnlPct > 0 in last 30. avgWin is mean of positive pnlPct, avgLoss is mean of negative pnlPct (absolute value).
+Auto-suspend trigger: in recordTradeOutcome, after appending the new pnl and trimming to last 30:
+	•	If trades < 30: don’t evaluate suspension yet (insufficient data)
+	•	If trades = 30 and expectancy < 0: set suspended = true, suspended_at = NOW(), suspended_reason = ‘negative_expectancy_30_trades’. Write audit row event_type: ‘SYMBOL_AUTO_SUSPENDED’ with payload including the 30 pnls.
+	•	If suspended = true and operator manually reinstates via Discord: clear suspension flags, write SYMBOL_REINSTATED audit row, BUT keep tracking — the next 30 trades determine whether it auto-suspends again.
+Wire into agent.js:
+	1.	On every trade close (executeOrder for SELL, or stop-out, or end-of-day flatten), call expectancyService.recordTradeOutcome with the realised pnl.
+	2.	Before entering a new BUY, call isSuspended(symbol, strategy). If suspended, skip the symbol with a TRADE_REJECTED audit row reason: ‘symbol_auto_suspended’. Do not proceed to Council.
+	3.	The check should happen after the killSwitch and circuitBreaker checks but before the hybrid signal computation — saves cost.
+Discord command: add a new command parser for Reinstate <SYMBOL> <strategy> in discordApprovalService.js. Auth: requires DISCORD_APPROVER_IDS membership. On success, calls expectancyService.reinstate() and writes the audit row.
+Tests in tests/expectancy.test.js:
+	•	recordTradeOutcome appends and trims to 30 (insert 35, verify only last 30 retained)
+	•	expectancy formula: 60% wins of 1% each, 40% losses of -1% each → 0.6 * 1 - 0.4 * 1 = 0.2
+	•	expectancy formula: 30% wins of 2% each, 70% losses of -1% each → 0.3 * 2 - 0.7 * 1 = -0.1
+	•	suspended after 30 trades with negative expectancy
+	•	not suspended at 29 trades even if expectancy is -0.5 (insufficient data)
+	•	reinstate clears suspension flags
+	•	after reinstate, the next 30 trades reset the evaluation window
+TASK 8 — Confidence calibration audit in meta-review
+Add a calibration check to the daily meta-review. After each US close, group closed trades by stated confidence bucket and compute actual win rate per bucket. Surface mismatches.
+In metaReviewService.js, add a new function calibrationAudit():
+	1.	Query the last 30 trading days of closed trades from the trades table.
+	2.	Bucket by stated confidence: [0.65, 0.70), [0.70, 0.75), [0.75, 0.80), [0.80, 0.85), [0.85, 0.90), [0.90, 1.00].
+	3.	For each bucket, compute: count, actualWinRate (fraction with pnl > 0), expectedWinRate (midpoint of bucket), divergence (actual - expected).
+	4.	Flag buckets where abs(divergence) > 0.10 AND count >= 10 trades (statistical significance threshold). Buckets with fewer than 10 trades are reported but not flagged.
+	5.	Track in a new table calibration_history (added to ensureSchema): date DATE, bucket_low NUMERIC, bucket_high NUMERIC, count INT, actual_win_rate NUMERIC, divergence NUMERIC, flagged BOOLEAN, recorded_at TIMESTAMPTZ DEFAULT NOW().
+	6.	If a bucket has been flagged for 5 consecutive trading days (query last 5 rows from calibration_history for that bucket), emit a config suggestion via discordApprovalService.addSuggestion: “Confidence bucket [X, Y) has been miscalibrated by Z% for 5 consecutive days (actual win rate W%). Consider recalibrating Judge confidence ranges.” NEVER auto-apply — operator must Approve via Discord.
+	7.	Post the daily calibration summary to Discord as part of the meta-review, with a markdown table showing each bucket’s actual vs. expected.
+Wire into runReview() in metaReviewService.js: call calibrationAudit() after the existing facts gathering, include the summary in the Discord post.
+Tests in tests/calibration.test.js (pure-function tests on the bucketing logic):
+	•	Bucket assignment: confidence 0.72 → [0.70, 0.75), confidence 0.85 → [0.85, 0.90)
+	•	Edge case: confidence exactly at boundary (0.70) → goes to [0.70, 0.75)
+	•	Divergence calculation: 60% actual, 75% expected (midpoint of [0.70, 0.80)) → -0.15
+	•	Flag triggered when divergence > 0.10 AND count >= 10
+	•	Flag NOT triggered when count < 10 (small sample)
+TASK 9 — Rename max_position_pct → max_position_pct_day
+The SAFE_KEY name max_position_pct is misleading because it only applies to day strategies (Section 9 finding from Phase A.5). Rename for clarity.
+	1.	In discordApprovalService.js: rename the SAFE_KEYS entry max_position_pct to max_position_pct_day. Update the description and example messages.
+	2.	In runtimeConfig.js: rename the property max_position_pct to max_position_pct_day. Update DEFAULTS, BOUNDS, and the JSDoc.
+	3.	In agent.js buildStrategyConfig: rename the read from rt.max_position_pct to rt.max_position_pct_day.
+	4.	The DB column portfolio.max_position_pct_day is already correctly named — no DB migration needed.
+	5.	Backwards compatibility: if any pending suggestion in pending_suggestions has target_key = ‘max_position_pct’, auto-rewrite it to ‘max_position_pct_day’ on read in discordApprovalService. Log a one-time deprecation warning [DEPRECATED] target_key ‘max_position_pct’ rewritten to ‘max_position_pct_day’.
+This is a pure rename. No behaviour changes. Add a brief test in tests/runtimeConfig.test.js confirming the new name resolves correctly through the fallback chain.
+VERIFICATION REPORT (mandatory)
+After completing all nine tasks, produce a single markdown report:
+Section 1 — Test scaffolding
+	•	Vitest version installed
+	•	Output of npm test (all tests passing)
+	•	Total test count and breakdown by file
+Section 2 — Hybrid cache
+	•	File path and line count
+	•	Cache key examples for 3 different inputs
+	•	Hit/miss invalidation hooks (where wired)
+	•	Cache stats endpoint URL and example response
+Section 3 — Regime meta-layer
+	•	Diff summary of dynamicGateService.js changes
+	•	Confirmation of the four invariants asserted in code (with line numbers)
+	•	Example log line for a regime transition
+	•	getStatus() output now includes the new fields
+Section 4 — Adversarial Analyst
+	•	Council role count: 8 specialists + 1 Judge = 9 LLM calls per deliberation
+	•	Quorum threshold: confirm verdicts.length >= 4
+	•	Updated cost projection (per deliberation, monthly at current cycle volume)
+	•	System prompt excerpt for Adversarial (first 200 chars)
+	•	Judge system prompt change excerpt
+Section 5 — Multi-timeframe consensus
+	•	Whether real 5m/15m/1h data is fetched or stubbed (be honest)
+	•	Pure function for mtfConsensus
+	•	Technical Analyst prompt update excerpt
+Section 6 — Asymmetric sizing
+	•	Formula with example calculations for confidence ∈ {0.65, 0.75, 0.85, 0.90}
+	•	File path of positionSizingService.js
+	•	Where the overlay happens in agent.js (file:line)
+	•	Defence-in-depth assertion location
+	•	Confirmation that statistical-only signals do NOT receive asymmetric sizing
+Section 7 — Per-symbol expectancy
+	•	Schema confirmation
+	•	Auto-suspend trigger logic (test of the threshold)
+	•	Discord Reinstate command location
+	•	Wiring point in agent.js (where isSuspended is called in the hot path)
+Section 8 — Calibration audit
+	•	Bucketing logic
+	•	5-day flag threshold logic
+	•	Where the suggestion is emitted (and confirmation it is NEVER auto-applied)
+	•	Sample Discord output format
+Section 9 — Rename
+	•	Confirmation of all rename sites
+	•	Backwards-compat handling for in-flight pending suggestions
+Section 10 — Files touched
+Complete list with one-line summary per file.
+Section 11 — Things you noticed
+Anything fragile, surprising, or worth fixing later. Be honest. If something is held together with duct tape, say so.
+Section 12 — What did NOT change
+Explicit confirmation that the following are byte-for-byte identical:
+	•	riskManager.js function bodies (computeDynamicScaling, computeTargetRisk, evaluateBuy, evaluateSell, evaluateStops, computeTrailingUpdate, checkQuorum, checkCircuitBreaker)
+	•	audit chain code in db.js (recordAudit, verifyAuditChain)
+	•	kill switch logic in agent.js
+	•	atomic cash logic
+	•	DENIED_KEYS list
+Section 13 — Paper trading verification plan
+A checklist for the operator to run during the 2-week paper trading window:
+	•	Daily: check deploy logs for [GATE-REGIME], [SIZING], [STRATEGY-OVERLAY] log lines — confirm they’re firing
+	•	After first week: query symbol_expectancy table — confirm rows exist for actively traded symbols
+	•	After first week: check calibration_history for any flagged buckets
+	•	Daily Discord meta-review: confirm calibration summary table appears
+	•	Spot-check: pick a Council deliberation from logs, verify all 8 analyst verdicts present
+	•	Verify: pick a high-confidence trade and a low-confidence trade from trades table, confirm the size matches the asymmetric formula
+CONSTRAINTS — re-emphasised
+	•	riskManager.js function bodies: do not modify. You may add new optional parameters with defaults.
+	•	Audit chain: do not modify. You may write new audit row event_types via the existing recordAudit function.
+	•	Tests cover NEW math only. Existing untested code stays untested.
+	•	If you find a tenth subtle bug, report it in Section 11. Do not fix outside scope.
+	•	All new features ship enabled by default (operator is paper-only).
+When the report is complete, stop and wait for further instructions.
