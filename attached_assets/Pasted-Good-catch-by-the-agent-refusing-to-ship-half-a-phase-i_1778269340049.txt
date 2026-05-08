@@ -1,0 +1,208 @@
+Good catch by the agent — refusing to ship half a phase is exactly the right instinct. Here’s the rest of the prompt as plain text, starting from where Task 5’s prompt update list was cut off. Paste this as a continuation message in the same Replit Agent conversation, so the agent has the original context plus this completion:
+
+Continuing the Phase B prompt from where Task 5’s prompt update list was cut off. Treat this as the rest of the same brief — Tasks 5 (completion), 6, 7, 8, 9, and the verification report.
+Task 5 — Multi-timeframe consensus, prompt update (continued):
+The Technical Analyst’s system prompt update should:
+	1.	Explicitly mention the three timeframes (5m, 15m, 1h) and the mtfConsensus field that you’ve added to the context.
+	2.	Instruct the model: “Vote BUY only if at least 2 of 3 timeframes show UP consensus. Vote SELL only if at least 2 of 3 show DOWN. Otherwise HOLD. Confidence should reflect alignment strength: 3of3 alignment justifies high confidence, 2of3 justifies moderate confidence, split must always be HOLD.”
+If you cannot easily fetch 5m/15m/1h bars from the existing alpacaService without restructuring core data flow, use the existing single-timeframe data and stub the other two as null with a clear TODO comment. Document this honestly in the verification report. The Technical Analyst’s prompt should still mention the framework even if data is partial — the model will note unavailability in its reasoning.
+Tests in tests/mtfConsensus.test.js — pure function tests on the consensus computation:
+	•	3 UP timeframes returns consensus=‘3of3’, trend=‘UP’
+	•	2 UP and 1 SIDEWAYS returns consensus=‘2of3’, trend=‘UP’
+	•	1 UP, 1 DOWN, 1 SIDEWAYS returns consensus=‘split’, trend=‘SIDEWAYS’
+	•	Two timeframes null and one UP returns consensus=‘split’ (insufficient data, do not vote on a single timeframe)
+	•	All three null returns consensus=‘split’
+TASK 6 — Asymmetric sizing by confidence
+Currently position size is a fixed percentage of equity (4% for day, 5% for swing). The new behaviour scales position size by Council confidence: higher Judge confidence equals larger position, within hard caps.
+Formula: positionSize = 1.0 + 2.0 * ((confidence - 0.65) / 0.25), clamped to [1.0%, 3.0%]
+Where confidence is the Judge’s final confidence from Council deliberation, expressed as a fraction (0.65 to 0.90). Worked examples:
+	•	confidence 0.65 returns size 1.0%
+	•	confidence 0.75 returns size 1.8%
+	•	confidence 0.85 returns size 2.6%
+	•	confidence 0.90 returns size 3.0% (clamped at the ceiling)
+This applies ONLY to day strategies (day, asx_day). Swing strategies (swing, asx_swing) keep their existing literal sizing of 5%.
+Important: the existing per-name cap on day strategies (currently 4% in strategies.js, being reconciled in Task 9) acts as a hard ceiling outside this formula. Defence-in-depth: even if the formula returns a value outside [1%, 3%] due to a bug, the existing position-cap math in riskManager.js (qty = min(qtyByRisk, qtyByPosition)) still enforces the strategy’s maxPositionPct. We are layering, not replacing.
+Implementation:
+	1.	Create a new file backend/services/positionSizingService.js. Single export computeAsymmetricSize(confidence, baseStrategy) returning a number (decimal percentage).
+	•	If baseStrategy.name is not ‘day’ and not ‘asx_day’, return baseStrategy.maxPositionPct unchanged. Swing pass-through.
+	•	If confidence is null, undefined, or NaN, return 0.01. Fail safe small.
+	•	Apply the formula. Clamp to [0.01, 0.03]. Return.
+	2.	Wire into agent.js. The existing flow is: agent.js builds sc via buildStrategyConfig() → passes sc into riskManager.evaluateBuy(). For day and asx_day strategies, after Council deliberation returns a Judge verdict with confidence, but BEFORE calling evaluateBuy, overlay the asymmetric size onto sc.maxPositionPct. The clone semantics from Phase A.5 apply — never mutate the base STRATEGIES literal, never mutate a sc that’s shared across strategies.
+	3.	Do not modify riskManager.js. The function continues to read sc.maxPositionPct as before. It just receives a different value depending on Council confidence. This preserves the architectural rule that riskManager is untouched.
+	4.	Statistical-only signals where _statisticalOnly: true and agreementCount: 1 must NOT receive asymmetric sizing. They fail the 3-of-N quorum by design and never reach evaluateBuy with a BUY signal. Verify by inspection that the overlay code path only fires after a successful Council BUY verdict, not on statistical-only signals.
+	5.	Logging: when sizing differs from base, log [SIZING] AAPL day: confidence 0.82 -> size 2.36% (base 0.04). Log per trade decision, not per cycle. Suppress when size equals base.
+	6.	Defence-in-depth: in agent.js, after computing the asymmetric size but BEFORE calling evaluateBuy, assert the result is within [0.005, 0.05] (broader than the formula’s [0.01, 0.03] range, to allow for future rule changes without retripping the assertion). If out of range, log a critical error, fall back to the base sc.maxPositionPct, and write an audit row event_type ‘SIZING_BOUND_VIOLATED’ with payload including the symbol, computed value, and the fallback used.
+Tests in tests/positionSizing.test.js:
+	•	confidence 0.65 returns 0.01
+	•	confidence 0.75 returns 0.018
+	•	confidence 0.85 returns 0.026
+	•	confidence 0.90 returns 0.03 (clamped)
+	•	confidence 0.50 (below floor — defensive case, shouldn’t happen) returns 0.01
+	•	confidence 0.95 (above ceiling — defensive case, shouldn’t happen) returns 0.03
+	•	confidence null returns 0.01
+	•	confidence NaN returns 0.01
+	•	swing strategy pass-through returns sc.maxPositionPct unchanged
+	•	monotonicity: size at 0.80 strictly greater than size at 0.75 strictly greater than size at 0.70
+TASK 7 — Per-symbol expectancy tracking with auto-suspend
+Track rolling expectancy per (symbol, strategy) pair. Auto-suspend any pair whose expectancy is negative across the last 30 closed trades. Suspension means: that pair cannot enter NEW trades. Existing positions are unaffected — they exit normally via stops, trailing, or end-of-day flatten.
+Create a new service backend/services/expectancyService.js with this surface:
+	•	recordTradeOutcome({ symbol, strategy, pnlPct }) returns void. Called from agent’s trade-close path.
+	•	getExpectancy(symbol, strategy) returns { trades, winRate, avgWin, avgLoss, expectancy, suspended, suspensionReason }
+	•	isSuspended(symbol, strategy) returns boolean. Fast check, used in pre-trade hook.
+	•	listSuspended() returns Array of { symbol, strategy, since, expectancy }
+	•	reinstate(symbol, strategy, operatorId) returns void. Manual reinstatement via Discord.
+New table symbol_expectancy in db.js ensureSchema:
+	•	id SERIAL PRIMARY KEY
+	•	symbol TEXT NOT NULL
+	•	strategy TEXT NOT NULL
+	•	last_30_pnls JSONB NOT NULL DEFAULT ‘[]’ (array of decimal percentages, oldest first)
+	•	expectancy NUMERIC
+	•	suspended BOOLEAN DEFAULT FALSE
+	•	suspended_at TIMESTAMPTZ
+	•	suspended_reason TEXT
+	•	updated_at TIMESTAMPTZ DEFAULT NOW()
+	•	UNIQUE(symbol, strategy)
+Index: CREATE INDEX idx_symbol_expectancy_suspended ON symbol_expectancy(suspended) WHERE suspended = TRUE — fast listing of suspended pairs without scanning the full table.
+Expectancy formula (computed inside recordTradeOutcome after each insert):
+	•	winRate = count(pnls > 0) / total
+	•	lossRate = count(pnls <= 0) / total
+	•	avgWin = mean(pnls where pnl > 0), or 0 if no wins
+	•	avgLoss = mean(abs(pnls) where pnl <= 0), or 0 if no losses
+	•	expectancy = (winRate * avgWin) - (lossRate * avgLoss)
+Auto-suspend trigger logic, inside recordTradeOutcome AFTER appending the new pnl and trimming to last 30:
+	•	If trades < 30: do not evaluate suspension. Insufficient data.
+	•	If trades = 30 and expectancy < 0 and not currently suspended: set suspended=true, suspended_at=NOW(), suspended_reason=‘negative_expectancy_30_trades’. Write audit row event_type ‘SYMBOL_AUTO_SUSPENDED’ with payload including the 30 pnls and the computed expectancy. Post a Discord notification via discordService.
+	•	If currently suspended: do nothing — operator must reinstate manually. Continue tracking pnls for future evaluation post-reinstatement.
+Reinstate behaviour:
+	•	Clears suspended, suspended_at, suspended_reason. Writes audit row event_type ‘SYMBOL_REINSTATED’ with payload including the operator ID.
+	•	Does NOT clear last_30_pnls. The next 30 trades determine whether it auto-suspends again. If reinstated when at 30 trades and still negative, the very next trade will re-evaluate — meaning it will auto-suspend again immediately after one more trade. This is intentional: the operator’s reinstate is a “give it one more chance” signal, not a permanent bypass.
+Wire into agent.js:
+	1.	On every trade close (executeOrder for SELL, stop-out path, end-of-day flatten path), call expectancyService.recordTradeOutcome({ symbol, strategy, pnlPct }) with the realised pnl. There may be multiple close paths — ensure all of them call this. The pnlPct is decimal (e.g. 0.012 for +1.2%).
+	2.	Before entering a new BUY, call isSuspended(symbol, strategy). If suspended, skip the symbol with a TRADE_REJECTED audit row payload.reason=‘symbol_auto_suspended’. Do not proceed to hybrid signal computation. The check should happen AFTER the killSwitch and circuitBreaker checks but BEFORE the hybrid signal computation. This saves cost.
+	3.	Discord command: add a new command parser for “Reinstate <SYMBOL> <strategy>” (case-insensitive) in discordApprovalService.js or discordChatService.js (whichever owns the command parsing). Auth: requires DISCORD_APPROVER_IDS membership, fail-closed semantics preserved. On success, calls expectancyService.reinstate() and replies with confirmation. On unauthorised, writes audit row ‘REINSTATE_UNAUTHORIZED’.
+Tests in tests/expectancy.test.js:
+	•	recordTradeOutcome appends and trims to 30 (insert 35 outcomes, verify only the most recent 30 are retained, verify ordering is oldest-first)
+	•	expectancy formula with 60% wins of 1% each and 40% losses of -1% each: 0.6 * 0.01 - 0.4 * 0.01 = 0.002
+	•	expectancy formula with 30% wins of 2% each and 70% losses of -1% each: 0.3 * 0.02 - 0.7 * 0.01 = -0.001
+	•	suspended after 30 trades with negative expectancy
+	•	not suspended at 29 trades even if running expectancy is -0.5 (insufficient data threshold respected)
+	•	reinstate clears suspension flags but preserves last_30_pnls
+	•	after reinstate with still-negative expectancy at 30 trades, next recordTradeOutcome triggers re-suspension
+TASK 8 — Confidence calibration audit in meta-review
+Add a calibration check to the daily meta-review. After each US close, group closed trades by stated confidence bucket and compute actual win rate per bucket. Surface mismatches.
+Modify metaReviewService.js. Add a new function calibrationAudit():
+	1.	Query the last 30 trading days of closed trades from the trades table where pnl is not null.
+	2.	Bucket each trade by its stated confidence at entry: [0.65, 0.70), [0.70, 0.75), [0.75, 0.80), [0.80, 0.85), [0.85, 0.90), [0.90, 1.00]. Use half-open intervals — confidence exactly at 0.70 goes into [0.70, 0.75).
+	3.	For each bucket, compute: count, actualWinRate (fraction of trades with pnl > 0), expectedWinRate (midpoint of the bucket — for [0.70, 0.75) the midpoint is 0.725), divergence (actualWinRate - expectedWinRate).
+	4.	Flag a bucket as “miscalibrated for the day” if abs(divergence) > 0.10 AND count >= 10. Buckets with fewer than 10 trades are reported but never flagged — small samples are noise.
+	5.	Add a new table calibration_history to ensureSchema:
+	•	id SERIAL PRIMARY KEY
+	•	date DATE NOT NULL
+	•	bucket_low NUMERIC NOT NULL
+	•	bucket_high NUMERIC NOT NULL
+	•	count INT NOT NULL
+	•	actual_win_rate NUMERIC
+	•	divergence NUMERIC
+	•	flagged BOOLEAN NOT NULL DEFAULT FALSE
+	•	recorded_at TIMESTAMPTZ DEFAULT NOW()
+	•	INDEX on (bucket_low, date DESC)
+	6.	After computing today’s calibration, write one row per bucket into calibration_history.
+	7.	Five-day persistent flag check: for each bucket flagged today, query the last 5 calibration_history rows for that bucket. If all 5 are flagged (today plus the 4 prior trading days), emit a config suggestion via discordApprovalService.addSuggestion. The suggestion text: “Confidence bucket [X, Y) has been miscalibrated by Z% for 5 consecutive trading days (actual win rate W%, expected ~M%). Consider recalibrating Judge confidence ranges or reviewing prompt design.” NEVER auto-apply — operator must Approve via Discord. The suggestion target_key should be a documentation-only key like ‘calibration_review’ that has no apply() function — purely informational, requires manual investigation.
+	8.	Post the daily calibration summary to Discord as part of the meta-review post. Include a markdown table with columns: Bucket | Count | Actual WR | Expected WR | Divergence | Flag. Use ⚠️ for flagged rows.
+Wire into runReview(): call calibrationAudit() after the existing facts gathering. Pass its return value into the existing Discord post construction so the table appears in the same daily post.
+Tests in tests/calibration.test.js — pure function tests on the bucketing logic:
+	•	Bucket assignment: confidence 0.72 returns [0.70, 0.75)
+	•	Bucket assignment: confidence 0.85 returns [0.85, 0.90)
+	•	Edge case: confidence exactly at boundary 0.70 goes to [0.70, 0.75) (half-open intervals)
+	•	Edge case: confidence 0.65 goes to [0.65, 0.70)
+	•	Edge case: confidence 1.00 goes to [0.90, 1.00] — last bucket is closed at top
+	•	Divergence calculation: actual 0.60, bucket [0.70, 0.80), midpoint 0.75 returns -0.15
+	•	Flag triggered when abs(divergence) > 0.10 AND count >= 10
+	•	Flag NOT triggered when count is 9 even if divergence is huge (small sample protection)
+	•	Flag NOT triggered when divergence is exactly 0.10 (strict greater-than, not greater-than-or-equal)
+TASK 9 — Rename max_position_pct to max_position_pct_day
+The SAFE_KEY name max_position_pct is misleading because it only applies to day strategies (Section 9 finding from Phase A.5). Rename for clarity.
+	1.	discordApprovalService.js: rename the SAFE_KEYS entry max_position_pct to max_position_pct_day. Update the description text and any example messages or docstrings.
+	2.	runtimeConfig.js: rename the property max_position_pct to max_position_pct_day. Update DEFAULTS, BOUNDS, and JSDoc.
+	3.	agent.js buildStrategyConfig: rename the read from rt.max_position_pct to rt.max_position_pct_day. Update related warning log messages.
+	4.	The DB column portfolio.max_position_pct_day is already correctly named — no DB migration needed.
+	5.	Backwards compatibility: if any pending suggestion in pending_suggestions has target_key=‘max_position_pct’ (from before this rename), auto-rewrite it to ‘max_position_pct_day’ on read in discordApprovalService. Log a one-time deprecation warning [DEPRECATED] target_key ‘max_position_pct’ rewritten to ‘max_position_pct_day’ on suggestion ID N. This protects against ambiguity if a pre-rename suggestion is still in the queue at deploy time.
+This is a pure rename. No behaviour changes. Add a brief test in tests/runtimeConfig.test.js confirming that the new name resolves correctly through the DB → env → default fallback chain.
+VERIFICATION REPORT (mandatory)
+After completing all nine tasks, produce a single markdown report:
+Section 1 — Test scaffolding
+	•	Vitest version installed
+	•	Output of npm test (all tests passing)
+	•	Total test count and breakdown by file
+Section 2 — Hybrid cache
+	•	File path and line count
+	•	Cache key examples for 3 different inputs (showing how RSI and VWAP buckets work)
+	•	Hit/miss invalidation hooks (where wired)
+	•	Cache stats endpoint URL and example response
+Section 3 — Regime meta-layer
+	•	Diff summary of dynamicGateService.js changes
+	•	Confirmation of the four invariants asserted in code with line numbers
+	•	Example log line for a regime transition
+	•	getStatus() output now includes regimeAdjustment, regimeLabel, regimeConfidence
+Section 4 — Adversarial Analyst
+	•	Council role count: 7 specialists + 1 Judge = 8 LLM calls per deliberation
+	•	Quorum threshold: confirm verdicts.length >= 4 (half of 7 specialists, rounded up — confirm exact threshold used)
+	•	Updated cost projection per deliberation and monthly at current cycle volume (router-adjusted estimate $0.045-$0.050 per deliberation, ~$95-$100/mo at current volume)
+	•	System prompt excerpt for Adversarial (first 200 chars)
+	•	Judge system prompt change excerpt showing the Adversarial weighting instruction
+Section 5 — Multi-timeframe consensus
+	•	Honest report: is real 5m/15m/1h data fetched or stubbed? If stubbed, where are the TODOs and what’s required to wire real data later?
+	•	The pure function for mtfConsensus
+	•	Technical Analyst prompt update excerpt
+Section 6 — Asymmetric sizing
+	•	Formula with the four worked examples (0.65, 0.75, 0.85, 0.90)
+	•	File path of positionSizingService.js
+	•	Where the overlay happens in agent.js (file:line)
+	•	Defence-in-depth assertion location and the [0.005, 0.05] bound
+	•	Confirmation that statistical-only signals do NOT receive asymmetric sizing (and how this is verified)
+Section 7 — Per-symbol expectancy
+	•	Schema confirmation
+	•	Auto-suspend trigger logic walk-through with a worked example
+	•	Discord Reinstate command location and auth check
+	•	Wiring point in agent.js where isSuspended is called in the hot path
+	•	All trade-close paths that call recordTradeOutcome (list every one — there should be 3 or more)
+Section 8 — Calibration audit
+	•	Bucketing logic with edge cases tested
+	•	5-day flag threshold logic
+	•	Where the suggestion is emitted and confirmation it is NEVER auto-applied
+	•	Sample Discord output format showing the markdown table
+Section 9 — Rename
+	•	Confirmation of all rename sites (file:line for each)
+	•	Backwards-compat handling for in-flight pending suggestions
+Section 10 — Files touched
+Complete list with one-line summary per file. Distinguish NEW files from MODIFIED files.
+Section 11 — Things you noticed
+Anything fragile, surprising, or worth fixing later. Be honest. If something is held together with duct tape, say so.
+Section 12 — What did NOT change
+Explicit confirmation that the following are byte-for-byte identical to before this phase:
+	•	riskManager.js function bodies (computeDynamicScaling, computeTargetRisk, evaluateBuy, evaluateSell, evaluateStops, computeTrailingUpdate, checkQuorum, checkCircuitBreaker)
+	•	audit chain code in db.js (recordAudit, verifyAuditChain)
+	•	kill switch logic in agent.js
+	•	atomic cash logic
+	•	DENIED_KEYS list in discordApprovalService.js
+Section 13 — Paper trading verification plan
+A checklist for the operator to run during the 2-week paper trading window. Include:
+	•	Daily: confirm [GATE-REGIME], [SIZING], [STRATEGY-OVERLAY] log lines fire when expected
+	•	After first week: query symbol_expectancy table, confirm rows exist for actively traded symbols
+	•	After first week: check calibration_history, list any flagged buckets
+	•	Daily Discord meta-review: confirm calibration summary table appears
+	•	Spot-check: pick a Council deliberation from logs, verify all 8 analyst verdicts present (7 specialists + Judge synthesis)
+	•	Spot-check: pick a high-confidence trade and a low-confidence trade from the trades table, confirm their position sizes match the asymmetric formula
+	•	Spot-check: induce a regime change in a paper environment (or wait for one to occur naturally) and confirm the gate raises
+	•	Trigger a Reinstate command from Discord and confirm the suspension clears and audit row writes
+CONSTRAINTS — re-emphasised
+	•	riskManager.js function bodies: do not modify. You may add new optional parameters with defaults that preserve existing behaviour when unset.
+	•	Audit chain: do not modify. You may write new audit row event_types via the existing recordAudit function.
+	•	Tests cover NEW math only. Existing untested code stays untested for now.
+	•	If you find a tenth subtle bug along the way, report it in Section 11. Do not fix outside scope.
+	•	All new features ship enabled by default — operator is paper-only and will observe for 2 weeks before live.
+	•	Ship Phase B as one cohesive checkpoint. Do not partially commit Tasks 1-4 and leave 5-9 for later. Verify all nine tasks land before declaring complete.
+When the report is complete, stop and wait for further instructions.
+
+That’s the complete remainder. Paste this in the same Replit Agent thread as a follow-up message — it’ll have the original context plus this completion, and should give the agent everything needed to ship Phase B end-to-end.
+The agent’s instinct to refuse partial implementation was correct. That’s a sign of a careful operator. When the verification report comes back, paste the full thing here and we’ll go through it section by section before deciding whether to deploy.​​​​​​​​​​​​​​​​
