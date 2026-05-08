@@ -385,6 +385,48 @@ async function _incrementDailyCallCount(symbol) {
   } catch (_) { /* swallow */ }
 }
 
+// Phase A hygiene (May 2026) — persisted payload cache. The in-process Map
+// is wiped on every backend restart; this DB mirror lets the next boot
+// re-hydrate paid-for ensemble payloads instead of re-fetching them.
+// TTL matches the in-memory TTL_MS exactly. Both reads and writes are
+// best-effort and swallow errors so a DB hiccup never breaks sentiment.
+async function _readPersistedCache(symbol) {
+  const db = _getDb(); if (!db) return null;
+  try {
+    const r = await db.query(`
+      SELECT payload, price_at_fetch, fetched_at
+      FROM sentiment_cache
+      WHERE symbol = $1 AND expires_at > NOW()
+      ORDER BY fetched_at DESC
+      LIMIT 1
+    `, [symbol]);
+    if (!r.rows.length) return null;
+    const row = r.rows[0];
+    return {
+      data: row.payload,
+      price: row.price_at_fetch != null ? parseFloat(row.price_at_fetch) : null,
+      ts: new Date(row.fetched_at).getTime(),
+    };
+  } catch (_) { return null; }
+}
+async function _writePersistedCache(symbol, data, price) {
+  const db = _getDb(); if (!db) return;
+  try {
+    const expiresMs = Date.now() + TTL_MS;
+    await db.query(`
+      INSERT INTO sentiment_cache (symbol, payload, price_at_fetch, expires_at)
+      VALUES ($1, $2::jsonb, $3, to_timestamp($4 / 1000.0))
+    `, [symbol, JSON.stringify(data), Number.isFinite(price) ? price : null, expiresMs]);
+  } catch (_) { /* swallow */ }
+}
+async function cleanupPersistedCache() {
+  const db = _getDb(); if (!db) return { ok: false, reason: 'no db' };
+  try {
+    const r = await db.query(`DELETE FROM sentiment_cache WHERE expires_at < NOW() - INTERVAL '1 day'`);
+    return { ok: true, deleted: r.rowCount };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 async function fetchFresh(symbol) {
   // Per-day cap check — if we've already done MAX_DAILY_CALLS_PER_SYMBOL
   // ensemble calls today for this symbol, return whatever's cached (stale
@@ -420,6 +462,15 @@ async function fetchFresh(symbol) {
 
 async function getSentiment(symbol, { force = false, currentPrice = null } = {}) {
   const sym = String(symbol).toUpperCase();
+  // Phase A: if the in-process Map is cold (e.g. after restart), try the
+  // persisted DB cache. A live row hydrates the Map and short-circuits
+  // before we incur an LLM call. Same TTL semantics as the Map.
+  if (!force && !cache.get(sym)) {
+    const persisted = await _readPersistedCache(sym);
+    if (persisted) {
+      cache.set(sym, persisted);
+    }
+  }
   const cached = cache.get(sym);
   if (!force && cached) {
     const age = Date.now() - cached.ts;
@@ -451,11 +502,14 @@ async function getSentiment(symbol, { force = false, currentPrice = null } = {})
   const p = (async () => {
     try {
       const data = await fetchFresh(sym);
-      touchCache(sym, {
-        ts: Date.now(),
-        data,
-        price: Number.isFinite(currentPrice) ? currentPrice : null,
-      });
+      const price = Number.isFinite(currentPrice) ? currentPrice : null;
+      touchCache(sym, { ts: Date.now(), data, price });
+      // Best-effort DB persistence so a restart preserves the payload.
+      // Skips degraded payloads (no providers responded) so we don't
+      // pollute the persisted cache with neutral defaults.
+      if (data && data.providersValid > 0 && !data.dailyCapHit) {
+        _writePersistedCache(sym, data, price).catch(() => {});
+      }
       return data;
     } finally {
       inflight.delete(sym);
@@ -509,4 +563,4 @@ function getProviders() {
   return PROVIDERS.map(p => ({ id: p.id, label: p.label, provider: p.provider, model: p.model }));
 }
 
-module.exports = { getSentiment, getSentimentBatch, getCached, getAllCached, clearCache, classify, getProviders, PROVIDERS };
+module.exports = { getSentiment, getSentimentBatch, getCached, getAllCached, clearCache, classify, getProviders, PROVIDERS, cleanupPersistedCache };

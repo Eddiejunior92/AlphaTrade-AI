@@ -47,6 +47,25 @@ function _isApprover(msg) {
   return (id && allow.has(id)) || (tag && allow.has(tag));
 }
 
+// Phase A hygiene (May 2026) — visibility-only. Auth logic above is
+// unchanged; this just surfaces how many approvers were parsed so
+// operators notice misconfigured DISCORD_APPROVER_IDS at boot instead
+// of finding out the first time they try to Approve a suggestion.
+function getApproverCount() { return _getApproverAllowlist().size; }
+function getApproverIds() { return Array.from(_getApproverAllowlist()); }
+(function _logApproversAtModuleLoad() {
+  try {
+    const ids = getApproverIds();
+    if (ids.length === 0) {
+      console.warn('[DISCORD-APPROVERS] WARNING: zero approvers configured, all approvals will fail-closed');
+    } else {
+      console.log(`[DISCORD-APPROVERS] parsed ${ids.length} approver IDs: [${ids.join(', ')}]`);
+    }
+  } catch (e) {
+    console.warn('[DISCORD-APPROVERS] startup log failed:', e.message);
+  }
+})();
+
 // ---------------------------------------------------------------------------
 // SAFE_KEYS — every key here MUST have:
 //   • a `validate(value)` that returns {ok, reason?, normalised?}

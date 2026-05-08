@@ -2311,6 +2311,12 @@ async function dailyReset() {
   }
   console.log(`[Agent] Daily reset — new day-start equity: $${equity.toFixed(2)}` +
     (wasTripped ? (shouldAutoReset ? ' | breaker auto-reset (paper)' : ' | breaker LEFT TRIPPED (live or opt-out)') : ''));
+  // Phase A hygiene — drop expired sentiment_cache rows so the table never
+  // grows unbounded. Best-effort; never breaks the daily reset.
+  try {
+    const r = await require('./services/sentimentService').cleanupPersistedCache();
+    if (r?.ok) console.log(`[Agent] sentiment_cache cleanup: ${r.deleted || 0} rows`);
+  } catch (e) { console.warn('[Agent] sentiment_cache cleanup failed:', e.message); }
 }
 
 function scheduleDailyReset() {

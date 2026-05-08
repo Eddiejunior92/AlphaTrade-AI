@@ -1,0 +1,75 @@
+Here you go — clean, no markdown decorations, ready to copy-paste straight into Replit Agent:
+
+Before any new features are built, the AlphaTrade codebase needs five hygiene fixes. Do these in the order listed. Do not modify safety-critical code: riskManager.js math, the audit chain in db.js, the kill switch, atomic cash logic, or any DENIED_KEYS parameters. After completing all five tasks, produce the verification report at the end.
+TASK 1 — Force schema migration to live DB
+The four T002 tables defined in backend/services/db.js (llm_router_perf, dynamic_gate_state, pending_suggestions, sentiment_daily_calls) exist in code but are missing from the live Postgres DB because ensureSchema() only runs on backend startup, and the backend hasn’t restarted since T002 landed.
+Do the following:
+	1.	Read backend/services/db.js::ensureSchema() and confirm the four CREATE TABLE IF NOT EXISTS statements are present for these tables. Report their line numbers.
+	2.	Add a one-shot startup migration verifier in db.js (or a new file backend/services/schemaVerifier.js) that, on backend boot, queries information_schema.tables for each of these four tables. If any are missing, log a [SCHEMA-MISSING] warning to stdout with the table name. If all present, log [SCHEMA-OK] T002 tables verified.
+	3.	Wire this verifier to run once after ensureSchema() completes, in the same boot path.
+	4.	For dynamic_gate_state specifically: ensure the first-row insert (currently in dynamicGateService.js::_ensureState()) is also called during boot, not lazily on first read. The table being empty has been masking the dynamic gate logic for an unknown period.
+	5.	Do NOT manually run SQL against the live DB. The fix is to make sure the next deploy will land the schema correctly.
+TASK 2 — SAFE_KEYS consumer audit
+Critical bug: discordApprovalService.js allows operators to approve config changes that write to the portfolio table, but several consuming services still read those values from environment variables. This means approved changes silently no-op while still writing CONFIG_CHANGE_APPROVED to the audit log — governance theatre.
+For each entry in SAFE_KEYS (currently: confidence_gate_base, day_trading_dip_strictness, llm_skip_price_bps, sentiment_ttl_seconds, agent_interval_seconds, max_holdings_day, max_position_pct):
+	1.	Find every place the value is read in the codebase (grep for the env var name, the column name, and any related variable names).
+	2.	For each read site, classify it: READS_FROM_DB / READS_FROM_ENV / READS_FROM_BOTH / HARDCODED.
+	3.	Produce a markdown table in your final report with columns: SAFE_KEY | env_var_name | portfolio_column | read_sites | status.
+Do NOT fix the inconsistencies in this prompt. Just report them. We’ll decide which to fix in a follow-up. The goal here is visibility, not migration.
+TASK 3 — Reconcile position cap
+Commit 02b618e raised the position cap from 3% to 4% in backend/strategies.js. Investor materials still reference 3%. There are also two places SAFETY_FLOOR=0.65 is declared (riskManager.js:74 and dynamicGateService.js:33) — defence-in-depth, but vulnerable to drift.
+Do the following:
+	1.	Locate every numeric constant in the codebase that controls position sizing or safety floors. Specifically find: the 3%/4% per-name cap, the 65% confidence floor, the 90% gate ceiling, the 5% drawdown breaker, the 42%/55% pin/release thresholds, the 80% base gate.
+	2.	For each constant, report file:line | constant_name | current_value | env_overridable (yes/no).
+	3.	Identify any constant that is declared in more than one place with the same value. Flag these as drift risks.
+	4.	Do NOT change any values. Reporting only.
+TASK 4 — Discord approver visibility
+Currently if DISCORD_APPROVER_IDS is misconfigured (trailing comma, wrong format, empty), the system fail-closes silently — no one realises approvals are dead until they try one.
+Do the following:
+	1.	In discordApprovalService.js, add a startup log line that runs once when the module loads. It should log: [DISCORD-APPROVERS] parsed N approver IDs: [list] — log the actual IDs (these are public Discord user IDs, not secrets).
+	2.	If the list is empty, log: [DISCORD-APPROVERS] WARNING: zero approvers configured, all approvals will fail-closed.
+	3.	Also expose this count via a new property on getRouterStatus() or similar diagnostic function — or add a new export getApproverCount() — so the dashboard can surface it.
+	4.	Do NOT change the auth logic itself. Just add visibility.
+TASK 5 — Persist sentiment cache payloads
+Currently sentimentService.js keeps response payloads in an in-process Map that gets wiped on every backend restart. The daily call counter persists in sentiment_daily_calls but the actual sentiment data does not, so a restart mid-session causes paid-for data to be re-fetched.
+Do the following:
+	1.	Add a new table sentiment_cache to ensureSchema() in db.js with columns: id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, payload JSONB NOT NULL, price_at_fetch NUMERIC, fetched_at TIMESTAMPTZ DEFAULT NOW(), expires_at TIMESTAMPTZ NOT NULL. Index on (symbol, expires_at).
+	2.	Modify sentimentService.js so that getSentiment(symbol):
+	•	First checks the in-process Map (existing behaviour)
+	•	On miss, checks the new sentiment_cache table for a row where expires_at > NOW()
+	•	If found, hydrates the in-process Map and returns the payload
+	•	On full miss, makes the LLM call as before, then writes both to the Map and to the DB
+	3.	Existing TTL and price-stable logic stays as-is. The DB cache TTL should match SENTIMENT_TTL_SECONDS (default 45 minutes — the existing constant).
+	4.	Add a small cleanup query in the daily reset path: DELETE FROM sentiment_cache WHERE expires_at < NOW() - INTERVAL ‘1 day’ so the table doesn’t grow forever.
+	5.	Test: after implementation, simulate a restart by running the cleanup logic once in a node REPL or test script, and confirm rows persist across the simulated restart.
+VERIFICATION REPORT (mandatory)
+After completing all five tasks, produce a single markdown report with these sections:
+Section 1 — Schema status
+	•	Confirmation that all four T002 tables have CREATE TABLE IF NOT EXISTS in db.js (with line numbers)
+	•	Whether the boot verifier was added and where
+	•	Whether the dynamic_gate_state first-row insert was moved to boot
+Section 2 — SAFE_KEYS audit table
+The markdown table described in Task 2. Be exhaustive — every read site, classified.
+Section 3 — Constants table
+The markdown table from Task 3, with every safety-critical numeric constant and any duplicates flagged.
+Section 4 — Discord approver logging
+	•	Where the startup log line was added (file:line)
+	•	What the new export/property is named for the dashboard
+	•	Confirmation that auth logic was not modified
+Section 5 — Sentiment cache
+	•	Confirmation that sentiment_cache table is in ensureSchema() with the correct schema
+	•	Diff summary of changes to sentimentService.js::getSentiment()
+	•	How TTL is sourced and whether it matches the existing constant
+Section 6 — Files touched
+A complete list of every file modified, with a one-line summary of the change per file.
+Section 7 — Things you noticed
+Anything that surprised you, didn’t make sense, or looked broken in adjacent code while you were working. Be honest. If something is held together with duct tape, say so.
+Section 8 — What to verify after deploy
+A checklist of things the operator should manually check after the next deploy goes live. Examples: “Confirm [SCHEMA-OK] T002 tables verified appears in deploy logs”, “Confirm [DISCORD-APPROVERS] parsed N shows non-zero”, “Run a sentiment query, restart, run again, confirm cache hit”.
+CONSTRAINTS — re-emphasised
+	•	No changes to riskManager.js math, audit chain, kill switch, atomic cash, or DENIED_KEYS.
+	•	No new features. No Council role changes. No earnings stubs. No regime meta-layer. No asymmetric sizing. Those are Phase B.
+	•	If you’re tempted to refactor something adjacent “while you’re in there” — don’t. Phase A is hygiene only.
+When the report is complete, stop and wait for further instructions.
+
+Paste that as one block. When the report comes back, drop the whole thing here and we’ll go through it together before writing Phase B.​​​​​​​​​​​​​​​​

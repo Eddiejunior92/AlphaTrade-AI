@@ -268,6 +268,24 @@ async function ensureSchema() {
       PRIMARY KEY (symbol, utc_date)
     )
   `);
+  // Persisted sentiment payload cache (Phase A hygiene, May 2026).
+  // The in-process Map in sentimentService is wiped on every backend
+  // restart, causing paid-for ensemble payloads to be re-fetched. This
+  // table mirrors the Map so that on restart the previous payloads can
+  // be re-hydrated. TTL is enforced in the WHERE clause via expires_at.
+  // Cleanup runs from agent.dailyReset() so the table never grows
+  // unbounded. NEVER touched by safety-critical code.
+  await query(`
+    CREATE TABLE IF NOT EXISTS sentiment_cache (
+      id              SERIAL PRIMARY KEY,
+      symbol          TEXT NOT NULL,
+      payload         JSONB NOT NULL,
+      price_at_fetch  NUMERIC,
+      fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at      TIMESTAMPTZ NOT NULL
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS sentiment_cache_lookup_idx ON sentiment_cache (symbol, expires_at DESC)`);
 
   // Regime-aware meta-learning layer (metaLearningService) — per-regime,
   // per-strategy closed-trade rollup. Drives the regime-conditional
@@ -900,10 +918,47 @@ async function verifyAuditChain({ since } = {}) {
   return { ok: brokenAt.length === 0, total: rows.length, verified, legacy: legacy + legacyNoBody, legacyPreHash: legacy, legacyPreBody: legacyNoBody, brokenAt };
 }
 
+// =============================================================================
+// Phase A hygiene — T002 schema verifier (May 2026)
+// =============================================================================
+// Confirms the four "Master Intelligence Upgrade" tables exist in the live
+// DB after ensureSchema() ran. They were defined in code (above) but the
+// backend hadn't restarted since they landed, so the live DB had drifted.
+// This verifier is read-only — it does NOT create tables; it only logs
+// [SCHEMA-OK] / [SCHEMA-MISSING] so an operator notices on the next boot.
+// =============================================================================
+const T002_TABLES = [
+  'llm_router_perf',
+  'dynamic_gate_state',
+  'pending_suggestions',
+  'sentiment_daily_calls',
+];
+async function verifyT002Schema() {
+  try {
+    const { rows } = await query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = ANY($1::text[])`,
+      [T002_TABLES]
+    );
+    const present = new Set(rows.map(r => r.table_name));
+    const missing = T002_TABLES.filter(t => !present.has(t));
+    if (missing.length === 0) {
+      console.log('[SCHEMA-OK] T002 tables verified:', T002_TABLES.join(', '));
+      return { ok: true, missing: [] };
+    }
+    for (const t of missing) console.warn(`[SCHEMA-MISSING] ${t}`);
+    return { ok: false, missing };
+  } catch (e) {
+    console.warn('[SCHEMA-VERIFY] failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 module.exports = {
   query, pool, ensureSchema, getPortfolio, updatePortfolio, adjustCash,
   getHoldings, getHolding, upsertHolding, deleteHolding,
   recordTrade, getRecentTrades, getNonTerminalTrades, updateTradeStatus, reconcileTradeAtomic,
   recordAudit, getRecentAudit, verifyAuditChain,
   updateTrailing,
+  verifyT002Schema,
 };

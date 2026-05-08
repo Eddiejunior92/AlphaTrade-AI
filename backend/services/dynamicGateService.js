@@ -171,11 +171,42 @@ async function getStatus() {
   };
 }
 
+// Phase A hygiene (May 2026): on boot, confirm dynamic_gate_state has at
+// least one row. If it's empty, insert the default baseline so getStatus()
+// returns a real DB-backed value from cycle one (instead of an in-memory
+// default that masks "the table has been empty all along"). Idempotent.
+async function initStateAtBoot() {
+  try {
+    const r = await db.query(`SELECT COUNT(*)::int AS n FROM dynamic_gate_state`);
+    if ((r.rows[0]?.n || 0) > 0) {
+      _stateTs = 0; // force fresh read on next getCurrentGate
+      console.log('[DYNAMIC-GATE] state row present — boot init skipped');
+      return { ok: true, action: 'noop' };
+    }
+    await db.query(`
+      INSERT INTO dynamic_gate_state
+        (base_gate, council_delta, pinned, pin_value, pin_reason, source, reason, updated_at)
+      VALUES ($1, 0, FALSE, NULL, NULL, 'boot_init', 'first-row insert at boot', NOW())
+    `, [BASE_GATE]);
+    _stateTs = 0;
+    await db.recordAudit({
+      event_type: 'DYNAMIC_GATE_INITIALISED',
+      payload: { base_gate: BASE_GATE, source: 'boot_init' },
+    });
+    console.log(`[DYNAMIC-GATE] inserted default state row (base_gate=${BASE_GATE})`);
+    return { ok: true, action: 'inserted', base_gate: BASE_GATE };
+  } catch (e) {
+    console.warn('[DYNAMIC-GATE] initStateAtBoot failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 module.exports = {
   getCurrentGate,
   applyCouncilSuggestion,
   evaluateAutoAdaptive,
   getStatus,
   clampGate,
+  initStateAtBoot,
   SAFETY_FLOOR, SAFETY_CEIL, BASE_GATE,
 };

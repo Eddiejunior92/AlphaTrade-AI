@@ -1825,6 +1825,16 @@ server.listen(PORT, '0.0.0.0', () => {
   // one (or an empty watchlist) never blocks the other. US runs at 08:00 ET,
   // ASX at 09:00 Sydney.
   require('./services/llmCostTracker').ensureSchema().catch(e => console.error('[LLMCost] ensureSchema failed:', e.message));
+
+  // Phase A hygiene (May 2026): verify the four T002 tables landed in the
+  // live DB after ensureSchema(), then ensure dynamic_gate_state has a
+  // first-row baseline. Both are best-effort and never block boot.
+  (async () => {
+    try { await db.ensureSchema(); } catch (e) { console.error('[Boot] ensureSchema failed:', e.message); }
+    try { await db.verifyT002Schema(); } catch (e) { console.error('[Boot] verifyT002Schema failed:', e.message); }
+    try { await require('./services/dynamicGateService').initStateAtBoot(); }
+    catch (e) { console.error('[Boot] dynamicGate.initStateAtBoot failed:', e.message); }
+  })();
   premarketService.ensureSchema()
     .then(() => {
       const usWl  = () => getWatchlist();
